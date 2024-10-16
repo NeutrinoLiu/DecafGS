@@ -1,0 +1,48 @@
+# default config
+data:
+  format: "colmap"
+  data_dir: "scenes/coffee"
+  frame_num: 10
+  resolution: 2
+  max_cached_img: 3
+  # point cloud init
+  init_type: "sfm"
+  init_random_num: 2000
+  init_random_extend: 3
+
+model:
+  # anchor embedding
+  anchor_num: 10000
+  anchor_dim: 64
+  anchor_child_gs: 5
+  anchor_attr_offset: 8
+  # frame embedding
+  frame_start: 0
+  frame_end: 10
+  frame_dim: 200
+
+train:
+  max_step: 20000
+  batch_size: 1
+  # init vals
+  init_opacity: 0.1
+  init_scale: 1.0
+  sh_degree: 3
+  # learning rate
+  lr_mean: 1e-4
+  lr_scale: 5e-3
+  lr_opacity: 5e-2
+  lr_quat: 1e-3
+  lr_sh0: 2.5e-3
+  lr_shN: 1.25e-4
+  # loss and regularization
+  ssim_lambda: 0.2
+  reg_opacity: 1e-2
+  reg_scale: 1e-2
+  # evaluation
+  test_every: 25
+  test_steps:
+    - 0
+    - 4000
+    - 8000
+    - 12000

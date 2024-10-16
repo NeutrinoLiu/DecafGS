@@ -1,0 +1,218 @@
+"""
+data set loading and sampling policy
+
+expected file structure:
+    - scene_name
+        - cam00
+            - images
+                - 0.png
+                - 1.png
+                - ...
+        - cam01
+        - ...
+        - cams.json
+        - points.bin
+    
+    number of png images in each cam folder should be the same, starting from 0.
+
+expected cams.json structure:
+    {
+        "cam00": {
+            "intri": [ [f_x, 0, c_x], [0, f_y, c_y], [0, 0, 1] ],
+            "c2w_R": [ [r_00, r_01, r_02], [r_10, r_11, r_12], [r_20, r_21, r_22] ],
+            "c2w_t": [t_x, t_y, t_z],
+            "width": w,
+            "height": h
+        },
+        "cam01": ...
+    }
+    intri is pixel based, not fov based
+"""
+
+import os 
+from typing import Literal, Tuple
+from plyfile import PlyData
+import torch
+import numpy as np
+import json
+from PIL import Image
+
+from interface import Camera
+from examples.datasets.normalize import (
+    similarity_from_cameras,
+    transform_cameras,
+    transform_points,
+    align_principle_axes
+)
+
+def dataset_split(all:list , test_every):
+    """
+    split the dataset into train and test
+    """
+    train = []
+    test = []
+    for i in range(len(all)):
+        if i % test_every == 0:
+            test.append(all[i])
+        else:
+            train.append(all[i])
+    return train, test
+
+def random_init(scene_scale, n, extend):
+    """
+    randomly sample n points from the unit cubic
+    """
+    points = torch.rand(n, 3) * 2 - 1
+    points *= scene_scale * extend
+    colors = torch.rand(n, 3)
+    return points, colors
+
+def read_ply(ply_path):
+    """
+    read point cloud from .ply file
+    return two tensors: points and colors
+    """
+    plydata = PlyData.read(ply_path)
+    points = np.stack((np.asarray(plydata.elements[0]["x"]),
+                        np.asarray(plydata.elements[0]["y"]),
+                        np.asarray(plydata.elements[0]["z"])),  axis=1)
+    colors = np.stack((np.asarray(plydata.elements[0]["red"]),
+                        np.asarray(plydata.elements[0]["green"]),
+                        np.asarray(plydata.elements[0]["blue"])), axis=1) / 255.
+    return points, colors
+
+class SceneReader:
+    def __init__(self, cfg, cache_in_GPU=False):
+        self.cache_device = torch.device("cuda") \
+            if torch.cuda.is_available() and cache_in_GPU \
+            else torch.device("cpu")
+        self.path = cfg.data_dir
+
+        # 1) load cameras' info
+        with open(os.path.join(self.path, "cams.json"), "r") as f:
+            all_cams = json.load(f)
+        self.cams: list[Camera] = []
+        basic_downscale = cfg.resolution
+        c2w_batch_np: list[torch.Tensor] = []
+        for cname, cpara in all_cams.items():
+            intri = torch.tensor(cpara["intri"])
+            # intri should scale with resolution
+            intri[:2, :] /= basic_downscale
+            cam = Camera(
+                os.path.join(self.path, cname),
+                intri,
+                torch.tensor(cpara["c2w_R"]),
+                torch.tensor(cpara["c2w_t"]),
+                int(cpara["width"])  // basic_downscale,
+                int(cpara["height"]) // basic_downscale,
+            )
+            self.cams.append(cam)
+            c2w_batch_np.append(cam.c2w.clone().numpy())
+        c2w_batch_np = np.stack(c2w_batch_np, axis=0)
+
+        # 2) camera space normalization
+        # codes borrowed from gsplat/examples/datasets/colmap.py
+        # hence, this part is numpy based, not torch based
+        T1 = similarity_from_cameras(c2w_batch_np)
+        c2w_batch_np = transform_cameras(T1, c2w_batch_np)
+        if cfg.init_type == "sfm":
+            points, points_rgb = read_ply(os.path.join(self.path, "init.ply"))
+            points = transform_points(T1, points)
+            T2 = align_principle_axes(points)
+            c2w_batch_np = transform_cameras(T2, c2w_batch_np)
+            points = transform_points(T2, points)
+        elif cfg.init_type == "random":
+            pass
+        else:
+            raise ValueError(f"unknown init type {cfg.init_type}")
+        # apply normalization
+        for cam, new_c2w in zip(self.cams, c2w_batch_np):
+            cam.update_c2w(new_c2w)
+        # scene scale
+        cam_t_batch = c2w_batch_np[:, :3, 3]
+        center = np.mean(cam_t_batch, axis=0)
+        dist = np.linalg.norm(cam_t_batch - center, axis=1)
+        self.scene_scale = np.max(dist)
+        if cfg.init_type == "random":
+            points, points_rgb = random_init(self.scene_scale,
+                                             cfg.init_random_num,
+                                             cfg.init_random_extend)
+
+        # 3) dataset's meta data
+        self.init_pts = points
+        self.init_pts_rgb = points_rgb
+        self.scene_name = os.path.basename(self.path)
+        self.cam_num = len(self.cams)
+        self.frame_num = cfg.frame_num
+
+        print(f'''
+scene <{self.scene_name}> loaded:
+cameras: {self.cam_num}
+frames: {self.frame_num}
+scene scale: {self.scene_scale}
+init points: {len(points)}
+init type: {cfg.init_type}
+''')
+
+        # 4) image cache
+        self.cached = {}
+        self.max_cache = cfg.max_cached_img
+
+    def _get(self, 
+            cam: int, 
+            frame: int,
+            downscale): # -> Camera, GT image
+        """
+        storage blind loader, not expected to be used directly
+        cam attr and image are loaded separately
+        since image is lazy loaded
+        """
+        cam_obj = self.cams[cam][frame].thumbnail(downscale)
+        img = self.cached.get(
+            (cam, frame, downscale), None)
+        if img is None: # cache miss
+            img_path = os.path.join(self.cams[cam].path, "images", f"{frame}.png")
+            with Image.open(img_path) as f:
+                img = f.resize((cam_obj.width, 
+                          cam_obj.height))
+                img = np.asarray(img)
+                img = torch.tensor(img).permute(2, 0, 1) / 255. # [3, H, W]
+            img = img.to(self.cache_device)
+            self.cached[(cam, frame, downscale)] = img
+        return cam_obj, img
+    
+    def batch_get(self, triplets: list):
+        """
+        get a batch of images
+        storage awared loader
+        """
+        assert isinstance(triplets, list), "batch_get expects a list of triplets"
+        if len(triplets) > self.max_cache:
+            raise ValueError(f"wanted {len(triplets)} images exceeds max {self.max_cache} images in cache")
+        ready = set(self.cached.keys())
+        want = set(triplets)
+        more = want - ready
+        uneed = ready - want
+        if len(more) + len(ready) > self.max_cache:
+            # clear cache
+            for tri in uneed:
+                del self.cached[tri]
+        ret = []
+        for tri in want:
+            ret.append(self._get(*tri))
+        return ret
+
+
+class CamSampler:
+    def __init__(self, policy: Literal["random", "sequential"],
+                 cams_idx, batch_size, further_downscale=1):
+        self.policy = policy
+        self.cams = cams_idx
+        self.batch_size = batch_size
+        self.further_downscale = further_downscale
+    def __iter__(self):
+        # reset the iterator
+        return self
+    def __next__(self):
+        # return a batch of cams
+        pass
