@@ -1,10 +1,11 @@
 # default config
 data:
-  format: "colmap"
+  format: "FVV"
   data_dir: "scenes/coffee"
-  frame_num: 10
+  frame_total: 10
   resolution: 2
-  max_cached_img: 3
+  # image cached in the memory
+  max_cached_img: 100
   # point cloud init
   init_type: "sfm"
   init_random_num: 2000
@@ -18,7 +19,7 @@ model:
   anchor_attr_offset: 8
   # frame embedding
   frame_start: 0
-  frame_end: 10
+  frame_end: 1
   frame_dim: 200
 
 train:
@@ -28,6 +29,7 @@ train:
   init_opacity: 0.1
   init_scale: 1.0
   sh_degree: 3
+  sh_degree_interval: 1000
   # learning rate
   lr_mean: 1e-4
   lr_scale: 5e-3
@@ -42,7 +44,7 @@ train:
   # evaluation
   test_every: 25
   test_steps:
-    - 0
+    - 1000
     - 4000
     - 8000
     - 12000

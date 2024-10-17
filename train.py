@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+import math
+import os
+import json
+
 from tqdm import tqdm
 import hydra
-import math
-
 import torch
 import torch.nn.functional as F
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -12,10 +14,11 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from fused_ssim import fused_ssim
 from gsplat.strategy import MCMCStrategy
 from gsplat.rendering import rasterization
-from dataset import SceneReader, CamSampler, dataset_split
-from interface import Gaussian, Camera
 from examples.utils import knn, rgb_to_sh, set_random_seed
 
+from dataset import SceneReader, CamSampler, dataset_split
+from interface import Gaussian, Camera
+from decaf import DeformableScaffold
 
 def init_model_and_opt(
         scene: SceneReader,
@@ -23,6 +26,8 @@ def init_model_and_opt(
         model_cfg: dict,
         device: str = "cuda",
     ):
+
+    # ------------------------------ gaussian attrs ------------------------------ #
     xyz = torch.from_numpy(scene.init_pts).float()
     rgb = torch.from_numpy(scene.init_pts_rgb).float()
 
@@ -44,13 +49,14 @@ def init_model_and_opt(
         ("shN", torch.nn.Parameter(shN), train_cfg.lr_shN),
     ]
     
-    gs = torch.nn.ParameterDict({k: v for k, v, _ in params}).to(device)
+    # ----------------- optimizer binding and learning rate setup ---------------- #
+    gs_attr_dict = torch.nn.ParameterDict({k: v for k, v, _ in params}).to(device)
     opt_cali = train_cfg.batch_size # calibrate learning rate by batch size
-    opt = {
+    opts = {
         attr_name: torch.optim.Adam(
             [{
                 'name'  : attr_name,
-                'params': gs[attr_name],
+                'params': gs_attr_dict[attr_name],
                 'lr'    : attr_lr * math.sqrt(opt_cali),
             }],
             eps     = 1e-15 / math.sqrt(opt_cali),
@@ -58,60 +64,55 @@ def init_model_and_opt(
             )
         for attr_name, _, attr_lr in params # independent optimizer for each attr
     }
-    gs_obj = Gaussian(
-        means=gs['means'],
-        scales=gs['scales'],
-        quats=gs['quats'],
-        opacities=gs['opacities'],
-        sh0=gs['sh0'],
-        shN=gs['shN']
-    )
-    return gs_obj, opt
+    gs = Gaussian(gs_attr_dict)
+    model = DeformableScaffold(gs, model_cfg)
+    return model, opts
 
 class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
-        # data
+
         self.cfg = train_cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scene = SceneReader(data_cfg, True)
 
+        # ------------------------------- data loading ------------------------------- #å
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
-        max_frame = min(self.scene.frame_num, model_cfg.frame_end)
+        max_frame = min(self.scene.frame_total, model_cfg.frame_end)
         self.train_sampler = CamSampler(
             self.scene,
-            train_cam_idx,
-            list(range(min_frame, max_frame)),
-            train_cfg.batch_size,
-            "random")
+            train_cam_idx,                      # train cam only
+            list(range(min_frame, max_frame)),  # full frame
+            batch_size = train_cfg.batch_size,
+            policy = "random")
         self.test_sampler = CamSampler(
             self.scene,
-            test_cam_idx,
-            list(range(min_frame, max_frame))
+            test_cam_idx,                       # test cam only
+            list(range(min_frame, max_frame))   # full frame
             )
         
         print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
-        print(f"training frame {min_frame} ~ {max_frame}")
+        print(f"training frame {min_frame} ~ {max_frame}\n")
 
-        # model
-        self.model, self.opt = init_model_and_opt(
+        # ----------------------------- model & opt init ----------------------------- #
+        self.model, self.opts = init_model_and_opt(
             self.scene,
             train_cfg,
             model_cfg,
             device=self.device
             )
         
-        # plugin
+        # ------------------------------- other plugin ------------------------------- #
         self.strategy = MCMCStrategy(verbose=True, cap_max=200_000)
         self.state = {}
         self.state.update(self.strategy.initialize_state())
 
-        # eval
+        # ----------------------------------- eval ----------------------------------- #å
         self.eval_funcs = {
-            "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
             "psnr": PeakSignalNoiseRatio(data_range=1.0).to(self.device),
+            "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
             "lpips": LearnedPerceptualImagePatchSimilarity(
                 net_type="alex",
                 normalize=True).to(self.device),
@@ -122,28 +123,20 @@ class Runner:
     @staticmethod
     def render( pc: Gaussian,
                 cam: Camera,
-                **kwargs):
-        
-        means = pc.means                            # [N, 3]
-        quats = pc.quats                            # [N, 4]
-        scales = torch.exp(pc.scales)               # [N, 3]
-        opacities = torch.sigmoid(pc.opacities)     # [N,]
-        sh0 = pc.sh0                                # [N, 1, 3]
-        shN = pc.shN                                # [N, TOTAL-1, 3]
-        colors = torch.cat([sh0, shN], dim=1)       # [N, TOTAL, 3]
+                **kwargs): # sh_degree is expected to be provided
 
-        viewmats = torch.linalg.inv(cam.c2w)[None].to(means.device)
-        Ks = cam.intri[None].to(means.device)
+        viewmats = torch.linalg.inv(cam.c2w)[None].to(pc.device)
+        Ks = cam.intri[None].to(pc.device)
         width = cam.width
         height = cam.height
 
         img, alpha, info = rasterization(
             # gaussian attrs
-            means       =   means,
-            quats       =   quats,
-            scales      =   scales,
-            opacities   =   opacities,
-            colors      =   colors,
+            means       =   pc.means,
+            quats       =   pc.quats,
+            scales      =   pc.scales,
+            opacities   =   pc.opacities,
+            colors      =   pc.colors,
             # batched cams
             viewmats    =   viewmats,
             Ks          =   Ks,
@@ -154,9 +147,14 @@ class Runner:
             absgrad     =   True,                           # return abs grad
             **kwargs)
         
+        # output of rasterization is (N, H, W, 3), 
+        # we need to permute to (N, 3, H, W) for loss calculation
+        img = img.permute(0, 3, 1, 2).clamp(0, 1.)
+
         return img, alpha, info
 
     def train(self):
+
         init_step = 0
         max_step = self.cfg.max_step
         pbar = tqdm(range(init_step, max_step))
@@ -164,12 +162,10 @@ class Runner:
         # lr decaying
         schedulers = [
             torch.optim.lr_scheduler.ExponentialLR(
-                self.opt['means'], gamma=0.01 ** (1.0 / max_step))
+                self.opts['means'], gamma=0.01 ** (1.0 / max_step))
         ]
 
-        # data loading
-        train_iter = iter(self.train_sampler)
-
+        train_loader = iter(self.train_sampler)
         for step in pbar:
             active_sh_degrees = min(
                 step // self.cfg.sh_degree_interval,
@@ -177,11 +173,11 @@ class Runner:
             )
             # ------------------------- read train data in batch ------------------------- #
             try:
-                data = next(train_iter)
+                data = next(train_loader)
             except StopIteration:
-                self.train_sampler.learn(self.state) # adaptive data loader
-                train_iter = iter(self.train_sampler)
-                data = next(train_iter)
+                # self.train_sampler.learn(self.state) # TODO adaptive data loader
+                train_loader = iter(self.train_sampler)
+                data = next(train_loader)
             
             # ------------------------------ forward pass ------------------------------ #
             assert len(data) == 1, "batch size should be 1"
@@ -197,31 +193,44 @@ class Runner:
             gt = gt[None].to(self.device)
             l1loss = F.l1_loss(img, gt)
             ssimloss = 1 - fused_ssim(
-                img.permute(0, 3, 1, 2),
-                gt.permute(0, 3, 1, 2),
+                img,
+                gt,
                 padding="valid")
             loss = self.cfg.ssim_lambda * ssimloss + (1 - self.cfg.ssim_lambda) * l1loss
         
             # regs
-            if self.cfg.opacity_reg > 0:
-                loss += self.cfg.opacity_reg * \
-                    torch.abs(torch.sigmoid(pc.opacities)).mean()
-            if self.cfg.scale_reg > 0:
-                loss += self.cfg.scale_reg * \
-                    torch.abs(torch.exp(pc.scales)).mean()
+            if self.cfg.reg_opacity > 0:
+                loss += self.cfg.reg_opacity * \
+                    torch.abs(pc.opacities).mean()
+            if self.cfg.reg_scale > 0:
+                loss += self.cfg.reg_scale * \
+                    torch.abs(pc.scales).mean()
 
             # ------------------------------- backward pass ------------------------------ #
             # update the states
-            self.strategy.step_pre_backward(self.state)  
+            self.strategy.step_pre_backward(
+                params=pc.gs,
+                optimizers=self.opts,
+                state=self.state,
+                step=step,
+                info=info
+            )
 
             loss.backward()
             desc = f"loss={loss.item():.3f}| " f"sh degree={active_sh_degrees}| "
             pbar.set_description(desc)
             
             # relocate and densification
-            self.strategy.step_post_backward(self.state)  
+            self.strategy.step_post_backward(
+                params=pc.gs,
+                optimizers=self.opts,
+                state=self.state,
+                step=step,
+                info=info,
+                lr=schedulers[0].get_last_lr()[0]
+            )
             
-            for optimizer in self.opt.values():
+            for optimizer in self.opts.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -235,13 +244,13 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step):
-        test_iter = iter(self.test_sampler)
+        test_loader = iter(self.test_sampler)
         results = {k:0.0 for k in self.eval_funcs.keys()}
-        for data in test_iter:
+        for data in test_loader:
             assert len(data) == 1, "batch size should be 1"
             cam, gt = data[0]
             pc: Gaussian = self.model.deform(cam)
-            img, _, info = self.render(
+            img, _, _ = self.render(
                 pc=pc,
                 cam=cam,
                 sh_degree=self.cfg.sh_degree
@@ -251,12 +260,13 @@ class Runner:
                 results[k] += func(img, gt).item()
         for k in results.keys():
             results[k] /= len(self.test_sampler)
-        print(f"step {step}: {results}")
+        print(f"step {step}: \n{json.dumps(results, indent=4)}")
 
 
 
-@hydra.main(config_path='.', config_name='config')
+@hydra.main(config_path='.', config_name='config', version_base=None)
 def main(cfg):
+    print(f"current dir: {os.getcwd()}")
     assert True, 'sanity check'
     runner = Runner(cfg.data, cfg.model, cfg.train)
     runner.train()

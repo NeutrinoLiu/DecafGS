@@ -48,7 +48,7 @@ class Config:
     init_type = "sfm"
     init_random_num = 6000
     init_random_extend = 3.0
-    frame_num = 1
+    frame_total = 1
     max_cached_img = 100
     normalize_world_space: bool = True
 
@@ -136,7 +136,7 @@ class Runner:
 
         # -------------------------------- dataloader -------------------------------- #
         
-        self.scene = SceneReader(cfg, True)
+        self.scene = SceneReader(cfg, True, True)
 
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),

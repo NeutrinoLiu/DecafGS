@@ -83,10 +83,11 @@ def read_ply(ply_path):
     return points, colors
 
 class SceneReader:
-    def __init__(self, cfg, cache_in_GPU=False):
+    def __init__(self, cfg, cache_in_GPU=False, return_dict=False):
         self.cache_device = torch.device("cuda") \
             if torch.cuda.is_available() and cache_in_GPU \
             else torch.device("cpu")
+        self.return_dict = return_dict
         self.path = cfg.data_dir
 
         # 1) load cameras' info
@@ -138,18 +139,19 @@ class SceneReader:
             points, points_rgb = random_init(self.scene_scale,
                                              cfg.init_random_num,
                                              cfg.init_random_extend)
+        assert points is not None, "points has not been initialized !"
 
         # 3) dataset's meta data
         self.init_pts = points
         self.init_pts_rgb = points_rgb
         self.scene_name = os.path.basename(self.path)
         self.cam_num = len(self.cams)
-        self.frame_num = cfg.frame_num
+        self.frame_total = cfg.frame_total
 
         print(f'''
 scene <{self.scene_name}> loaded:
 cameras: {self.cam_num}
-frames: {self.frame_num}
+frames: {self.frame_total}
 scene scale: {self.scene_scale}
 init points: {len(points)}
 init type: {cfg.init_type}
@@ -202,6 +204,22 @@ init type: {cfg.init_type}
         ret = []
         for tri in want:
             ret.append(self._get(*tri))
+        
+        # a formatter for gsplat compatibility
+        if self.return_dict:
+            ret = self.cam_formatter(ret)
+        return ret
+    
+    @staticmethod
+    def cam_formatter(get_res):
+        """
+        format the get_res to a dict
+        """
+        ret = {
+            "camtoworld": torch.stack([cam.c2w for cam, _ in get_res], dim=0),
+            "K": torch.stack([cam.intri for cam, _ in get_res], dim=0),
+            "image": torch.stack([img.permute(1, 2, 0) for _, img in get_res], dim=0)
+        }
         return ret
 
 
@@ -214,7 +232,8 @@ class CamSampler:
                  further_downscale=1,
                  # options
                  batch_size = 1, 
-                 policy: Literal["random", "sequential"] = "sequential"):
+                 policy: Literal["random", "sequential"] = "sequential"
+                 ):
         self.scene = scene
         self.policy = policy
         self.cams = cams_idx.copy()
@@ -239,16 +258,4 @@ class CamSampler:
             random.shuffle(self._pool)
         batch = self._pool[:self.batch_size]
         self._pool = self._pool[self.batch_size:]
-        return self.cam_formatter(self.scene.batch_get(batch))
-    
-    @staticmethod
-    def cam_formatter(get_res):
-        """
-        format the get_res to a dict
-        """
-        ret = {
-            "camtoworld": torch.stack([cam.c2w for cam, _ in get_res], dim=0),
-            "K": torch.stack([cam.intri for cam, _ in get_res], dim=0),
-            "image": torch.stack([img.permute(1, 2, 0) for _, img in get_res], dim=0)
-        }
-        return ret
+        return self.scene.batch_get(batch)

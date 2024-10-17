@@ -1,5 +1,6 @@
 """
 interface definition
+for better code readability
 """
 
 import torch
@@ -54,13 +55,42 @@ class Camera:
         Rt[:3, 3] = self.c2w_t
         return Rt
 
-class Gaussian(NamedTuple):
+class Gaussian:
     """
-    Gaussian parameters
+    higher layer warpper of Guassian para dict
     """
-    means: torch.Tensor
-    scales: torch.Tensor
-    quats: torch.Tensor
-    opacities: torch.Tensor
-    sh0: torch.Tensor
-    shN: torch.Tensor
+    def __init__(self, gs:dict):
+        self.gs = gs
+    @property
+    def device(self):
+        return self.gs["means"].device
+    @property
+    def means(self):
+        # [N, 3]
+        return self.gs["means"]
+    @property
+    def quats(self):
+        # [N, 4]
+        return self.gs["quats"]
+    @property
+    def scales(self):
+        # [N, 3]
+        return torch.exp(self.gs["scales"])
+    @property
+    def opacities(self):
+        # [N,]
+        return torch.sigmoid(self.gs["opacities"])
+    @property
+    def sh0(self):
+        # [N, 1, 3]
+        return self.gs["sh0"]
+    @property
+    def shN(self):
+        # [N, TOTAL-1, 3]
+        return self.gs["shN"]
+    @property
+    def colors(self):
+        # [N, TOTAL, 3]
+        sh0 = self.sh0
+        shN = self.shN
+        return torch.cat([sh0, shN], dim=1)
