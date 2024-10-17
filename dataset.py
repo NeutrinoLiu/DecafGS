@@ -36,6 +36,7 @@ import torch
 import numpy as np
 import json
 from PIL import Image
+import random
 
 from interface import Camera
 from examples.datasets.normalize import (
@@ -185,6 +186,7 @@ init type: {cfg.init_type}
         """
         get a batch of images
         storage awared loader
+        image format: [3, H, W]
         """
         assert isinstance(triplets, list), "batch_get expects a list of triplets"
         if len(triplets) > self.max_cache:
@@ -204,15 +206,49 @@ init type: {cfg.init_type}
 
 
 class CamSampler:
-    def __init__(self, policy: Literal["random", "sequential"],
-                 cams_idx, batch_size, further_downscale=1):
+    def __init__(self, 
+                 scene: SceneReader,
+                 # range
+                 cams_idx, 
+                 frames_idx,
+                 further_downscale=1,
+                 # options
+                 batch_size = 1, 
+                 policy: Literal["random", "sequential"] = "sequential"):
+        self.scene = scene
         self.policy = policy
-        self.cams = cams_idx
+        self.cams = cams_idx.copy()
+        self.frames = frames_idx.copy()
         self.batch_size = batch_size
         self.further_downscale = further_downscale
+        # runtime
+        self._pool = None
+        print(f"data sampler pool size: {len(self.cams) * len(self.frames)}")
+    def __len__(self):
+        return - (len(self.cams) * len(self.frames) // -self.batch_size)
     def __iter__(self):
         # reset the iterator
+        self._pool = sorted([(c, f, self.further_downscale) \
+                             for c in self.cams for f in self.frames], key=lambda x: (x[0], x[1]))
         return self
     def __next__(self):
         # return a batch of cams
-        pass
+        if len(self._pool) == 0:
+            raise StopIteration
+        if self.policy == "random":
+            random.shuffle(self._pool)
+        batch = self._pool[:self.batch_size]
+        self._pool = self._pool[self.batch_size:]
+        return self.cam_formatter(self.scene.batch_get(batch))
+    
+    @staticmethod
+    def cam_formatter(get_res):
+        """
+        format the get_res to a dict
+        """
+        ret = {
+            "camtoworld": torch.stack([cam.c2w for cam, _ in get_res], dim=0),
+            "K": torch.stack([cam.intri for cam, _ in get_res], dim=0),
+            "image": torch.stack([img.permute(1, 2, 0) for _, img in get_res], dim=0)
+        }
+        return ret

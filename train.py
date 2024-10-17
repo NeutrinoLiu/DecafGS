@@ -75,23 +75,24 @@ class Runner:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scene = SceneReader(data_cfg, True)
 
-        train_idx, test_idx = dataset_split(
-            list(self.scene.cam_num),
+        train_cam_idx, test_cam_idx = dataset_split(
+            list(range(self.scene.cam_num)),
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_num, model_cfg.frame_end)
         self.train_sampler = CamSampler(
-            "random",
-            train_idx, 
+            self.scene,
+            train_cam_idx,
+            list(range(min_frame, max_frame)),
             train_cfg.batch_size,
-            min_frame, max_frame)
+            "random")
         self.test_sampler = CamSampler(
-            "sequential",
-            test_idx,
-            1,             # batch size = 1 for testing
-            min_frame, max_frame)
+            self.scene,
+            test_cam_idx,
+            list(range(min_frame, max_frame))
+            )
         
-        print(f"totally {len(train_idx)}+{len(test_idx)} cams")
+        print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
         print(f"training frame {min_frame} ~ {max_frame}")
 
         # model
