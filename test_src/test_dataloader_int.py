@@ -19,8 +19,7 @@ import nerfview
 import viser
 
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy 
-from examples.datasets.colmap import Dataset, Parser
+from gsplat.strategy import MCMCStrategy 
 from examples.utils import knn, rgb_to_sh, set_random_seed
 
 from dataset import SceneReader, CamSampler, dataset_split

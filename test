@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+
 test_dir="test_src"
 
 if [ $# -eq 0 ]; then
@@ -7,16 +10,17 @@ if [ $# -eq 0 ]; then
     for file in "$test_dir"/*.py; do
         if [ -f "$file" ]; then
             filename=$(basename -- "$file")
-            echo "  ${filename%.py}"
+            formatted_name=${filename#test_}  # Remove 'test_' prefix
+            echo "  ${formatted_name%.py}"    # Remove '.py' extension
         fi
     done
     echo "Usage: $0 <test_name>"
     exit 0
 fi
 
-if [ -f "$test_dir/$1.py" ]; then
-    python "$test_dir/$1.py"
+if [ -f "$test_dir/test_$1.py" ]; then
+    python "$test_dir/test_$1.py"
 else
-    echo "Error: Test file '$test_dir/$1.py' not found."
+    echo "Error: Test file '$test_dir/test_$1.py' not found."
     exit 1
 fi

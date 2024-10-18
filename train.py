@@ -105,7 +105,7 @@ class Runner:
             )
         
         # ------------------------------- other plugin ------------------------------- #
-        self.strategy = MCMCStrategy(verbose=True, cap_max=200_000)
+        self.strategy = MCMCStrategy(cap_max=200_000)
         self.state = {}
         self.state.update(self.strategy.initialize_state())
 
@@ -247,7 +247,7 @@ class Runner:
         test_loader = iter(self.test_sampler)
         results = {k:0.0 for k in self.eval_funcs.keys()}
         for data in test_loader:
-            assert len(data) == 1, "batch size should be 1"
+            assert len(data) == 1, "batch size should be 1 for test"
             cam, gt = data[0]
             pc: Gaussian = self.model.deform(cam)
             img, _, _ = self.render(
@@ -266,7 +266,6 @@ class Runner:
 
 @hydra.main(config_path='.', config_name='config', version_base=None)
 def main(cfg):
-    print(f"current dir: {os.getcwd()}")
     assert True, 'sanity check'
     runner = Runner(cfg.data, cfg.model, cfg.train)
     runner.train()

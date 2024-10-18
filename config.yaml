@@ -1,6 +1,6 @@
 # default config
 data:
-  format: "FVV"
+  format: "volumetric_video"
   data_dir: "scenes/coffee"
   frame_total: 10
   resolution: 2

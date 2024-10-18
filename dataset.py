@@ -59,12 +59,12 @@ def dataset_split(all:list , test_every):
             train.append(all[i])
     return train, test
 
-def random_init(scene_scale, n, extend):
+def random_init(n, extend):
     """
     randomly sample n points from the unit cubic
     """
     points = torch.rand(n, 3) * 2 - 1
-    points *= scene_scale * extend
+    points *= extend
     colors = torch.rand(n, 3)
     return points, colors
 
@@ -136,9 +136,8 @@ class SceneReader:
         dist = np.linalg.norm(cam_t_batch - center, axis=1)
         self.scene_scale = np.max(dist)
         if cfg.init_type == "random":
-            points, points_rgb = random_init(self.scene_scale,
-                                             cfg.init_random_num,
-                                             cfg.init_random_extend)
+            points, points_rgb = random_init(cfg.init_random_num,
+                self.scene_scale * cfg.init_random_extend)
         assert points is not None, "points has not been initialized !"
 
         # 3) dataset's meta data
