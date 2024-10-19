@@ -17,8 +17,8 @@ from gsplat.rendering import rasterization
 from examples.utils import knn, rgb_to_sh, set_random_seed
 
 from dataset import SceneReader, CamSampler, dataset_split
-from interface import Gaussian, Camera
-from decaf import DeformableScaffold
+from interface import Gaussians, Camera
+from pipeline import DummyPipeline
 
 def init_model_and_opt(
         scene: SceneReader,
@@ -64,8 +64,8 @@ def init_model_and_opt(
             )
         for attr_name, _, attr_lr in params # independent optimizer for each attr
     }
-    gs = Gaussian(gs_attr_dict)
-    model = DeformableScaffold(gs, model_cfg)
+    gs = Gaussians(gs_attr_dict)
+    model = DummyPipeline(gs, model_cfg)
     return model, opts
 
 class Runner:
@@ -121,7 +121,7 @@ class Runner:
         # TODO online viewer
     
     @staticmethod
-    def render( pc: Gaussian,
+    def render( pc: Gaussians,
                 cam: Camera,
                 **kwargs): # sh_degree is expected to be provided
 
@@ -182,7 +182,7 @@ class Runner:
             # ------------------------------ forward pass ------------------------------ #
             assert len(data) == 1, "batch size should be 1"
             cam, gt = data[0]
-            pc: Gaussian = self.model.deform(cam)
+            pc: Gaussians = self.model.produce(cam)
             img, _, info = self.render(
                 pc=pc,
                 cam=cam,
@@ -209,7 +209,7 @@ class Runner:
             # ------------------------------- backward pass ------------------------------ #
             # update the states
             self.strategy.step_pre_backward(
-                params=pc.gs,
+                params=pc._gs,
                 optimizers=self.opts,
                 state=self.state,
                 step=step,
@@ -222,7 +222,7 @@ class Runner:
             
             # relocate and densification
             self.strategy.step_post_backward(
-                params=pc.gs,
+                params=pc._gs,
                 optimizers=self.opts,
                 state=self.state,
                 step=step,
@@ -249,7 +249,7 @@ class Runner:
         for data in test_loader:
             assert len(data) == 1, "batch size should be 1 for test"
             cam, gt = data[0]
-            pc: Gaussian = self.model.deform(cam)
+            pc: Gaussians = self.model.produce(cam)
             img, _, _ = self.render(
                 pc=pc,
                 cam=cam,

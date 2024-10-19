@@ -55,39 +55,85 @@ class Camera:
         Rt[:3, 3] = self.c2w_t
         return Rt
 
-class Gaussian:
+class SpacetimeEmbeds:
+    def __init__(self, cfg):
+        pass
+
+class Anchors:
+    """
+    Higher layer wrapper of anchor dict
+    """
+    required = ["feature", "xyz", "offsets", "offset_extend", "scale_extend", "opacity_decay"]
+    def __init__(self, anchor):
+        assert all([k in anchor for k in self.required]), f"missing key in Anchors: {self.required}"
+        self._anchor = anchor
+    @property
+    def feature(self):
+        return self._anchor["feature"]
+    @property
+    def device(self):
+        return self._anchor["xyz"].device
+    @property
+    def anchor_xyz(self):
+        # [N, 3]
+        return self._anchor["xyz"]
+    @property
+    def offsets(self):
+        # [N, K, 3]
+        return self._anchor["offsets"]
+    @property
+    def offset_extend(self):
+        # [N, 3]
+        return torch.exp(self._anchor["offset_extend"])
+    @property
+    def childs_xyz(self):
+        # [N, K, 3]
+        return self.anchor_xyz[:, None] + self.offsets * self.offset_extend[:, None]
+    @property
+    def scale_extend(self):
+        # [N, 3]
+        return torch.exp(self._anchor["scale_extend"])
+    @property
+    def opacity_decay(self):
+        # [N,]
+        return torch.exp(self._anchor["opacity_decay"])
+
+
+class Gaussians:
     """
     higher layer warpper of Guassian para dict
     """
-    def __init__(self, gs:dict):
-        self.gs = gs
+    required = ["means", "scales", "quats", "opacities", "sh0", "shN"]
+    def __init__(self, gs):
+        assert all([k in gs for k in self.required]), f"missing key in Gaussians: {self.required}"
+        self._gs = gs
     @property
     def device(self):
-        return self.gs["means"].device
+        return self._gs["means"].device
     @property
     def means(self):
         # [N, 3]
-        return self.gs["means"]
+        return self._gs["means"]
     @property
     def quats(self):
         # [N, 4]
-        return self.gs["quats"]
+        return self._gs["quats"]
     @property
     def scales(self):
         # [N, 3]
-        return torch.exp(self.gs["scales"])
+        return torch.exp(self._gs["scales"])
     @property
     def opacities(self):
         # [N,]
-        return torch.sigmoid(self.gs["opacities"])
+        return torch.sigmoid(self._gs["opacities"])
     @property
     def sh0(self):
         # [N, 1, 3]
-        return self.gs["sh0"]
+        return self._gs["sh0"]
     @property
     def shN(self):
         # [N, TOTAL-1, 3]
-        return self.gs["shN"]
+        return self._gs["shN"]
     @property
     def colors(self):
         # [N, TOTAL, 3]

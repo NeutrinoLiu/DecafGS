@@ -27,6 +27,7 @@ expected cams.json structure:
         "cam01": ...
     }
     intri is pixel based, not fov based
+    axis direction follows colmap's convention
 """
 
 import os 
