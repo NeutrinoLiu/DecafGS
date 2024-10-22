@@ -88,7 +88,9 @@ class Anchors:
     @property
     def childs_xyz(self):
         # [N, K, 3]
-        return self.anchor_xyz[:, None] + self.offsets * self.offset_extend[:, None]
+        K = self.offsets.shape[1]
+        return self.anchor_xyz.unsqueeze(1).repeat(1, K, 1) + \
+              self.offsets * self.offset_extend.unsqueeze(1).repeat(1, K, 1)
     @property
     def scale_extend(self):
         # [N, 3]

@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+import nerfview
+import viser
 
 from fused_ssim import fused_ssim
 from gsplat.rendering import rasterization
@@ -70,7 +72,13 @@ class Runner:
                 normalize=True).to(self.device),
         }
 
-        # TODO online viewer
+        # ------------------------------- online viewer ------------------------------ #
+        self.server = viser.ViserServer(port=8090, verbose=False)
+        self.viewer = nerfview.Viewer(
+            server=self.server,
+            render_fn=self.viewer_callback,
+            mode="training",
+        )
     
     @staticmethod
     def render( pc: Gaussians,
@@ -106,7 +114,6 @@ class Runner:
         return img, alpha, info
 
     def train(self):
-
         init_step = 0
         max_step = self.cfg.max_step
         pbar = tqdm(range(init_step, max_step))
@@ -161,6 +168,7 @@ class Runner:
             
             self.model.optimize()
             self.model.zero_grad()
+            self.model.update_lr(step)
 
             # ----------------------------------- eval ----------------------------------- #
             if step in [i - 1 for i in self.cfg.test_steps]:
@@ -188,11 +196,41 @@ class Runner:
             results[k] /= len(self.test_sampler)
         print(f"step {step}: \n{json.dumps(results, indent=4)}")
 
+    @torch.no_grad()
+    def viewer_callback(
+        self, camera_state: nerfview.CameraState, img_wh: "tuple[int, int]"
+    ):
+        W, H = img_wh
+        c2w = camera_state.c2w
+        K = camera_state.get_K(img_wh)
+        c2w = torch.from_numpy(c2w).float().to(self.device)
+        K = torch.from_numpy(K).float().to(self.device)
+        c2w_R = c2w[:3, :3]
+        c2w_t = c2w[:3, 3]
+
+        cam = Camera(
+            path=None,
+            intri=K,
+            c2w_R=c2w_R,
+            c2w_t=c2w_t,
+            width=W,
+            height=H,
+            frame=0
+        )
+        img, _, _ = self.render(
+            pc=self.model.produce(cam),
+            cam=cam,
+            sh_degree=0
+        )
+        return img[0].cpu().numpy()
+
+
 
 
 @hydra.main(config_path='.', config_name='config', version_base=None)
 def main(cfg):
     assert True, 'sanity check'
+    torch.autograd.set_detect_anomaly(True)
     runner = Runner(cfg.data, cfg.model, cfg.train)
     runner.train()
 

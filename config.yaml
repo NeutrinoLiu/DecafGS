@@ -15,21 +15,23 @@ model:
   # anchor embedding
   anchor_num: 10000
   anchor_feature_dim: 32
-  anchor_child_gs: 5
+  anchor_child_num: 5
   # frame embedding
   frame_start: 0
   frame_end: 1
   frame_dim: 200
+  # neural GS MLP
+  hidden_dim: 32
 
 train:
-  max_step: 20000
+  max_step: 30000
   batch_size: 1
   # init vals
   init_opacity: 0.1
   init_scale: 1.0
+  # [legacy] learning rate
   sh_degree: 3
   sh_degree_interval: 1000
-  # [legacy] learning rate
   lr_mean: 1e-4
   lr_scale: 5e-3
   lr_opacity: 5e-2
@@ -37,18 +39,34 @@ train:
   lr_sh0: 2.5e-3
   lr_shN: 1.25e-4
   # [anchor] learning rate
-  lr_frame_embed: 1e-3
-  lr_anchor_embed: 1e-3
-  lr_anchor_xyz: 1e-3
-  lr_anchor_offsets: 1e-5
-  lr_anchor_offset_extend: 1e-5
-  lr_anchor_scale_extend: 1e-5
+  lr_frame_embed: 0.0075
+  lr_anchor_embed: 0.0075
+  lr_anchor_xyz: 
+    - 1e-4
+    - 1e-6
+    - 1e-2
+    - 30000
+  lr_anchor_offsets: 
+    - 1e-2
+    - 1e-4
+    - 1e-2
+    - 30000
+  lr_anchor_offset_extend: 7e-3
+  lr_anchor_scale_extend: 7e-3
   lr_anchor_opacity_decay: 1e-5
   # [neural GS] learning rate
-  lr_mlp_scales: 1e-3
-  lr_mlp_opacities: 1e-3
-  lr_mlp_quats: 1e-3
-  lr_mlp_colors: 1e-3
+  lr_mlp_scales: 0.004
+  lr_mlp_quats: 0.004
+  lr_mlp_opacities:
+    - 2e-3
+    - 2e-5
+    - 1e-2
+    - 30000
+  lr_mlp_colors: 
+    - 8e-3
+    - 5e-5
+    - 1e-2
+    - 30000
   # loss and regularization
   ssim_lambda: 0.2
   reg_opacity: 1e-2
@@ -57,6 +75,18 @@ train:
   test_every: 25
   test_steps:
     - 1000
+    - 2000
     - 4000
+    - 6000
     - 8000
+    - 10000
     - 12000
+    - 14000
+    - 16000
+    - 18000
+    - 20000
+    - 22000
+    - 24000
+    - 26000
+    - 28000
+    - 30000

@@ -5,12 +5,15 @@ from interface import Camera, Gaussians, Anchors
 import torch
 from torch import nn
 import math
+
 from examples.utils import rgb_to_sh
+from lr_scheduler import get_adam_and_lr_sched
 
 def random_sample(points, K):
     M = points.shape[0]
     indices = torch.randint(0, M, (K,))
     return points[indices]
+
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
 
@@ -47,26 +50,26 @@ class Deformable(nn.Module):
         # embeddings
         self._frame_embed = torch.nn.Parameter(
             torch.zeros(self.frame_length,
-                        model_cfg.frame_dim)).to(device)
+                        model_cfg.frame_dim).to(device))
         # anchor & childs xyz
         assert init_pts.shape[-1] == 3, "init_pts should be [N, 3]"
         anchor_xyz = random_sample(init_pts, model_cfg.anchor_num)
         N = anchor_xyz.shape[0]
         anchor_xyz += random_init(N, 3, 0.001) # add noise
-        print(f"sampling {N} anchors from {init_pts.shape[0]} init points")
+        print(f"sampling {N} anchors from {init_pts.shape[0]} init points\n")
         self._anchor_xyz = torch.nn.Parameter(
-            anchor_xyz).to(device)
+            anchor_xyz.to(device))
         self._anchor_offsets = torch.nn.Parameter(
-            torch.zeros(N, model_cfg.anchor_child_gs, 3)).to(device)
+            torch.zeros(N, model_cfg.anchor_child_num, 3).float().to(device))
         # anchor attributes
         self._anchor_offset_extend = torch.nn.Parameter(
-            torch.ones(N, 3)).to(device)
+            torch.zeros(N, 3).float().to(device))
         self._anchor_scale_extend = torch.nn.Parameter(
-            torch.ones(N, 3)).to(device)
-        self._anchor_opcity_decay = torch.nn.Parameter(
-            torch.ones(N)).to(device)
+            torch.zeros(N, 3).float().to(device))
+        self._anchor_opacity_decay = torch.nn.Parameter(
+            torch.ones(N).float().to(device))
         self._anchor_embed = torch.nn.Parameter(
-            torch.zeros(N, model_cfg.anchor_feature_dim)).to(device)
+            torch.zeros(N, model_cfg.anchor_feature_dim).float().to(device))
         
         # ----------------------------------- MLPs ----------------------------------- #
         # TODO temporal defomable model
@@ -80,20 +83,9 @@ class Deformable(nn.Module):
             ("anchor_offsets", self._anchor_offsets, train_cfg.lr_anchor_offsets),
             ("anchor_offset_extend", self._anchor_offset_extend, train_cfg.lr_anchor_offset_extend),
             ("anchor_scale_extend", self._anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
-            ("anchor_opcity_decay", self._anchor_opcity_decay, train_cfg.lr_anchor_opcity_decay)
+            ("anchor_opacity_decay", self._anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
-        self.opts = {
-            attr_name: torch.optim.Adam(
-                [{
-                    'name': attr_name,
-                    'params': attr,
-                    'lr': attr_lr * math.sqrt(opt_cali)
-                }],
-                eps=1e-15 / math.sqrt(opt_cali),
-                betas=(1 - opt_cali * (1 - 0.9), 1 - opt_cali * (1 - 0.999))
-            )
-            for attr_name, attr, attr_lr in to_be_optimized
-        }
+        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali)
 
     def forward(self, frame) -> Anchors:
         """
@@ -107,7 +99,7 @@ class Deformable(nn.Module):
             "offsets": self._anchor_offsets,
             "offset_extend": self._anchor_offset_extend,
             "scale_extend": self._anchor_scale_extend,
-            "opacity_decay": self._anchor_opcity_decay
+            "opacity_decay": self._anchor_opacity_decay
         }
         return Anchors(aks_dict)
 
@@ -131,7 +123,7 @@ def decay(opacities, decay):
     https://arxiv.org/abs/2404.09591
     """
     # TODO implement decay after we implement relocation
-    return nn.Sigmoid()(opacities)
+    return opacities
 
 class Scaffold(nn.Module):
     """
@@ -151,57 +143,48 @@ class Scaffold(nn.Module):
         hidden_dim = model_cfg.hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid()).to(device), # scale of offset
+            "scales": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Identity()).to(device), # scale of offset
             "quats": MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity()).to(device),
-            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Sigmoid()).to(device),
+            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Identity()).to(device),
             "colors": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid()).to(device)
         })
 
         # --------------------------------- optimizer -------------------------------- #
         opt_cali = train_cfg.batch_size
         to_be_optimized = [
-            (f"mlp_{k}", v, train_cfg[f"lr_mlp_{k}"])
+            (f"mlp_{k}", v.parameters(), train_cfg[f"lr_mlp_{k}"])
             for k, v in self.mlp.items()
         ]
-        self.opts = {
-            attr_name: torch.optim.Adam(
-                [{
-                    'name': attr_name,
-                    'params': attr,
-                    'lr': attr_lr * math.sqrt(opt_cali)
-                }],
-                eps=1e-15 / math.sqrt(opt_cali),
-                betas=(1 - opt_cali * (1 - 0.9), 1 - opt_cali * (1 - 0.999))
-            )
-            for attr_name, attr, attr_lr in to_be_optimized
-        }
+        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali)
 
     def forward(self, aks: Anchors, cam: Camera) -> Gaussians:
         """
         forward pass
         """
         # anchor
-        means = aks.childs_xyz
-        anchor_xyz = aks.anchor_xyz
-        scales_extend = aks.scale_extend
-        opacity_decay = aks.opacity_decay
+        means = aks.childs_xyz                                  # [N, K, 3]
+        N = means.shape[0]
+        K = means.shape[1]
+        anchor_xyz = aks.anchor_xyz                             # [N, 3]
+        scales_extend = aks.scale_extend                        # [N, 3]
+        opacity_decay = aks.opacity_decay                       # [N,]
 
-        feature = aks.feature
-        ob_view = cam.c2w_t.to(aks.device) - anchor_xyz
+        feature = aks.feature                                   # [N, D]
+        ob_view = cam.c2w_t.float().to(aks.device) - anchor_xyz         # [N, 3]
         ob_view = ob_view / torch.norm(ob_view, dim=-1, keepdim=True)
-        fea_ob = torch.cat([feature, ob_view], dim=-1)
+        fea_ob = torch.cat([feature, ob_view], dim=-1)          # [N, D + 3]
 
-        print(f"fea_ob: {fea_ob.shape}")
-
-        # mlp
-        scales = self.mlp["scales"](fea_ob)
-        scales = scales * scales_extend
-        quats = self.mlp["quats"](fea_ob)
-        opacities = self.mlp["opacities"](fea_ob)
+        # attrs
+        means = means.reshape(-1, 3)                            # [N * K, 3]
+        scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
+        scales *= scales_extend.unsqueeze(1).repeat(1, K, 1)    # [N, K, 3]
+        scales = scales.reshape(-1, 3)                          # [N * K, 3]
+        quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
+        opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
         opacities = decay(opacities, opacity_decay)
-        colors = self.mlp["colors"](fea_ob)
+        colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
 
-        sh_degree = 3
+        sh_degree = 0
         # since gs_dict is simply an interface
         # dont have to wrap it with torch.nn.ParameterDict
         gs_dict = {
@@ -223,6 +206,7 @@ class DecafPipeline(nn.Module):
     parameterless nn module
     """
     def __init__(self, train_cfg, model_cfg, init_pts, device):
+        super(DecafPipeline, self).__init__()
         self.deform = Deformable(train_cfg,
                                  model_cfg,
                                  init_pts,
@@ -230,7 +214,6 @@ class DecafPipeline(nn.Module):
         self.scaffold = Scaffold(train_cfg,
                                  model_cfg,
                                  device)
-        # renaming forward
         self.produce = self.forward
     
     def forward(self, cam: Camera) -> Gaussians:
@@ -240,7 +223,6 @@ class DecafPipeline(nn.Module):
         return gs
     
     def optimize(self):
-        # TODO: does the order of optimization matter?
         for opt in self.scaffold.opts.values():
             opt.step()
         for opt in self.deform.opts.values():
@@ -253,3 +235,9 @@ class DecafPipeline(nn.Module):
             opt.zero_grad()
         for opt in self.deform.opts.values():
             opt.zero_grad()
+    
+    def update_lr(self, step):
+        for lr_sched in self.scaffold.lr_sched.values():
+            lr_sched.step()
+        for lr_sched in self.deform.lr_sched.values():
+            lr_sched.step()
