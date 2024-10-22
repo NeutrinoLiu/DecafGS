@@ -8,12 +8,12 @@ data:
   max_cached_img: 100
   # point cloud init
   init_type: "sfm"
-  init_random_num: 2000
+  init_random_num: 10000
   init_random_extend: 3
 
 model:
   # anchor embedding
-  anchor_num: 10000
+  anchor_num: 40000
   anchor_feature_dim: 32
   anchor_child_num: 5
   # frame embedding

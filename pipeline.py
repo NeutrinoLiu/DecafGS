@@ -1,13 +1,16 @@
 """
 main decaf (deformable scaffold) nn module
 """
+from pytorch_memlab import (LineProfiler, clear_global_line_profiler, profile,
+                            profile_every, set_target_gpu)
+
 from interface import Camera, Gaussians, Anchors
 import torch
 from torch import nn
 import math
 
 from examples.utils import rgb_to_sh
-from lr_scheduler import get_adam_and_lr_sched
+from helper import get_adam_and_lr_sched
 
 def random_sample(points, K):
     M = points.shape[0]
@@ -60,16 +63,16 @@ class Deformable(nn.Module):
         self._anchor_xyz = torch.nn.Parameter(
             anchor_xyz.to(device))
         self._anchor_offsets = torch.nn.Parameter(
-            torch.zeros(N, model_cfg.anchor_child_num, 3).float().to(device))
+            torch.zeros(N, model_cfg.anchor_child_num, 3, dtype=torch.float32, device=device))
         # anchor attributes
         self._anchor_offset_extend = torch.nn.Parameter(
-            torch.zeros(N, 3).float().to(device))
+            torch.zeros(N, 3, dtype=torch.float32, device=device))
         self._anchor_scale_extend = torch.nn.Parameter(
-            torch.zeros(N, 3).float().to(device))
+            torch.zeros(N, 3, dtype=torch.float32, device=device))
         self._anchor_opacity_decay = torch.nn.Parameter(
-            torch.ones(N).float().to(device))
+            torch.ones(N, dtype=torch.float32, device=device))
         self._anchor_embed = torch.nn.Parameter(
-            torch.zeros(N, model_cfg.anchor_feature_dim).float().to(device))
+            torch.zeros(N, model_cfg.anchor_feature_dim, dtype=torch.float32, device=device))
         
         # ----------------------------------- MLPs ----------------------------------- #
         # TODO temporal defomable model

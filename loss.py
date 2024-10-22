@@ -1,4 +1,3 @@
 """
-loss functions
+loss and evaluation relatedfunctions
 """
-

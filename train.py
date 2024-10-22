@@ -1,7 +1,6 @@
 from dataclasses import dataclass
-import math
-import os
 import json
+import time
 
 from tqdm import tqdm
 import hydra
@@ -22,7 +21,10 @@ from dataset import SceneReader, CamSampler, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
+from helper import save_tensor_images, mem_profile_start, mem_profile_end
+
 class Runner:
+
     def __init__(self, data_cfg, model_cfg, train_cfg):
 
         self.cfg = train_cfg
@@ -54,7 +56,7 @@ class Runner:
         self.model = DecafPipeline(
             train_cfg=train_cfg,
             model_cfg=model_cfg,
-            init_pts=torch.from_numpy(self.scene.init_pts).float(),
+            init_pts=torch.Tensor(self.scene.init_pts).float(),
             device=self.device
         )
         
@@ -73,7 +75,7 @@ class Runner:
         }
 
         # ------------------------------- online viewer ------------------------------ #
-        self.server = viser.ViserServer(port=8090, verbose=False)
+        self.server = viser.ViserServer(port=8080, verbose=False)
         self.viewer = nerfview.Viewer(
             server=self.server,
             render_fn=self.viewer_callback,
@@ -83,12 +85,22 @@ class Runner:
     @staticmethod
     def render( pc: Gaussians,
                 cam: Camera,
+                permute: bool = True,
                 **kwargs): # sh_degree is expected to be provided
 
         viewmats = torch.linalg.inv(cam.c2w)[None].to(pc.device)
         Ks = cam.intri[None].to(pc.device)
         width = cam.width
         height = cam.height
+
+        print(f"""shapes:
+    means: {pc.means.shape}
+    quats: {pc.quats.shape}
+    scales: {pc.scales.shape}
+    opacities: {pc.opacities.shape}
+    colors: {pc.colors.shape}
+    viewmats: {viewmats.shape}
+    Ks: {Ks.shape}""")
 
         img, alpha, info = rasterization(
             # gaussian attrs
@@ -109,9 +121,11 @@ class Runner:
         
         # output of rasterization is (N, H, W, 3), 
         # we need to permute to (N, 3, H, W) for loss calculation
-        img = img.permute(0, 3, 1, 2).clamp(0, 1.)
+        if permute:
+            img = img.permute(0, 3, 1, 2).clamp(0, 1.)
 
         return img, alpha, info
+
 
     def train(self):
         init_step = 0
@@ -120,6 +134,12 @@ class Runner:
 
         train_loader = iter(self.train_sampler)
         for step in pbar:
+            
+            while self.viewer.state.status == "paused":
+                time.sleep(0.01)
+            self.viewer.lock.acquire()
+            tic = time.time()
+
             # ------------------------- read train data in batch ------------------------- #
             try:
                 data = next(train_loader)
@@ -132,11 +152,14 @@ class Runner:
             assert len(data) == 1, "batch size should be 1"
             cam, gt = data[0]
             pc: Gaussians = self.model.produce(cam)
+
+            if step == 0: mem_profile_start()
             img, _, info = self.render(
                 pc=pc,
                 cam=cam,
                 sh_degree=0
             ) # img and info are batched actually, but batch size = 1
+            if step == 0: mem_profile_end()
 
             # losses
             gt = gt[None].to(self.device)
@@ -174,13 +197,24 @@ class Runner:
             if step in [i - 1 for i in self.cfg.test_steps]:
                 self.eval(step)
 
-            # TODO save model
+            # ---------------------------- viser viewer update --------------------------- #
+            self.viewer.lock.release()
+            num_train_rays_per_step = (
+                gt.shape[0] * gt.shape[1] * gt.shape[2]
+            )
+            num_train_steps_per_sec = 1.0 / (time.time() - tic)
+            num_train_rays_per_sec = num_train_rays_per_step * num_train_steps_per_sec
+            # static update
+            self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
+            self.viewer.update(step, num_train_rays_per_step)
+
+
 
     @torch.no_grad()
     def eval(self, step):
         test_loader = iter(self.test_sampler)
         results = {k:0.0 for k in self.eval_funcs.keys()}
-        for data in test_loader:
+        for i, data in enumerate(test_loader):
             assert len(data) == 1, "batch size should be 1 for test"
             cam, gt = data[0]
             pc: Gaussians = self.model.produce(cam)
@@ -192,6 +226,8 @@ class Runner:
             gt = gt[None].to(self.device)
             for k, func in self.eval_funcs.items():
                 results[k] += func(img, gt).item()
+            save_tensor_images(img[0], gt[0], f"output/eval_{step}_{i}.png")
+
         for k in results.keys():
             results[k] /= len(self.test_sampler)
         print(f"step {step}: \n{json.dumps(results, indent=4)}")
@@ -203,8 +239,8 @@ class Runner:
         W, H = img_wh
         c2w = camera_state.c2w
         K = camera_state.get_K(img_wh)
-        c2w = torch.from_numpy(c2w).float().to(self.device)
-        K = torch.from_numpy(K).float().to(self.device)
+        c2w = torch.from_numpy(c2w).float()
+        K = torch.from_numpy(K).float()
         c2w_R = c2w[:3, :3]
         c2w_t = c2w[:3, 3]
 
@@ -217,11 +253,13 @@ class Runner:
             height=H,
             frame=0
         )
+
         img, _, _ = self.render(
             pc=self.model.produce(cam),
             cam=cam,
-            sh_degree=0
-        )
+            permute=False,
+            sh_degree=0)
+
         return img[0].cpu().numpy()
 
 

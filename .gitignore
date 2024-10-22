@@ -2,3 +2,4 @@
 scenes
 output
 outputs
+*.pickle
