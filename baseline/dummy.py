@@ -12,13 +12,61 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
 from fused_ssim import fused_ssim
+from gsplat.strategy import MCMCStrategy
 from gsplat.rendering import rasterization
 from examples.utils import knn, rgb_to_sh, set_random_seed
 
-from strategy import Strategy
 from dataset import SceneReader, CamSampler, dataset_split
 from interface import Gaussians, Camera
-from pipeline import DecafPipeline
+from pipeline import DummyPipeline
+
+def init_model_and_opt(
+        scene: SceneReader,
+        train_cfg: dict,
+        model_cfg: dict,
+        device: str = "cuda",
+    ):
+
+    # ------------------------------ gaussian attrs ------------------------------ #
+    xyz = torch.from_numpy(scene.init_pts).float()
+    rgb = torch.from_numpy(scene.init_pts_rgb).float()
+
+    N = xyz.shape[0]
+    dist2_avg = (knn(xyz, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+    dist_avg = torch.sqrt(dist2_avg)
+    scale = torch.log(dist_avg * train_cfg.init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    rotate = torch.rand(N, 4)
+    opacity = torch.logit(torch.full((N,), train_cfg.init_opacity)) # reverse sigmoid
+    sh0 = rgb_to_sh(rgb).unsqueeze(1) # [N, 1, 3]
+    shN = torch.zeros(N, (train_cfg.sh_degree + 1) ** 2 - 1, 3)      # [N, TOTAL-1, 3]
+
+    params = [
+        ("means", torch.nn.Parameter(xyz), train_cfg.lr_mean * scene.scene_scale),
+        ("scales", torch.nn.Parameter(scale), train_cfg.lr_scale),
+        ("quats", torch.nn.Parameter(rotate), train_cfg.lr_quat),
+        ("opacities", torch.nn.Parameter(opacity), train_cfg.lr_opacity),
+        ("sh0", torch.nn.Parameter(sh0), train_cfg.lr_sh0),
+        ("shN", torch.nn.Parameter(shN), train_cfg.lr_shN),
+    ]
+    
+    # ----------------- optimizer binding and learning rate setup ---------------- #
+    gs_attr_dict = torch.nn.ParameterDict({k: v for k, v, _ in params}).to(device)
+    opt_cali = train_cfg.batch_size # calibrate learning rate by batch size
+    opts = {
+        attr_name: torch.optim.Adam(
+            [{
+                'name'  : attr_name,
+                'params': gs_attr_dict[attr_name],
+                'lr'    : attr_lr * math.sqrt(opt_cali),
+            }],
+            eps     = 1e-15 / math.sqrt(opt_cali),
+            betas   = (1 - opt_cali * (1 - 0.9), 1 - opt_cali * (1 - 0.999))
+            )
+        for attr_name, _, attr_lr in params # independent optimizer for each attr
+    }
+    gs = Gaussians(gs_attr_dict)
+    model = DummyPipeline(gs, model_cfg)
+    return model, opts
 
 class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
@@ -49,15 +97,15 @@ class Runner:
         print(f"training frame {min_frame} ~ {max_frame}\n")
 
         # ----------------------------- model & opt init ----------------------------- #
-        self.model = DecafPipeline(
-            train_cfg=train_cfg,
-            model_cfg=model_cfg,
-            init_pts=torch.from_numpy(self.scene.init_pts).float(),
+        self.model, self.opts = init_model_and_opt(
+            self.scene,
+            train_cfg,
+            model_cfg,
             device=self.device
-        )
+            )
         
         # ------------------------------- other plugin ------------------------------- #
-        self.strategy = Strategy()
+        self.strategy = MCMCStrategy(cap_max=200_000)
         self.state = {}
         self.state.update(self.strategy.initialize_state())
 
@@ -111,8 +159,18 @@ class Runner:
         max_step = self.cfg.max_step
         pbar = tqdm(range(init_step, max_step))
 
+        # lr decaying
+        schedulers = [
+            torch.optim.lr_scheduler.ExponentialLR(
+                self.opts['means'], gamma=0.01 ** (1.0 / max_step))
+        ]
+
         train_loader = iter(self.train_sampler)
         for step in pbar:
+            active_sh_degrees = min(
+                step // self.cfg.sh_degree_interval,
+                self.cfg.sh_degree
+            )
             # ------------------------- read train data in batch ------------------------- #
             try:
                 data = next(train_loader)
@@ -128,7 +186,7 @@ class Runner:
             img, _, info = self.render(
                 pc=pc,
                 cam=cam,
-                sh_degree=0
+                sh_degree=active_sh_degrees
             ) # img and info are batched actually, but batch size = 1
 
             # losses
@@ -150,17 +208,33 @@ class Runner:
 
             # ------------------------------- backward pass ------------------------------ #
             # update the states
-            self.strategy.step_pre_backward()
+            self.strategy.step_pre_backward(
+                params=pc._gs,
+                optimizers=self.opts,
+                state=self.state,
+                step=step,
+                info=info
+            )
 
             loss.backward()
-            desc = f"loss={loss.item():.3f}| " f"sh degree={0}| "
+            desc = f"loss={loss.item():.3f}| " f"sh degree={active_sh_degrees}| "
             pbar.set_description(desc)
             
             # relocate and densification
-            self.strategy.step_post_backward()
+            self.strategy.step_post_backward(
+                params=pc._gs,
+                optimizers=self.opts,
+                state=self.state,
+                step=step,
+                info=info,
+                lr=schedulers[0].get_last_lr()[0]
+            )
             
-            self.model.optimize()
-            self.model.zero_grad()
+            for optimizer in self.opts.values():
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for scheduler in schedulers:
+                scheduler.step()
 
             # ----------------------------------- eval ----------------------------------- #
             if step in [i - 1 for i in self.cfg.test_steps]:
@@ -179,7 +253,7 @@ class Runner:
             img, _, _ = self.render(
                 pc=pc,
                 cam=cam,
-                sh_degree=0
+                sh_degree=self.cfg.sh_degree
             )
             gt = gt[None].to(self.device)
             for k, func in self.eval_funcs.items():

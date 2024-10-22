@@ -7,6 +7,13 @@ from torch import nn
 import math
 from examples.utils import rgb_to_sh
 
+def random_sample(points, K):
+    M = points.shape[0]
+    indices = torch.randint(0, M, (K,))
+    return points[indices]
+def random_init(N, dim, scale=1.):
+    return (torch.randn(N, dim) * 2. - 1.) * scale
+
 class DummyPipeline(nn.Module):
     """
     pass through module,
@@ -20,49 +27,60 @@ class DummyPipeline(nn.Module):
 
 class Deformable(nn.Module):
     """
+    A temporal deformation module
+    yet currently it simply takes anchors' embeddings into account
     deform nn module
         :input [frame]
         :output [aks]
         :params frame_embed, anchor_embed, anchor_attrs, deform_mlp
     """
-    def __init__(self, cfg, frame_start, frame_end, device):
+    def __init__(self, 
+                 train_cfg,
+                 model_cfg,
+                 init_pts,
+                 device):
         super(Deformable, self).__init__()
-        self.frame_base = frame_start
-        self.frame_length = frame_end - frame_start
+        self.frame_base = model_cfg.frame_start
+        self.frame_length = model_cfg.frame_end - model_cfg.frame_start
         
         # ---------------------------------- params ---------------------------------- #
+        # embeddings
         self._frame_embed = torch.nn.Parameter(
-            torch.randn(self.frame_length,
-                        cfg.frame_dim)).to(device)
-        self._anchor_embed = torch.nn.Parameter(
-            torch.randn(cfg.anchor_num,
-                        cfg.anchor_feature_dim)).to(device)
+            torch.zeros(self.frame_length,
+                        model_cfg.frame_dim)).to(device)
+        # anchor & childs xyz
+        assert init_pts.shape[-1] == 3, "init_pts should be [N, 3]"
+        anchor_xyz = random_sample(init_pts, model_cfg.anchor_num)
+        N = anchor_xyz.shape[0]
+        anchor_xyz += random_init(N, 3, 0.001) # add noise
+        print(f"sampling {N} anchors from {init_pts.shape[0]} init points")
         self._anchor_xyz = torch.nn.Parameter(
-            torch.randn(cfg.anchor_num, 3)).to(device)
+            anchor_xyz).to(device)
         self._anchor_offsets = torch.nn.Parameter(
-            torch.randn(cfg.anchor_num,
-                        cfg.anchor_child_num,
-                        3)).to(device)
+            torch.zeros(N, model_cfg.anchor_child_gs, 3)).to(device)
+        # anchor attributes
         self._anchor_offset_extend = torch.nn.Parameter(
-            torch.randn(cfg.anchor_num, 3)).to(device)
+            torch.ones(N, 3)).to(device)
         self._anchor_scale_extend = torch.nn.Parameter(
-            torch.randn(cfg.anchor_num, 3)).to(device)
+            torch.ones(N, 3)).to(device)
         self._anchor_opcity_decay = torch.nn.Parameter(
-            torch.randn(cfg.anchor_num)).to(device)
+            torch.ones(N)).to(device)
+        self._anchor_embed = torch.nn.Parameter(
+            torch.zeros(N, model_cfg.anchor_feature_dim)).to(device)
         
         # ----------------------------------- MLPs ----------------------------------- #
         # TODO temporal defomable model
         
         # --------------------------------- optimizor -------------------------------- #
-        opt_cali = cfg.batch_size
+        opt_cali = train_cfg.batch_size
         to_be_optimized = [
-            ("frame_embed", self._frame_embed, cfg.lr_frame_embed),
-            ("anchor_embed", self._anchor_embed, cfg.lr_anchor_embed),
-            ("anchor_xyz", self._anchor_xyz, cfg.lr_anchor_xyz),
-            ("anchor_offsets", self._anchor_offsets, cfg.lr_anchor_offsets),
-            ("anchor_offset_extend", self._anchor_offset_extend, cfg.lr_anchor_offset_extend),
-            ("anchor_scale_extend", self._anchor_scale_extend, cfg.lr_anchor_scale_extend),
-            ("anchor_opcity_decay", self._anchor_opcity_decay, cfg.lr_anchor_opcity_decay)
+            ("frame_embed", self._frame_embed, train_cfg.lr_frame_embed),
+            ("anchor_embed", self._anchor_embed, train_cfg.lr_anchor_embed),
+            ("anchor_xyz", self._anchor_xyz, train_cfg.lr_anchor_xyz),
+            ("anchor_offsets", self._anchor_offsets, train_cfg.lr_anchor_offsets),
+            ("anchor_offset_extend", self._anchor_offset_extend, train_cfg.lr_anchor_offset_extend),
+            ("anchor_scale_extend", self._anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
+            ("anchor_opcity_decay", self._anchor_opcity_decay, train_cfg.lr_anchor_opcity_decay)
         ]
         self.opts = {
             attr_name: torch.optim.Adam(
@@ -92,14 +110,6 @@ class Deformable(nn.Module):
             "opacity_decay": self._anchor_opcity_decay
         }
         return Anchors(aks_dict)
-    
-    def optimize(self):
-        """
-        optimize all parameters
-        """
-        for opt in self.opts.values():
-            opt.step()
-            opt.zero_grad()
 
 def MLP_builder(in_dim, hidden_dim, out_dim, out_act):
     """
@@ -120,7 +130,8 @@ def decay(opacities, decay):
     https://arxiv.org/abs/2404.06109
     https://arxiv.org/abs/2404.09591
     """
-    return None
+    # TODO implement decay after we implement relocation
+    return nn.Sigmoid()(opacities)
 
 class Scaffold(nn.Module):
     """
@@ -129,13 +140,16 @@ class Scaffold(nn.Module):
         :output [gs]
         :params mlp of scales, quats, opacities, colors
     """
-    def __init__(self, cfg, device):
+    def __init__(self, 
+                 train_cfg, 
+                 model_cfg,
+                 device):
         super(Scaffold, self).__init__()
 
         # ----------------------------------- mlps ----------------------------------- #
-        in_dim = cfg.anchor_feature_dim + 3
-        hidden_dim = cfg.hidden_dim
-        k = cfg.anchor_child_num
+        in_dim = model_cfg.anchor_feature_dim + 3
+        hidden_dim = model_cfg.hidden_dim
+        k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
             "scales": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid()).to(device), # scale of offset
             "quats": MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity()).to(device),
@@ -144,9 +158,9 @@ class Scaffold(nn.Module):
         })
 
         # --------------------------------- optimizer -------------------------------- #
-        opt_cali = cfg.batch_size
+        opt_cali = train_cfg.batch_size
         to_be_optimized = [
-            (f"mlp_{k}", v, cfg[f"lr_mlp_{k}"])
+            (f"mlp_{k}", v, train_cfg[f"lr_mlp_{k}"])
             for k, v in self.mlp.items()
         ]
         self.opts = {
@@ -202,26 +216,24 @@ class Scaffold(nn.Module):
                                device=means.device)
         }
         return Gaussians(gs_dict)
-    
-    def optimize(self):
-        """
-        optimize all parameters
-        """
-        for opt in self.opts.values():
-            opt.step()
-            opt.zero_grad()
 
 class DecafPipeline(nn.Module):
     """
     a wrapper of system pipeline
+    parameterless nn module
     """
-    def __init__(self, cfg, device):
-        self.cfg = cfg
-        self.deform = Deformable(cfg, cfg.frame_start, cfg.frame_end, device)
-        self.scaffold = Scaffold(cfg, device)
-        # TODO add optimizer
+    def __init__(self, train_cfg, model_cfg, init_pts, device):
+        self.deform = Deformable(train_cfg,
+                                 model_cfg,
+                                 init_pts,
+                                 device)
+        self.scaffold = Scaffold(train_cfg,
+                                 model_cfg,
+                                 device)
+        # renaming forward
+        self.produce = self.forward
     
-    def produce(self, cam: Camera) -> Gaussians:
+    def forward(self, cam: Camera) -> Gaussians:
         frame = cam.frame
         aks = self.deform(frame)
         gs = self.scaffold(aks, cam)
@@ -229,5 +241,15 @@ class DecafPipeline(nn.Module):
     
     def optimize(self):
         # TODO: does the order of optimization matter?
-        self.deform.optimize()
-        self.scaffold.optimize()
+        for opt in self.scaffold.opts.values():
+            opt.step()
+        for opt in self.deform.opts.values():
+            opt.step()
+
+    def zero_grad(self):
+        # zero grad
+        # dont zero grad before all opt has been stepped
+        for opt in self.scaffold.opts.values():
+            opt.zero_grad()
+        for opt in self.deform.opts.values():
+            opt.zero_grad()
