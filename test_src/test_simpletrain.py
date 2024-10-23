@@ -64,7 +64,7 @@ def init_gs_and_opt(
         batch_size: int = 1, # BS will impact learning rate of optimizor
         # init method
         init_type: Literal["random", "sfm"] = "sfm",
-        init_rand_pts: int = 100_000,
+        init_rand_pts: int = 1000_000,
         init_rand_extent: float = 3.0,
         # init attr
         init_scale: float = 1.0,
@@ -144,11 +144,11 @@ class Runner:
             scene_scale=self.scene_scale,       # box of canonical space
             device=self.device,
             batch_size=cfg.batch_size,
-            init_type="sfm",
+            init_type="random",
             sh_degree=cfg.sh_degree,
         )
         # strategy for densification
-        self.strategy = MCMCStrategy(verbose=True, cap_max=200_000)
+        self.strategy = MCMCStrategy(verbose=True, cap_max=1000_000)
         self.strategy_state = self.strategy.initialize_state()
 
         # ------------------------------- eval metrics ------------------------------- #
@@ -175,14 +175,24 @@ class Runner:
                 height: int,
                 **kwargs):
         
-        means = self.gs['means']       # [N, 3]
-        quats = self.gs['quats'] # [N, 4]
-        scales = torch.exp(self.gs['scales'])   # [N, 3]
+        means = self.gs['means']                    # [N, 3]
+        quats = self.gs['quats']                    # [N, 4]
+        scales = torch.exp(self.gs['scales'])       # [N, 3]
         opacities = torch.sigmoid(self.gs['opacities']) # [N,]
-        sh0 = self.gs['sh0']       # [N, 1, 3]
-        shN = self.gs['shN']       # [N, TOTAL-1, 3]
+        sh0 = self.gs['sh0']                        # [N, 1, 3]
+        shN = self.gs['shN']                        # [N, TOTAL-1, 3]
         color = torch.cat([sh0, shN], dim=1) # [N, TOTAL, 3]
         w2c_batch = torch.linalg.inv(c2w_batch)
+
+        print(f"""shapes:
+    means: {means.shape}
+    quats: {quats.shape}
+    scales: {scales.shape}
+    opacities: {opacities.shape}
+    color: {color.shape}
+    w2c_batch: {w2c_batch.shape}
+    K_batch: {K_batch.shape}
+    """)
 
         # TODO, are they activated or not?
         img, alpha, info = rasterization(

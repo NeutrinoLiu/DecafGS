@@ -68,6 +68,12 @@ class Anchors:
         assert all([k in anchor for k in self.required]), f"missing key in Anchors: {self.required}"
         self._anchor = anchor
     @property
+    def N(self):
+        return self.offsets.shape[0]
+    @property
+    def K(self):
+        return self.offsets.shape[1]
+    @property
     def feature(self):
         return self._anchor["feature"]
     @property
@@ -123,11 +129,11 @@ class Gaussians:
     @property
     def scales(self):
         # [N, 3]
-        return torch.exp(self._gs["scales"])
+        return self._gs["scales"]
     @property
     def opacities(self):
         # [N,]
-        return torch.sigmoid(self._gs["opacities"])
+        return self._gs["opacities"]
     @property
     def sh0(self):
         # [N, 1, 3]

@@ -24,20 +24,21 @@ model:
   hidden_dim: 32
 
 train:
+  # logging
+  log_path: "output.json"
   max_step: 30000
   batch_size: 1
-  # init vals
-  init_opacity: 0.1
-  init_scale: 1.0
-  # [legacy] learning rate
-  sh_degree: 3
-  sh_degree_interval: 1000
-  lr_mean: 1e-4
-  lr_scale: 5e-3
-  lr_opacity: 5e-2
-  lr_quat: 1e-3
-  lr_sh0: 2.5e-3
-  lr_shN: 1.25e-4
+  # [legacy] 
+  # init_opacity: 0.1
+  # init_scale: 1.0
+  # sh_degree: 3
+  # sh_degree_interval: 1000
+  # lr_mean: 1e-4
+  # lr_scale: 5e-3
+  # lr_opacity: 5e-2
+  # lr_quat: 1e-3
+  # lr_sh0: 2.5e-3
+  # lr_shN: 1.25e-4
   # [anchor] learning rate
   lr_frame_embed: 0.0075
   lr_anchor_embed: 0.0075
@@ -71,6 +72,14 @@ train:
   ssim_lambda: 0.2
   reg_opacity: 1e-2
   reg_scale: 1e-2
+  # densification with MCMC relocation
+  growing_rate: 0.05
+  perturb_intensity: 0
+  reloc_start_iter: 500
+  reloc_stop_iter: 25000
+  reloc_every: 100
+  reloc_dead_thres: 0.01
+  scale_decay: 0.95 # an approximate of MCMC rescale after relocation
   # evaluation
   test_every: 25
   test_steps:

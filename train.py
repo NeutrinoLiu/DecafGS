@@ -4,6 +4,7 @@ import time
 
 from tqdm import tqdm
 import hydra
+from omegaconf import OmegaConf
 import torch
 import torch.nn.functional as F
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -14,9 +15,9 @@ import viser
 
 from fused_ssim import fused_ssim
 from gsplat.rendering import rasterization
-from examples.utils import knn, rgb_to_sh, set_random_seed
+from examples.utils import set_random_seed
 
-from strategy import Strategy
+from strategy import DecafMCMCStrategy
 from dataset import SceneReader, CamSampler, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
@@ -30,6 +31,14 @@ class Runner:
         self.cfg = train_cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scene = SceneReader(data_cfg, True)
+
+        # --------------------------------- setup log -------------------------------- #
+        with open(self.cfg.log_path, 'w') as f:
+            f.write(json.dumps({
+                "data": OmegaConf.to_container(data_cfg),
+                "model": OmegaConf.to_container(model_cfg),
+                "train": OmegaConf.to_container(train_cfg)
+            }, indent=" ") + '\n\n====================\n\n')
 
         # ------------------------------- data loading ------------------------------- #å
         train_cam_idx, test_cam_idx = dataset_split(
@@ -61,7 +70,10 @@ class Runner:
         )
         
         # ------------------------------- other plugin ------------------------------- #
-        self.strategy = Strategy()
+        self.strategy = DecafMCMCStrategy(
+            train_cfg=train_cfg,
+            max_cap=model_cfg.anchor_num,
+            verbose=False)
         self.state = {}
         self.state.update(self.strategy.initialize_state())
 
@@ -92,15 +104,6 @@ class Runner:
         Ks = cam.intri[None].to(pc.device)
         width = cam.width
         height = cam.height
-
-        print(f"""shapes:
-    means: {pc.means.shape}
-    quats: {pc.quats.shape}
-    scales: {pc.scales.shape}
-    opacities: {pc.opacities.shape}
-    colors: {pc.colors.shape}
-    viewmats: {viewmats.shape}
-    Ks: {Ks.shape}""")
 
         img, alpha, info = rasterization(
             # gaussian attrs
@@ -151,15 +154,13 @@ class Runner:
             # ------------------------------ forward pass ------------------------------ #
             assert len(data) == 1, "batch size should be 1"
             cam, gt = data[0]
-            pc: Gaussians = self.model.produce(cam)
+            pc = self.model.produce(cam)
 
-            if step == 0: mem_profile_start()
             img, _, info = self.render(
                 pc=pc,
                 cam=cam,
                 sh_degree=0
             ) # img and info are batched actually, but batch size = 1
-            if step == 0: mem_profile_end()
 
             # losses
             gt = gt[None].to(self.device)
@@ -187,7 +188,15 @@ class Runner:
             pbar.set_description(desc)
             
             # relocate and densification
-            self.strategy.step_post_backward()
+            cur_anchor_xyz_lr = self.model.deform.lr_sched['anchor_xyz'].get_last_lr()[0]
+            self.strategy.step_post_backward(
+                gs=pc,
+                aks_params=self.model.deform.raw_params,
+                aks_opts=self.model.deform.opts,
+                state=self.state,
+                step=step,
+                anchor_xyz_lr=cur_anchor_xyz_lr
+            )
             
             self.model.optimize()
             self.model.zero_grad()
@@ -207,8 +216,9 @@ class Runner:
             # static update
             self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
             self.viewer.update(step, num_train_rays_per_step)
-
-
+        
+        print("training finished, viewer lingering...")
+        time.sleep(100)
 
     @torch.no_grad()
     def eval(self, step):
@@ -217,7 +227,7 @@ class Runner:
         for i, data in enumerate(test_loader):
             assert len(data) == 1, "batch size should be 1 for test"
             cam, gt = data[0]
-            pc: Gaussians = self.model.produce(cam)
+            pc = self.model.produce(cam)
             img, _, _ = self.render(
                 pc=pc,
                 cam=cam,
@@ -231,6 +241,9 @@ class Runner:
         for k in results.keys():
             results[k] /= len(self.test_sampler)
         print(f"step {step}: \n{json.dumps(results, indent=4)}")
+        results['step'] = step
+        with open(self.cfg.log_path, 'a') as f:
+            f.write(json.dumps(results) + '\n')
 
     @torch.no_grad()
     def viewer_callback(
@@ -254,8 +267,9 @@ class Runner:
             frame=0
         )
 
+        pc = self.model.produce(cam)
         img, _, _ = self.render(
-            pc=self.model.produce(cam),
+            pc=pc,
             cam=cam,
             permute=False,
             sh_degree=0)
@@ -263,10 +277,9 @@ class Runner:
         return img[0].cpu().numpy()
 
 
-
-
 @hydra.main(config_path='.', config_name='config', version_base=None)
 def main(cfg):
+    set_random_seed(42)
     assert True, 'sanity check'
     torch.autograd.set_detect_anomaly(True)
     runner = Runner(cfg.data, cfg.model, cfg.train)

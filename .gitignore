@@ -3,3 +3,4 @@ scenes
 output
 outputs
 *.pickle
+*.json
