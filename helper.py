@@ -3,8 +3,32 @@ import math
 from omegaconf import ListConfig
 
 import os
+import shutil
 from PIL import Image
 import torchvision.transforms as T
+
+def cur_time():
+    import datetime
+    return datetime.datetime.now().strftime("%H-%M-%S")
+
+class LogDirMgr:
+    def __init__(self, root):
+        if os.path.exists(root):
+            resp = input(f"Log directory {root} already exists. Press <y> to overwrite: ")
+            if resp.lower() != "y":
+                root = f"{root}_{cur_time()}"
+                print(f"Using new log directory {root}")
+        os.makedirs(root)
+
+        self.root = root
+        self.tb = root
+        self.config = os.path.join(root, "config.json")
+        self.log = os.path.join(root, "log.json")
+        self.stat = os.path.join(root, "stat.json")
+        self.ckpt = self._dir_builder("ckpt", lambda x: f"ckpt_{x}.pth")
+        self.render = self._dir_builder("render", lambda x: f"render_{x}.png")
+    def _dir_builder(self, dir, fmt):
+        return lambda x: os.path.join(self.root, dir, fmt(x))
 
 def save_tensor_images(img_tensor, gt_tensor, save_path):
     """

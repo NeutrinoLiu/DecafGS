@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import json
 import time
+import os
 
 from tqdm import tqdm
 import hydra
@@ -9,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torch.utils.tensorboard import SummaryWriter
+
 
 import nerfview
 import viser
@@ -22,25 +25,26 @@ from dataset import SceneReader, CamSampler, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
-from helper import save_tensor_images, mem_profile_start, mem_profile_end
+from helper import LogDirMgr, save_tensor_images, mem_profile_start, mem_profile_end
 
 class Runner:
 
     def __init__(self, data_cfg, model_cfg, train_cfg):
 
         self.cfg = train_cfg
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.scene = SceneReader(data_cfg, True)
-
         # --------------------------------- setup log -------------------------------- #
-        with open(self.cfg.log_path, 'w') as f:
+        self.log = LogDirMgr(self.cfg.log_dir)
+        with open(self.log.config, 'w') as f:
             f.write(json.dumps({
                 "data": OmegaConf.to_container(data_cfg),
                 "model": OmegaConf.to_container(model_cfg),
                 "train": OmegaConf.to_container(train_cfg)
-            }, indent=" ") + '\n\n====================\n\n')
+            }, indent=" "))
 
-        # ------------------------------- data loading ------------------------------- #å
+        # ------------------------------- data loading ------------------------------- #
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.scene = SceneReader(data_cfg, True)
+
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
             train_cfg.test_every)
@@ -93,7 +97,10 @@ class Runner:
             render_fn=self.viewer_callback,
             mode="training",
         )
-    
+
+        # ----------------------------- setup tensorboard ---------------------------- #
+        self.writer = SummaryWriter(log_dir=self.log.tb)
+
     @staticmethod
     def render( pc: Gaussians,
                 cam: Camera,
@@ -203,6 +210,12 @@ class Runner:
             self.model.update_lr(step)
 
             # ----------------------------------- eval ----------------------------------- #
+            self.writer.add_scalar("train/loss", loss.item(), step)
+            self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+            self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+            # print distributions
+            if step % 400 == 0:
+                self.writer.add_histogram("train/gs_opacities", pc.opacities, step)
             if step in [i - 1 for i in self.cfg.test_steps]:
                 self.eval(step)
 
@@ -218,7 +231,7 @@ class Runner:
             self.viewer.update(step, num_train_rays_per_step)
         
         print("training finished, viewer lingering...")
-        time.sleep(100)
+        time.sleep(5)
 
     @torch.no_grad()
     def eval(self, step):
@@ -236,13 +249,19 @@ class Runner:
             gt = gt[None].to(self.device)
             for k, func in self.eval_funcs.items():
                 results[k] += func(img, gt).item()
-            save_tensor_images(img[0], gt[0], f"output/eval_{step}_{i}.png")
+            save_tensor_images(img[0], gt[0], self.log.render(f"{step}_{i}"))
 
         for k in results.keys():
             results[k] /= len(self.test_sampler)
+        
+        # terminal print
         print(f"step {step}: \n{json.dumps(results, indent=4)}")
+        # tb print
+        self.writer.add_scalar("eval/psnr", results['psnr'] , step)
+        self.writer.add_scalar("eval/ssim", results['ssim'] , step)
+        # log print
         results['step'] = step
-        with open(self.cfg.log_path, 'a') as f:
+        with open(self.log.stat, 'a') as f:
             f.write(json.dumps(results) + '\n')
 
     @torch.no_grad()
@@ -272,14 +291,16 @@ class Runner:
             pc=pc,
             cam=cam,
             permute=False,
-            sh_degree=0)
+            sh_degree=0,
+            radius_clip=3.0,                # boost rendering speed
+            )
 
         return img[0].cpu().numpy()
 
 
 @hydra.main(config_path='.', config_name='config', version_base=None)
 def main(cfg):
-    set_random_seed(42)
+    set_random_seed(cfg.train.random_seed)
     assert True, 'sanity check'
     torch.autograd.set_detect_anomaly(True)
     runner = Runner(cfg.data, cfg.model, cfg.train)

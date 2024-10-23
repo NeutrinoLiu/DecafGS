@@ -25,7 +25,9 @@ model:
 
 train:
   # logging
-  log_path: "output.json"
+  random_seed: 42
+  log_dir: "output"
+  # training
   max_step: 30000
   batch_size: 1
   # [legacy] 
