@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Function to clean up and exit
+cleanup_and_exit() {
+    echo "Script interrupted. Cleaning up and exiting..."
+    exit 1
+}
+
+# Set up trap to catch interruption signals
+trap cleanup_and_exit SIGINT SIGTERM
+
+# Check if configs.txt exists
+if [ ! -f "batch_config.txt" ]; then
+    echo "Error: batch_config.txt not found"
+    exit 1
+fi
+
+read -r exp_name < "batch_config.txt"
+
+# Initialize line counter
+line_number=1
+
+# Read the file line by line
+while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip empty lines
+    if [ -n "$line" ]; then
+        # Run the command with line content and line number
+        python train.py $line train.log_dir="output_batch/$exp_name/$line_number"
+        
+        # Print status (optional)
+        echo "Processed line $line_number: $line"
+    fi
+    
+    # Increment line counter
+    ((line_number++))
+done < <(tail -n +2 "batch_config.txt")
+
+echo "All iterations completed successfully."

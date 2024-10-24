@@ -25,8 +25,8 @@ model:
 
 train:
   # logging
-  random_seed: 42
-  log_dir: "output"
+  random_seed: 103
+  log_dir: "output/coffee"
   # training
   max_step: 30000
   batch_size: 1

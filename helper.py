@@ -14,10 +14,13 @@ def cur_time():
 class LogDirMgr:
     def __init__(self, root):
         if os.path.exists(root):
-            resp = input(f"Log directory {root} already exists. Press <y> to overwrite: ")
-            if resp.lower() != "y":
+            # overwrite = input(f"Log directory {root} already exists. Press <y> to overwrite: ")
+            # workaround = overwrite.lower() != "y"
+            if True:
                 root = f"{root}_{cur_time()}"
-                print(f"Using new log directory {root}")
+                print(f"Log directory: {root}")
+            else:
+                shutil.rmtree(root)
         os.makedirs(root)
 
         self.root = root
