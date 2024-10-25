@@ -75,17 +75,15 @@ def save_tensor_images(img_tensor, gt_tensor, save_path):
     
     return combined
 
-def get_adam_and_lr_sched(to_be_optimized, opt_cali):
+def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
     ret_opts = {}
     ret_lr_sched = {}
     for attr_name, attr, attr_lr in to_be_optimized:
         if isinstance(attr_lr, ListConfig):
-            assert len(attr_lr) == 4, "lr list should have 4 elements"
+            assert len(attr_lr) >= 2, "lr list should have at least 2 elements"
             lr_init = attr_lr[0]
             lr_end = attr_lr[1]
-            lr_decay = attr_lr[2]
-            max_iter = attr_lr[3]
-            gamma = (lr_end / lr_init) ** (1.0 / max_iter)
+            gamma = (lr_end / lr_init) ** (1.0 / max_step)
             ret_opts[attr_name] = torch.optim.Adam(
                 [{
                     'name': attr_name,

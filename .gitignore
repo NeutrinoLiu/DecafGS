@@ -3,3 +3,6 @@ scenes
 output*
 *.pickle
 *.json
+*.prof
+experiments
+batch_config.txt

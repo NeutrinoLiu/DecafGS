@@ -2,13 +2,15 @@
 main decaf (deformable scaffold) nn module
 """
 
-from interface import Camera, Gaussians, Anchors
+from typing import Tuple
 import torch
 from torch import nn
 import math
 
 from examples.utils import rgb_to_sh
 from helper import get_adam_and_lr_sched
+from interface import Camera, Gaussians, Anchors
+
 
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
@@ -99,7 +101,7 @@ class Deformable(nn.Module):
             ("anchor_opacity_decay", para_anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
         self.raw_params = {k: v for k, v, _ in to_be_optimized}
-        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali)
+        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali, train_cfg.max_step)
 
     def forward(self, frame) -> Anchors:
         """
@@ -117,13 +119,13 @@ class Deformable(nn.Module):
         }
         return Anchors(aks_dict)
 
-def MLP_builder(in_dim, hidden_dim, out_dim, out_act, skip_cam=True):
+def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True):
     """
     build a 2 layer mlp module, refer to scaffold-gs
     """
     return nn.Sequential(
-        IngoreCam() if skip_cam else nn.Identity(),
-        nn.Linear(in_dim - 3 if skip_cam else in_dim,
+        nn.Identity() if view_dependent else IngoreCam(),
+        nn.Linear(in_dim if view_dependent else in_dim - 3,
                   hidden_dim),
         nn.ReLU(),
         nn.Linear(hidden_dim, out_dim),
@@ -161,10 +163,10 @@ class Scaffold(nn.Module):
         hidden_dim = model_cfg.hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid()).to(device), # scale of offset
-            "quats": MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity()).to(device),
-            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, ExpLayer()).to(device),
-            "colors": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), False).to(device)
+            "scales": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), model_cfg.view_dependent).to(device), # scale of offset
+            "quats": MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(), model_cfg.view_dependent).to(device),
+            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, ExpLayer(), model_cfg.view_dependent).to(device),
+            "colors": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), True).to(device)
         })
 
         # --------------------------------- optimizer -------------------------------- #
@@ -173,7 +175,7 @@ class Scaffold(nn.Module):
             (f"mlp_{k}", v.parameters(), train_cfg[f"lr_mlp_{k}"])
             for k, v in self.mlp.items()
         ]
-        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali)
+        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali, train_cfg.max_step)
 
     def forward(self, aks: Anchors, cam: Camera) -> Gaussians:
         """
@@ -186,7 +188,7 @@ class Scaffold(nn.Module):
         anchor_xyz = aks.anchor_xyz                             # [N, 3]
         scales_extend = aks.scale_extend                        # [N, 3]
         opacity_decay = aks.opacity_decay                       # [N,]
-        opacity_decay = opacity_decay.unsqueeze(1).repeat(1, K).flatten()
+        opacity_decay = opacity_decay.unsqueeze(1).expand(-1, K).flatten()
 
         feature = aks.feature                                   # [N, D]
         ob_view = cam.c2w_t.float().to(aks.device) - anchor_xyz         # [N, 3]
@@ -196,7 +198,7 @@ class Scaffold(nn.Module):
         # attrs
         means = means.reshape(-1, 3)                            # [N * K, 3]
         scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
-        scales = scales * scales_extend.unsqueeze(1).repeat(1, K, 1)    # [N, K, 3]
+        scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
         scales = scales.reshape(-1, 3)                          # [N * K, 3]
         quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
         opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
@@ -235,11 +237,11 @@ class DecafPipeline(nn.Module):
                                  device)
         self.produce = self.forward
     
-    def forward(self, cam: Camera) -> Gaussians:
+    def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
         frame = cam.frame
-        aks = self.deform(frame)
-        gs = self.scaffold(aks, cam)
-        return gs
+        aks: Anchors = self.deform(frame)
+        gs: Gaussians = self.scaffold(aks, cam)
+        return gs, aks
     
     def optimize(self):
         for opt in self.scaffold.opts.values():

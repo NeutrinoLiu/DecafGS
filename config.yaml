@@ -22,11 +22,13 @@ model:
   frame_dim: 200
   # neural GS MLP
   hidden_dim: 32
-
+  rotate6: False
+  trim_by_opacity: True
+  view_dependent: False
 train:
   # logging
   random_seed: 103
-  log_dir: "output/coffee"
+  root: "output/coffee"
   # training
   max_step: 30000
   batch_size: 1
@@ -47,13 +49,9 @@ train:
   lr_anchor_xyz: 
     - 1e-4
     - 1e-6
-    - 1e-2
-    - 30000
   lr_anchor_offsets: 
     - 1e-2
     - 1e-4
-    - 1e-2
-    - 30000
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
   lr_anchor_opacity_decay: 1e-5
@@ -63,17 +61,14 @@ train:
   lr_mlp_opacities:
     - 2e-3
     - 2e-5
-    - 1e-2
-    - 30000
   lr_mlp_colors: 
     - 8e-3
     - 5e-5
-    - 1e-2
-    - 30000
   # loss and regularization
   ssim_lambda: 0.2
   reg_opacity: 1e-2
-  reg_scale: 1e-2
+  reg_scale: 0
+  reg_volume: 1e-1
   # densification with MCMC relocation
   growing_rate: 0.05
   perturb_intensity: 0
@@ -87,17 +82,31 @@ train:
   test_steps:
     - 1000
     - 2000
+    - 3000
     - 4000
+    - 5000
     - 6000
+    - 7000
     - 8000
+    - 9000
     - 10000
+    - 11000
     - 12000
+    - 13000
     - 14000
+    - 15000
     - 16000
+    - 17000
     - 18000
+    - 19000
     - 20000
+    - 21000
     - 22000
+    - 23000
     - 24000
+    - 25000
     - 26000
+    - 27000
     - 28000
+    - 29000
     - 30000

@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, Union, List
 import torch
 
 from interface import Gaussians, Anchors
@@ -57,7 +57,7 @@ class DecafMCMCStrategy:
         self.scale_decay: float = train_cfg.scale_decay
         self.refine_start_iter: int = train_cfg.reloc_start_iter
         self.refine_stop_iter: int = train_cfg.reloc_stop_iter
-        self.refine_every: int = train_cfg.reloc_every
+        self.refine_every: int = train_cfg.reloc_every // train_cfg.batch_size
         self.min_opacity: float = train_cfg.reloc_dead_thres
         self.verbose: bool = verbose
 
@@ -71,7 +71,7 @@ class DecafMCMCStrategy:
 
     def step_post_backward(
         self,
-        gs: Gaussians,
+        gs: Union[Gaussians, List[Gaussians]],
         aks_params: Dict[str, torch.nn.Parameter],
         aks_opts: Dict[str, torch.optim.Optimizer],
         state: dict, 

@@ -86,7 +86,7 @@ class Anchors:
     @property
     def offsets(self):
         # [N, K, 3]
-        return self._anchor["offsets"]
+        return torch.tanh(self._anchor["offsets"])
     @property
     def offset_extend(self):
         # [N, 3]
@@ -148,3 +148,17 @@ class Gaussians:
         sh0 = self.sh0
         shN = self.shN
         return torch.cat([sh0, shN], dim=1)
+    @classmethod
+    def filter_by_ops(cls, gs, thres=0.):
+        """
+        filter gaussians by opacities
+        """
+        mask = gs.opacities > thres
+        return Gaussians({
+            "means": gs.means[mask],
+            "scales": gs.scales[mask],
+            "quats": gs.quats[mask],
+            "opacities": gs.opacities[mask],
+            "sh0": gs.sh0[mask],
+            "shN": gs.shN[mask]
+        })

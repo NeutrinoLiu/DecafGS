@@ -1,9 +1,13 @@
 from dataclasses import dataclass
 import json
 import time
+
+from line_profiler import profile
+
 import os
 
 from tqdm import tqdm
+import numpy as np
 import hydra
 from omegaconf import OmegaConf
 import torch
@@ -33,7 +37,7 @@ class Runner:
 
         self.cfg = train_cfg
         # --------------------------------- setup log -------------------------------- #
-        self.log = LogDirMgr(self.cfg.log_dir)
+        self.log = LogDirMgr(self.cfg.root)
         with open(self.log.config, 'w') as f:
             f.write(json.dumps({
                 "data": OmegaConf.to_container(data_cfg),
@@ -101,16 +105,19 @@ class Runner:
         # ----------------------------- setup tensorboard ---------------------------- #
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
-    @staticmethod
-    def render( pc: Gaussians,
+    def single_render( self,
+                pc: Gaussians,
                 cam: Camera,
                 permute: bool = True,
                 **kwargs): # sh_degree is expected to be provided
 
-        viewmats = torch.linalg.inv(cam.c2w)[None].to(pc.device)
-        Ks = cam.intri[None].to(pc.device)
+        # gsplat rasterization requires batched cams
+        viewmats_batch = torch.linalg.inv(cam.c2w)[None].to(pc.device)
+        Ks_batch = cam.intri[None].to(pc.device)
         width = cam.width
         height = cam.height
+
+        pc = Gaussians.filter_by_ops(pc, self.cfg.reloc_dead_thres)
 
         img, alpha, info = rasterization(
             # gaussian attrs
@@ -120,8 +127,8 @@ class Runner:
             opacities   =   pc.opacities,
             colors      =   pc.colors,
             # batched cams
-            viewmats    =   viewmats,
-            Ks          =   Ks,
+            viewmats    =   viewmats_batch,
+            Ks          =   Ks_batch,
             width       =   width,
             height      =   height,
             # options
@@ -134,9 +141,11 @@ class Runner:
         if permute:
             img = img.permute(0, 3, 1, 2).clamp(0, 1.)
 
-        return img, alpha, info
+        info['pc'] = pc
 
+        return img[0], alpha[0], info
 
+    @profile
     def train(self):
         init_step = 0
         max_step = self.cfg.max_step
@@ -159,32 +168,50 @@ class Runner:
                 data = next(train_loader)
             
             # ------------------------------ forward pass ------------------------------ #
-            assert len(data) == 1, "batch size should be 1"
-            cam, gt = data[0]
-            pc = self.model.produce(cam)
+            # for batched, yet cam might lead to different gaussian pc
+            # we simple render each image separately
+            # no need to combine tensors within the batch, which will lead to costly memory operations (low fps)
 
-            img, _, info = self.render(
-                pc=pc,
-                cam=cam,
-                sh_degree=0
-            ) # img and info are batched actually, but batch size = 1
+            pc_batched = []
 
-            # losses
-            gt = gt[None].to(self.device)
-            l1loss = F.l1_loss(img, gt)
-            ssimloss = 1 - fused_ssim(
-                img,
-                gt,
-                padding="valid")
-            loss = self.cfg.ssim_lambda * ssimloss + (1 - self.cfg.ssim_lambda) * l1loss
-        
-            # regs
-            if self.cfg.reg_opacity > 0:
-                loss += self.cfg.reg_opacity * \
-                    torch.abs(pc.opacities).mean()
-            if self.cfg.reg_scale > 0:
-                loss += self.cfg.reg_scale * \
-                    torch.abs(pc.scales).mean()
+            metrics = {
+                "l1loss": 0.0,
+                "ssimloss": 0.0,
+                "l1opacity": 0.0,
+                "l1scale": 0.0,
+                "volume": 0.0
+            }
+            weights = {
+                "l1loss": self.cfg.ssim_lambda,
+                "ssimloss": 1 - self.cfg.ssim_lambda,
+                "l1opacity": self.cfg.reg_opacity,
+                "l1scale": self.cfg.reg_scale,
+                "volume": self.cfg.reg_volume
+            }
+
+            for cam, gt in data:
+                pc, aks = self.model.produce(cam)
+
+                img, _, info = self.single_render(
+                    pc=pc,
+                    cam=cam,
+                    sh_degree=0
+                ) # img and info are batched actually, but batch size = 1
+
+                metrics["l1loss"] += F.l1_loss(img[None], gt[None])
+                metrics["ssimloss"] += 1 - fused_ssim(img[None], gt[None], padding="valid")
+                if self.cfg.reg_opacity > 0:
+                    metrics["l1opacity"] += torch.abs(pc.opacities).mean()
+                if self.cfg.reg_scale > 0:
+                    metrics["l1scale"] += torch.abs(pc.scales).mean()
+                if self.cfg.reg_volume > 0:
+                    metrics["volume"] += torch.prod(pc.scales, dim=1).mean()
+
+                pc_batched.append(pc)
+
+            # losses averaged by batch
+            metrics = {k: v / len(data) for k, v in metrics.items()}
+            loss =  sum([metrics[k] * weights[k] for k in metrics.keys()])
 
             # ------------------------------- backward pass ------------------------------ #
             # update the states
@@ -197,7 +224,7 @@ class Runner:
             # relocate and densification
             cur_anchor_xyz_lr = self.model.deform.lr_sched['anchor_xyz'].get_last_lr()[0]
             self.strategy.step_post_backward(
-                gs=pc,
+                gs=pc_batched[0],
                 aks_params=self.model.deform.raw_params,
                 aks_opts=self.model.deform.opts,
                 state=self.state,
@@ -211,11 +238,18 @@ class Runner:
 
             # ----------------------------------- eval ----------------------------------- #
             self.writer.add_scalar("train/loss", loss.item(), step)
-            self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-            self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+            self.writer.add_scalar("train/l1loss", metrics["l1loss"].item(), step)
+            self.writer.add_scalar("train/ssimloss", metrics["ssimloss"].item(), step)
+            self.writer.add_scalar("train/time", time.time() - tic, step)
+            num_active_gs = info['pc'].means.shape[0]
+            num_aks = aks.N
+            self.writer.add_scalar("train/active_gs", num_active_gs, step)
+            self.writer.add_scalar("train/average_child", num_active_gs / num_aks, step)
             # print distributions
-            if step % 400 == 0:
-                self.writer.add_histogram("train/gs_opacities", pc.opacities, step)
+            if step % 100 == 0:
+                self.writer.add_histogram("train/gs_opacities", pc.opacities.detach(), step)
+                offsets = aks.offsets.detach() * aks.offset_extend.detach().unsqueeze(1).expand(-1, aks.K, -1)
+                self.writer.add_histogram("train/childs_offsets", offsets.clamp(-1,1), step)
             if step in [i - 1 for i in self.cfg.test_steps]:
                 self.eval(step)
 
@@ -240,16 +274,17 @@ class Runner:
         for i, data in enumerate(test_loader):
             assert len(data) == 1, "batch size should be 1 for test"
             cam, gt = data[0]
-            pc = self.model.produce(cam)
-            img, _, _ = self.render(
+            pc, _ = self.model.produce(cam)
+            img, _, _ = self.single_render(
                 pc=pc,
                 cam=cam,
                 sh_degree=0
             )
-            gt = gt[None].to(self.device)
+            gt = gt.to(self.device)
+            img = img
             for k, func in self.eval_funcs.items():
-                results[k] += func(img, gt).item()
-            save_tensor_images(img[0], gt[0], self.log.render(f"{step}_{i}"))
+                results[k] += func(img[None], gt[None]).item()  # metrics func expect batches
+            save_tensor_images(img, gt, self.log.render(f"{step}_{i}"))
 
         for k in results.keys():
             results[k] /= len(self.test_sampler)
@@ -286,16 +321,16 @@ class Runner:
             frame=0
         )
 
-        pc = self.model.produce(cam)
-        img, _, _ = self.render(
+        pc, _ = self.model.produce(cam)
+        img, _, _ = self.single_render(
             pc=pc,
             cam=cam,
-            permute=False,
+            permute=False,      # no need to permute, viewer need (H, W, 3)
             sh_degree=0,
             radius_clip=3.0,                # boost rendering speed
             )
 
-        return img[0].cpu().numpy()
+        return img.cpu().numpy()
 
 
 @hydra.main(config_path='.', config_name='config', version_base=None)
