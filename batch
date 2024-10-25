@@ -37,4 +37,4 @@ done < <(tail -n +2 "batch_config.txt")
 
 echo "All iterations completed successfully."
 
-cp batch_config.txt output_batch/$exp_name/config.txt
+cp batch_config.txt experiments/$exp_name/config.txt

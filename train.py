@@ -31,6 +31,7 @@ from pipeline import DecafPipeline
 
 from helper import LogDirMgr, save_tensor_images, mem_profile_start, mem_profile_end
 
+@torch.no_grad()
 def batch_analyse(pc_batched, K, dead_thres):
     # pc_batched is a list of pc, each pc is a Gaussians instance
     # we need to analyse the batched pc to get the average spawn and opacity
