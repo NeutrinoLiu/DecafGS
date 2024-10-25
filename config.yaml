@@ -76,6 +76,7 @@ train:
   reloc_stop_iter: 25000
   reloc_every: 100
   reloc_dead_thres: 0.01
+  impact_momentum: 0
   scale_decay: 0.95 # an approximate of MCMC rescale after relocation
   # evaluation
   test_every: 25

@@ -228,6 +228,8 @@ class DecafPipeline(nn.Module):
     """
     def __init__(self, train_cfg, model_cfg, init_pts, device):
         super(DecafPipeline, self).__init__()
+        self.model_cfg = model_cfg
+        self.train_cfg = train_cfg
         self.deform = Deformable(train_cfg,
                                  model_cfg,
                                  init_pts,

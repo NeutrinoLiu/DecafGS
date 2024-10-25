@@ -31,8 +31,23 @@ from pipeline import DecafPipeline
 
 from helper import LogDirMgr, save_tensor_images, mem_profile_start, mem_profile_end
 
-class Runner:
+def batch_analyse(pc_batched, K, dead_thres):
+    # pc_batched is a list of pc, each pc is a Gaussians instance
+    # we need to analyse the batched pc to get the average spawn and opacity
+    anchor_avg_spawn = []
+    anchor_opacity = []
+    for pc in pc_batched:
+        ops_per_anchor = pc.opacities.reshape(-1, K)
+        spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
+        opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
+        anchor_avg_spawn.append(spawn_per_anchor)
+        anchor_opacity.append(opacity_per_anchor)
+    anchor_avg_spawn = sum(anchor_avg_spawn) / len(pc_batched)
+    anchor_opacity = sum(anchor_opacity) / len(pc_batched)
 
+    return anchor_avg_spawn, anchor_opacity
+
+class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
 
         self.cfg = train_cfg
@@ -83,7 +98,9 @@ class Runner:
             max_cap=model_cfg.anchor_num,
             verbose=False)
         self.state = {}
-        self.state.update(self.strategy.initialize_state())
+        N = self.model.deform.raw_params['anchor_xyz'].shape[0]
+        self.state.update(
+            self.strategy.initialize_state(N, self.device))
 
         # ----------------------------------- eval ----------------------------------- #å
         self.eval_funcs = {
@@ -141,7 +158,7 @@ class Runner:
         if permute:
             img = img.permute(0, 3, 1, 2).clamp(0, 1.)
 
-        info['pc'] = pc
+        info['rendered_pc'] = pc
 
         return img[0], alpha[0], info
 
@@ -152,6 +169,7 @@ class Runner:
         pbar = tqdm(range(init_step, max_step))
 
         train_loader = iter(self.train_sampler)
+
         for step in pbar:
             
             while self.viewer.state.status == "paused":
@@ -163,7 +181,7 @@ class Runner:
             try:
                 data = next(train_loader)
             except StopIteration:
-                # self.train_sampler.learn(self.state) # TODO adaptive data loader
+                # self.train_sampler.learn() # TODO adaptive data loader
                 train_loader = iter(self.train_sampler)
                 data = next(train_loader)
             
@@ -171,8 +189,6 @@ class Runner:
             # for batched, yet cam might lead to different gaussian pc
             # we simple render each image separately
             # no need to combine tensors within the batch, which will lead to costly memory operations (low fps)
-
-            pc_batched = []
 
             metrics = {
                 "l1loss": 0.0,
@@ -189,6 +205,7 @@ class Runner:
                 "volume": self.cfg.reg_volume
             }
 
+            pc_batched = []
             for cam, gt in data:
                 pc, aks = self.model.produce(cam)
 
@@ -214,8 +231,17 @@ class Runner:
             loss =  sum([metrics[k] * weights[k] for k in metrics.keys()])
 
             # ------------------------------- backward pass ------------------------------ #
-            # update the states
-            self.strategy.step_pre_backward()
+
+            K = self.model.model_cfg.anchor_child_num
+            thres = self.cfg.reloc_dead_thres
+            (anchor_avg_spawn,
+             anchor_opacity,
+             ) = batch_analyse(pc_batched, K, thres)
+
+            self.strategy.step_pre_backward(
+                state=self.state,
+                update=anchor_opacity,
+            )
 
             loss.backward()
             desc = f"loss={loss.item():.3f}| " f"sh degree={0}| "
@@ -223,11 +249,10 @@ class Runner:
             
             # relocate and densification
             cur_anchor_xyz_lr = self.model.deform.lr_sched['anchor_xyz'].get_last_lr()[0]
-            self.strategy.step_post_backward(
-                gs=pc_batched[0],
+            report = self.strategy.step_post_backward(
+                state=self.state,
                 aks_params=self.model.deform.raw_params,
                 aks_opts=self.model.deform.opts,
-                state=self.state,
                 step=step,
                 anchor_xyz_lr=cur_anchor_xyz_lr
             )
@@ -241,14 +266,18 @@ class Runner:
             self.writer.add_scalar("train/l1loss", metrics["l1loss"].item(), step)
             self.writer.add_scalar("train/ssimloss", metrics["ssimloss"].item(), step)
             self.writer.add_scalar("train/time", time.time() - tic, step)
-            num_active_gs = info['pc'].means.shape[0]
-            num_aks = aks.N
-            self.writer.add_scalar("train/active_gs", num_active_gs, step)
-            self.writer.add_scalar("train/average_child", num_active_gs / num_aks, step)
+            self.writer.add_scalar("train/active_gs", torch.sum(anchor_avg_spawn), step)
+            self.writer.add_scalar("train/average_child", torch.mean(anchor_avg_spawn), step)
+            if report.get("relocated", None) is not None:
+                self.writer.add_scalar("train/relocated", report["relocated"], step)
+
             # print distributions
             if step % 100 == 0:
-                self.writer.add_histogram("train/gs_opacities", pc.opacities.detach(), step)
-                offsets = aks.offsets.detach() * aks.offset_extend.detach().unsqueeze(1).expand(-1, aks.K, -1)
+                aks_last = aks  # aks we used here is the last aks in the batch, 
+                                # but aks (except frame_embedding) is the same across the same batch
+                                # so we can use it to represent the whole batch
+                self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
+                offsets = aks_last.childs_xyz - aks_last.anchor_xyz.unsqueeze(1).expand(-1, K, -1)
                 self.writer.add_histogram("train/childs_offsets", offsets.clamp(-1,1), step)
             if step in [i - 1 for i in self.cfg.test_steps]:
                 self.eval(step)

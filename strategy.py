@@ -3,12 +3,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, Union, List
 import torch
 
-from interface import Gaussians, Anchors
-
 from gsplat.strategy.ops import _update_param_with_optimizer
 
 
-def compute_decay_after_relocate(
+def op_sigmoid(x, k=100, x0=0.995):
+    return 1 / (1 + torch.exp(-k * (x - x0)))
+
+def compute_impact_after_split(
+        impacts: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    return 1 - (1 - impacts) ** (1. / counts)
+
+def compute_decay_after_split(
         decays: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
     """Compute the new decay after relocating the anchor.
 
@@ -26,9 +31,6 @@ def compute_decay_after_relocate(
     """
     # return decays
     return decays + torch.log(counts.float())
-
-def gs_to_aks_op(gs: Gaussians, K) -> torch.Tensor:
-    return gs.opacities.reshape(-1, K).norm(dim=-1, p=1)
 
 class DecafMCMCStrategy:
     """Strategy that follows the paper:
@@ -59,91 +61,116 @@ class DecafMCMCStrategy:
         self.refine_stop_iter: int = train_cfg.reloc_stop_iter
         self.refine_every: int = train_cfg.reloc_every // train_cfg.batch_size
         self.min_opacity: float = train_cfg.reloc_dead_thres
+        self.impact_momentum: float = train_cfg.impact_momentum
         self.verbose: bool = verbose
 
-    def initialize_state(self) -> Dict[str, Any]:
-        return {}
+    def initialize_state(self, N, device) -> Dict[str, Any]:
+        return {
+            "anchor_impacts": torch.ones(N, device=device, dtype=torch.float32),
+        }
 
-    def step_pre_backward(self):
+    def step_pre_backward(self, state, update):
+        assert "anchor_impacts" in state, "state should have <anchor_impacts>"
         # nothing need to be done for MCMC strategy pre backward
         # just follow the convention of gsplat strategy
-        pass
+        assert len(update) == state["anchor_impacts"].shape[0], f"shape mismatch: {len(update)} vs {state['anchor_impacts'].shape[0]}"
+        state["anchor_impacts"] = self.impact_momentum * state["anchor_impacts"] + (1 - self.impact_momentum) * update
+
 
     def step_post_backward(
         self,
-        gs: Union[Gaussians, List[Gaussians]],
+        state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         aks_opts: Dict[str, torch.optim.Optimizer],
-        state: dict, 
         step: int,
         anchor_xyz_lr: float,
     ):
-        # move to the correct device
-        splited_idx = None
+        assert "anchor_impacts" in state, "state should have <anchor_impacts>"
+        report = {}
         if (step < self.refine_stop_iter
             and step >= self.refine_start_iter
             and step % self.refine_every == 0):
             # --------------------------------- relocate --------------------------------- #
-            n_reloacted_aks, _ = self._reloate_anchor(
-                gs=gs,
+            n_reloacted_aks, dead_idx, target_idx = self._reloate_anchor(
+                state=state,
                 aks_params=aks_params,
                 opts=aks_opts
             )
-            if self.verbose:
-                print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
+            if n_reloacted_aks > 0:
+                # update anchor_impacts
+                state["anchor_impacts"][target_idx] = compute_impact_after_split(
+                    impacts=state["anchor_impacts"][target_idx],
+                    counts=torch.bincount(target_idx)[target_idx] + 1,
+                )
+                state["anchor_impacts"][dead_idx] = state["anchor_impacts"][target_idx]
+                if self.verbose:
+                    print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
             # ---------------------------------- add aks --------------------------------- #
-            n_new_aks, splited_idx = self._add_anchor(
-                gs=gs,
+            n_new_aks, growed_idx = self._grow_anchor(
+                state=state,
                 aks_params=aks_params,
                 opts=aks_opts,
             )
-            N = aks_params["anchor_offsets"].shape[0]
-            if self.verbose:
-                print(
-                    f"Step {step}: Added {n_new_aks} Anchors. "
-                    f"Now having {N} Anchors."
+            if n_new_aks > 0:
+                # add new anchor impacts
+                state["anchor_impacts"][growed_idx] = compute_impact_after_split(
+                    impacts=state["anchor_impacts"][growed_idx],
+                    counts=torch.bincount(growed_idx)[growed_idx] + 1,
                 )
+                state["anchor_impacts"] = torch.cat(
+                    [state["anchor_impacts"],
+                     state["anchor_impacts"][growed_idx]])
+                if self.verbose:
+                    print(
+                        f"Step {step}: Added {n_new_aks} Anchors. "
+                        f"Now having {aks_params['anchor_offsets'].shape[0]} Anchors."
+                    )
 
             torch.cuda.empty_cache()
 
+            report.update({
+                "relocated": n_reloacted_aks if n_reloacted_aks > 0 else None,
+                "grew": n_new_aks if n_new_aks > 0 else None
+            })
+
         # --------------------------------- add noise -------------------------------- #
         self._inject_noise_to_position(
-            gs=gs, 
+            state=state,
             aks_params=aks_params,
-            splited_idx=splited_idx,
             intensity=self.noise_lr * anchor_xyz_lr
         )
+
+        return report
 
     @torch.no_grad()
     def _reloate_anchor(
         self,
-        gs: Gaussians,
+        state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         opts: Dict[str, torch.optim.Optimizer],
     ):
+        anchor_impacts = state["anchor_impacts"]
         N = aks_params["anchor_offsets"].shape[0]
-        K = aks_params["anchor_offsets"].shape[1]
-        anchor_ops = gs_to_aks_op(gs, K)
-        assert anchor_ops.shape[0] == N, "shape mismatch"
-        dead_mask = anchor_ops <= self.min_opacity
+        assert anchor_impacts.shape[0] == N, "shape mismatch"
+        dead_mask = anchor_impacts <= self.min_opacity
         n = dead_mask.sum().item()
         if n == 0: return 0, None
 
         # use neural gs's opacity to decide dead/alive anchor
         dead_idx = dead_mask.nonzero(as_tuple=True)[0]
         alive_idx = (~dead_mask).nonzero(as_tuple=True)[0]
-        probs = anchor_ops[alive_idx]
+        probs = anchor_impacts[alive_idx]
 
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         sampled_idx = alive_idx[sampled_idx]
 
-        new_opacity_decay = compute_decay_after_relocate(
+        new_opacity_decay = compute_decay_after_split(
             decays = aks_params["anchor_opacity_decay"][sampled_idx],
             counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
         )
-        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
 
+        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
         def param_update(name: str, p: torch.Tensor) -> torch.Tensor:
             if name == "anchor_opacity_decay":
                 p[sampled_idx] = new_opacity_decay
@@ -154,33 +181,32 @@ class DecafMCMCStrategy:
         def opt_update(key: str, v: torch.Tensor) -> torch.Tensor:
             v[sampled_idx] = 0
             return v
+        
         _update_param_with_optimizer(param_update, opt_update, aks_params, opts)
 
-        return n, sampled_idx
+        return n, dead_idx, sampled_idx
 
     @torch.no_grad()
-    def _add_anchor(
+    def _grow_anchor(
         self,
-        gs: Gaussians,
+        state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         opts: Dict[str, torch.optim.Optimizer],
     ):
         N = aks_params["anchor_offsets"].shape[0]
-        K = aks_params["anchor_offsets"].shape[1]
         ratio = 1 + self.growing_rate
         N_target = min(self.cap_max, int(ratio * N))
         n = max(0, N_target - N)
         if n == 0: return 0, None
 
-        anchor_ops = gs_to_aks_op(gs, K)
-        probs = anchor_ops
+        probs = state["anchor_impacts"]
         sampled_idx = torch.multinomial(probs, n, replacement=True)
-        new_opacity_decay = compute_decay_after_relocate(
+        new_opacity_decay = compute_decay_after_split(
             decays = aks_params["anchor_opacity_decay"][sampled_idx],
             counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
         )
-        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
 
+        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
         def param_update(name: str, p: torch.Tensor) -> torch.Tensor:
             if name == "anchor_opacity_decay":
                 p[sampled_idx] = new_opacity_decay
@@ -191,6 +217,7 @@ class DecafMCMCStrategy:
         def opt_update(key: str, v: torch.Tensor) -> torch.Tensor:
             v_new = torch.zeros((len(sampled_idx), *v.shape[1:]), device=v.device)
             return torch.cat([v, v_new])
+        
         _update_param_with_optimizer(param_update, opt_update, aks_params, opts)
 
         return n, sampled_idx
@@ -198,26 +225,12 @@ class DecafMCMCStrategy:
     @torch.no_grad()
     def _inject_noise_to_position(
         self,
-        gs: Gaussians,
+        state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
-        splited_idx: torch.Tensor,
         intensity,
     ):
-        N = aks_params["anchor_offsets"].shape[0]
-        K = aks_params["anchor_offsets"].shape[1]
-        anchor_ops = gs_to_aks_op(gs, K)
-
-        def op_sigmoid(x, k=100, x0=0.995):
-            return 1 / (1 + torch.exp(-k * (x - x0)))
-        op_penalty = op_sigmoid(1 - anchor_ops)
-
-        if splited_idx is not None:
-            op_penalty_extend = op_penalty[splited_idx]
-            op_penalty = torch.cat([op_penalty, op_penalty_extend], dim=0)
-
-        op_penalty = op_penalty.unsqueeze(1)
-
+        noise_resistance = op_sigmoid(1 - state["anchor_impacts"]).unsqueeze(1)
         noise = torch.randn_like(aks_params["anchor_xyz"]) \
-                 * op_penalty * intensity * aks_params["anchor_scale_extend"]
+                 * noise_resistance * intensity * aks_params["anchor_scale_extend"]
         
         aks_params["anchor_xyz"] += noise
