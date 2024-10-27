@@ -68,12 +68,22 @@ class DecafMCMCStrategy:
             "anchor_impacts": torch.ones(N, device=device, dtype=torch.float32),
         }
 
-    def step_pre_backward(self, state, ak_childs, ak_ops):
+    def step_pre_backward(self, state, ak_childs, ak_ops, ak_grads):
         assert "anchor_impacts" in state, "state should have <anchor_impacts>"
         # nothing need to be done for MCMC strategy pre backward
         # just follow the convention of gsplat strategy
-        assert len(ak_ops) == state["anchor_impacts"].shape[0], f"shape mismatch: {len(ak_ops)} vs {state['anchor_impacts'].shape[0]}"
-        state["anchor_impacts"] = self.impact_momentum * state["anchor_impacts"] + (1 - self.impact_momentum) * ak_ops
+        assert len(ak_ops) == state["anchor_impacts"].shape[0], \
+            f"shape mismatch: {len(ak_ops)} vs {state['anchor_impacts'].shape[0]}"
+
+        impact_lambda = 0.5
+        normalize = lambda x: (x - x.min()) / (x.max() - x.min() + 1e-6)
+        ops = normalize(ak_ops)
+        # grads = normlize(ak_grads)
+        # impacts = ops * impact_lambda + grads * (1 - impact_lambda)
+        impacts = ops
+        
+        state["anchor_impacts"] = self.impact_momentum * state["anchor_impacts"] + \
+                                    (1 - self.impact_momentum) * impacts
         state["anchor_childs"] = ak_childs
 
 

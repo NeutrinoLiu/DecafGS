@@ -8,7 +8,7 @@ from torch import nn
 import math
 
 from examples.utils import rgb_to_sh
-from helper import get_adam_and_lr_sched, GlobalWriter
+from helper import get_adam_and_lr_sched, count_opt_params
 from interface import Camera, Gaussians, Anchors
 from layers import MLP_builder, ExpLayer, TempoMixture
 
@@ -61,7 +61,7 @@ class Deformable(nn.Module):
         para_anchor_scale_extend = nn.Parameter(
             torch.zeros(N, 3, dtype=torch.float32, device=device))
         para_anchor_opacity_decay = nn.Parameter(
-            torch.ones(N, dtype=torch.float32, device=device))
+            torch.zeros(N, dtype=torch.float32, device=device))
         para_anchor_embed = nn.Parameter(
             torch.zeros(N, model_cfg.anchor_embed_dim, dtype=torch.float32, device=device))
         anchor_params = [
@@ -143,13 +143,22 @@ class Deformable(nn.Module):
          d_scale_extend) = self.deform_mlp(embeds)
         
         K = self.anchor_params["anchor_offsets"].shape[1]
+        xyz = self.anchor_params["anchor_xyz"] + \
+            (d_xyz if self.cfg.deform_anchor_xyz else 0)
+        offsets = self.anchor_params["anchor_offsets"] + \
+            (d_offsets.reshape(-1, K, 3) if self.cfg.deform_child_offsets else 0)
+        offset_extend = self.anchor_params["anchor_offset_extend"] + \
+            (d_offset_extend if self.cfg.deform_child_offsets else 0)
+        scale_extend = self.anchor_params["anchor_scale_extend"] + \
+            (d_scale_extend if self.cfg.deform_child_scales else 0)
+
         aks_dict = {
             "feature"       : torch.cat([features, self.anchor_params["anchor_embed"]], dim=-1),
-            "xyz"           : self.anchor_params["anchor_xyz"]              + d_xyz,           # linear sum
-            "offsets"       : self.anchor_params["anchor_offsets"]          + d_offsets.reshape(-1, K, 3), # linear sum
-            "offset_extend" : self.anchor_params["anchor_offset_extend"]    + d_offset_extend, # exp sum
-            "scale_extend"  : self.anchor_params["anchor_scale_extend"]     + d_scale_extend,  # exp sum
-            "opacity_decay" : self.anchor_params["anchor_opacity_decay"]
+            "xyz"           : xyz,
+            "offsets"       : offsets,
+            "offset_extend" : offset_extend, 
+            "scale_extend"  : scale_extend,
+            "opacity_decay" : self.anchor_params["anchor_opacity_decay"]        # opacity decay is general
         }
         return Anchors(aks_dict)
 
@@ -294,3 +303,21 @@ class DecafPipeline(nn.Module):
             lr_sched.step()
         for lr_sched in self.deform.deform_lr_sched.values():
             lr_sched.step()
+    
+    def count_params(self):
+        """
+        count params
+        """
+        ret = {}
+        for k, v in self.deform.anchor_opts.items():
+            ret[k] = count_opt_params(v)
+        for k, v in self.deform.deform_opts.items():
+            ret[k] = count_opt_params(v)
+        for k, v in self.scaffold.opts.items():
+            ret[k] = count_opt_params(v)
+        total = 0
+        for k, v in ret.items():
+            total += v
+        ret["total"] = total
+        ret["total_mem"] = total * 4 / 1024 / 1024
+        return ret

@@ -198,7 +198,7 @@ init type: {cfg.init_type}
         uneed = ready - want
         if len(more) + len(ready) > self.max_cache:
             # clear cache
-            for tri in uneed:
+            for tri in uneed[:len(more)]:
                 del self.cached[tri]
         ret = []
         for tri in want:

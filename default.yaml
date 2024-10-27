@@ -25,11 +25,15 @@ model:
   deform_hidden_dim: 32
   deform_depth: 6
   deform_skip: 3
+  deform_anchor_xyz: True
+  deform_child_offsets: True
+  deform_child_scales: True
   # neural GS MLP
   spawn_hidden_dim: 32
   rotate6: False
   trim_by_opacity: True
   view_dependent: False
+
 train:
   # logging
   random_seed: 103
@@ -82,21 +86,27 @@ train:
   growing_rate: 0.05
   perturb_intensity: 0
   reloc_start_iter: 500
-  reloc_stop_iter: 25000
-  reloc_every: 400
+  reloc_stop_iter: 100000
+  reloc_every: 100
   reloc_dead_thres: 0.005
   reloc_dead_spawns: 0
   impact_momentum: 0
   scale_decay: 0.95 # an approximate of MCMC rescale after relocation
   # evaluation
-  save_eval_img: True
+  save_eval_img: False
   test_every: 25
   test_steps:
+    - 5000
+    - 7500
     - 10000
+    - 12500
+    - 15000
+    - 17500
     - 20000
+    - 22500
+    - 25000
+    - 27500
     - 30000
-    - 40000
-    - 50000
     # - 10000
     # - 11000
     # - 12000

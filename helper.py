@@ -63,6 +63,7 @@ class LogDirMgr:
         self.config = os.path.join(root, "config.json")
         self.log = os.path.join(root, "log.json")
         self.stat = os.path.join(root, "stat.json")
+        self.summary = os.path.join(root, "summary.json")
         self.ckpt = self._dir_builder("ckpt", lambda x: f"ckpt_{x}.pth")
         self.render = self._dir_builder("render", lambda x: f"render_{x}.png")
     def _dir_builder(self, dir, fmt):
@@ -161,3 +162,17 @@ def mem_profile_end():
 
     # Stop recording memory snapshot history.
     torch.cuda.memory._record_memory_history(enabled=None)
+
+@torch.no_grad()
+def count_opt_params(optimizer):
+    """
+    Calculate the total number of parameters being optimized and their memory usage.
+    """
+    total_params = 0    
+    for i, param_group in enumerate(optimizer.param_groups):
+        group_params = 0
+        for param in param_group['params']:
+            group_params += param.numel()
+        total_params += group_params
+    
+    return total_params

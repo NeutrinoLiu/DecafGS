@@ -261,10 +261,11 @@ class Runner:
                 state=self.state,
                 ak_childs=anchor_avg_spawn,
                 ak_ops=anchor_opacity,
+                ak_grads=None
             )
 
             loss.backward()
-            desc = f"loss={loss.item():.3f}| " f"sh degree={0}| "
+            desc = f"loss={loss.item():.3f}| anchor#={aks.anchor_xyz.shape[0]}"
             pbar.set_description(desc)
             
             # relocate and densification
@@ -307,22 +308,28 @@ class Runner:
             self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
             self.viewer.update(step, num_train_rays_per_step)
         
+        with open(self.log.summary, 'a') as f:
+            f.write(json.dumps(self.model.count_params(), indent=4))
         print("training finished, viewer lingering...")
-        time.sleep(5)
+        time.sleep(10000)
 
     @torch.no_grad()
     def eval(self, step):
-        test_loader = iter(self.test_sampler)
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
-        for i, data in enumerate(test_loader):
+        elapsed = []
+        test_loader = iter(self.test_sampler)
+        sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
+        for i, data in enumerate(sub_bar):
             assert len(data) == 1, "batch size should be 1 for test"
             cam, gt = data[0]
+            start_time = time.time()
             pc, _ = self.model.produce(cam)
             img, _, _ = self.single_render(
                 pc=pc,
                 cam=cam,
                 sh_degree=0
             )
+            elapsed.append(time.time() - start_time)
             gt = gt.to(self.device)
             img = img
             for k, func in self.eval_funcs.items():
@@ -331,6 +338,7 @@ class Runner:
                 save_tensor_images(img, gt, self.log.render(f"{step}_{i}"))
 
         results_avg = {k: sum(results[k]) / len(results[k]) for k in results.keys()}
+        results_avg['fps'] = len(elapsed) / sum(elapsed)
 
         # terminal print
         print(f"step {step}: \n{json.dumps(results_avg, indent=4)}")
@@ -339,7 +347,9 @@ class Runner:
         self.writer.add_scalar("eval/ssim", results_avg['ssim'] , step)
 
         # log print
-        results['step'] = step
+        results.update(
+            {"step": step, "elapsed": elapsed}
+        )
         with open(self.log.stat, 'a') as f:
             f.write(json.dumps(results) + '\n')
 
