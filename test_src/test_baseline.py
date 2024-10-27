@@ -209,7 +209,7 @@ class Runner:
             # ------------------------------- backward pass ------------------------------ #
             # update the states
             self.strategy.step_pre_backward(
-                params=pc._gs,
+                params=pc._params,
                 optimizers=self.opts,
                 state=self.state,
                 step=step,
@@ -222,7 +222,7 @@ class Runner:
             
             # relocate and densification
             self.strategy.step_post_backward(
-                params=pc._gs,
+                params=pc._params,
                 optimizers=self.opts,
                 state=self.state,
                 step=step,

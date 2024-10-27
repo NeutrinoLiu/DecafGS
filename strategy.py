@@ -5,12 +5,11 @@ import torch
 
 from gsplat.strategy.ops import _update_param_with_optimizer
 
-
-def op_sigmoid(x, k=100, x0=0.995):
-    return 1 / (1 + torch.exp(-k * (x - x0)))
-
 def compute_impact_after_split(
         impacts: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """
+    impact basically is opacity, so that, we use the same logic for opacity split
+    """
     return 1 - (1 - impacts) ** (1. / counts)
 
 def compute_decay_after_split(
@@ -29,7 +28,6 @@ def compute_decay_after_split(
                     = exp(-precursor/decay_old) ^ C
                     = (1 - opacity_old) ^ C
     """
-    # return decays
     return decays + torch.log(counts.float())
 
 class DecafMCMCStrategy:
@@ -61,6 +59,7 @@ class DecafMCMCStrategy:
         self.refine_stop_iter: int = train_cfg.reloc_stop_iter
         self.refine_every: int = train_cfg.reloc_every // train_cfg.batch_size
         self.min_opacity: float = train_cfg.reloc_dead_thres
+        self.min_childs: int = train_cfg.reloc_dead_spawns
         self.impact_momentum: float = train_cfg.impact_momentum
         self.verbose: bool = verbose
 
@@ -69,12 +68,13 @@ class DecafMCMCStrategy:
             "anchor_impacts": torch.ones(N, device=device, dtype=torch.float32),
         }
 
-    def step_pre_backward(self, state, update):
+    def step_pre_backward(self, state, ak_childs, ak_ops):
         assert "anchor_impacts" in state, "state should have <anchor_impacts>"
         # nothing need to be done for MCMC strategy pre backward
         # just follow the convention of gsplat strategy
-        assert len(update) == state["anchor_impacts"].shape[0], f"shape mismatch: {len(update)} vs {state['anchor_impacts'].shape[0]}"
-        state["anchor_impacts"] = self.impact_momentum * state["anchor_impacts"] + (1 - self.impact_momentum) * update
+        assert len(ak_ops) == state["anchor_impacts"].shape[0], f"shape mismatch: {len(ak_ops)} vs {state['anchor_impacts'].shape[0]}"
+        state["anchor_impacts"] = self.impact_momentum * state["anchor_impacts"] + (1 - self.impact_momentum) * ak_ops
+        state["anchor_childs"] = ak_childs
 
 
     def step_post_backward(
@@ -151,11 +151,13 @@ class DecafMCMCStrategy:
         opts: Dict[str, torch.optim.Optimizer],
     ):
         anchor_impacts = state["anchor_impacts"]
+        anchor_childs = state["anchor_childs"]
         N = aks_params["anchor_offsets"].shape[0]
         assert anchor_impacts.shape[0] == N, "shape mismatch"
-        dead_mask = anchor_impacts <= self.min_opacity
+        dead_mask = torch.logical_or(anchor_impacts <= self.min_opacity,
+                                     anchor_childs < self.min_childs)
         n = dead_mask.sum().item()
-        if n == 0: return 0, None
+        if n == 0: return 0, None, None
 
         # use neural gs's opacity to decide dead/alive anchor
         dead_idx = dead_mask.nonzero(as_tuple=True)[0]
@@ -229,6 +231,10 @@ class DecafMCMCStrategy:
         aks_params: Dict[str, torch.nn.Parameter],
         intensity,
     ):
+        def op_sigmoid(x, k=100, x0=0.995):
+            """higher opacity, less noise"""
+            return 1 / (1 + torch.exp(-k * (x - x0)))
+        
         noise_resistance = op_sigmoid(1 - state["anchor_impacts"]).unsqueeze(1)
         noise = torch.randn_like(aks_params["anchor_xyz"]) \
                  * noise_resistance * intensity * aks_params["anchor_scale_extend"]

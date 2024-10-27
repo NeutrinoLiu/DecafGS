@@ -11,6 +11,41 @@ def cur_time():
     import datetime
     return datetime.datetime.now().strftime("%H-%M-%S")
 
+class GlobalWriter:
+    _writer = None
+    _step = 0
+    def __init__(self, writer):
+        if GlobalWriter._writer is None:
+            print("GlobalWriter initialized")
+        else:
+            print("GlobalWriter re-initialized")
+        GlobalWriter._writer = writer
+        GlobalWriter._step = 0
+
+    @classmethod
+    def add_scalar(cls, label, data, step=None, **kwargs):
+        if cls._writer is None:
+            print("GlobalWriter not initialized")
+            return
+        if step is None:
+            step = cls._step
+        else:
+            cls._step = step
+        cls._writer.add_scalar(label, data, step, **kwargs)
+    @classmethod
+    def add_histogram(cls, label, data, step=None, **kwargs):
+        if cls._writer is None:
+            print("GlobalWriter not initialized")
+            return
+        if step is None:
+            step = cls._step
+            if step % 100 != 0:
+                return
+        else:
+            cls._step = step
+        cls._writer.add_histogram(label, data, step, **kwargs)
+
+
 class LogDirMgr:
     def __init__(self, root):
         if os.path.exists(root):
@@ -18,10 +53,10 @@ class LogDirMgr:
             # workaround = overwrite.lower() != "y"
             if True:
                 root = f"{root}_{cur_time()}"
-                print(f"Log directory: {root}")
             else:
                 shutil.rmtree(root)
         os.makedirs(root)
+        print(f"Log directory: {root}")
 
         self.root = root
         self.tb = root

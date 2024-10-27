@@ -8,9 +8,9 @@ from torch import nn
 import math
 
 from examples.utils import rgb_to_sh
-from helper import get_adam_and_lr_sched
+from helper import get_adam_and_lr_sched, GlobalWriter
 from interface import Camera, Gaussians, Anchors
-
+from layers import MLP_builder, ExpLayer, TempoMixture
 
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
@@ -25,24 +25,6 @@ class DummyPipeline(nn.Module):
         self.cfg = cfg
     def produce(self, cam: Camera) -> Gaussians:
         return self.content
-
-class ExpLayer(nn.Module):
-    """
-    a nn module wapper for torch.exp
-    """
-    def __init__(self):
-        super(ExpLayer, self).__init__()
-    def forward(self, x):
-        return torch.exp(x)
-
-class IngoreCam(nn.Module):
-    """
-    ignore the last three dim of batched input features
-    """
-    def __init__(self):
-        super(IngoreCam, self).__init__()
-    def forward(self, x):
-        return x[:, :-3]
 
 class Deformable(nn.Module):
     """
@@ -59,40 +41,30 @@ class Deformable(nn.Module):
                  init_pts,
                  device):
         super(Deformable, self).__init__()
+
+        self.cfg = model_cfg
         self.frame_base = model_cfg.frame_start
         self.frame_length = model_cfg.frame_end - model_cfg.frame_start
         
-        # ---------------------------------- params ---------------------------------- #
-        # embeddings
-        para_frame_embed = torch.nn.Parameter(
-            torch.zeros(self.frame_length,
-                        model_cfg.frame_dim).to(device))
-        # anchor & childs xyz
+        # ------------------------------- anchor params ------------------------------ #
         assert init_pts.shape[-1] == 3, "init_pts should be [N, 3]"
         anchor_xyz = init_pts
         N = anchor_xyz.shape[0]
         anchor_xyz += random_init(N, 3, 0.001) # add noise
         print(f"init with {N} anchors\n")
-        para_anchor_xyz = torch.nn.Parameter(
+        para_anchor_xyz = nn.Parameter(
             anchor_xyz.to(device))
-        para_anchor_offsets = torch.nn.Parameter(
+        para_anchor_offsets = nn.Parameter(
             torch.zeros(N, model_cfg.anchor_child_num, 3, dtype=torch.float32, device=device))
-        # anchor attributes
-        para_anchor_offset_extend = torch.nn.Parameter(
+        para_anchor_offset_extend = nn.Parameter(
             torch.zeros(N, 3, dtype=torch.float32, device=device))
-        para_anchor_scale_extend = torch.nn.Parameter(
+        para_anchor_scale_extend = nn.Parameter(
             torch.zeros(N, 3, dtype=torch.float32, device=device))
-        para_anchor_opacity_decay = torch.nn.Parameter(
+        para_anchor_opacity_decay = nn.Parameter(
             torch.ones(N, dtype=torch.float32, device=device))
-        para_anchor_embed = torch.nn.Parameter(
-            torch.zeros(N, model_cfg.anchor_feature_dim, dtype=torch.float32, device=device))
-        
-        # ----------------------------------- MLPs ----------------------------------- #
-        # TODO temporal defomable model
-        
-        # --------------------------------- optimizor -------------------------------- #
-        opt_cali = train_cfg.batch_size
-        to_be_optimized = [
+        para_anchor_embed = nn.Parameter(
+            torch.zeros(N, model_cfg.anchor_embed_dim, dtype=torch.float32, device=device))
+        anchor_params = [
             ("anchor_embed", para_anchor_embed, train_cfg.lr_anchor_embed),
             ("anchor_xyz", para_anchor_xyz, train_cfg.lr_anchor_xyz),
             ("anchor_offsets", para_anchor_offsets, train_cfg.lr_anchor_offsets),
@@ -100,8 +72,42 @@ class Deformable(nn.Module):
             ("anchor_scale_extend", para_anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
             ("anchor_opacity_decay", para_anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
-        self.raw_params = {k: v for k, v, _ in to_be_optimized}
-        self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali, train_cfg.max_step)
+        self.anchor_params = {k: v for k, v, _ in anchor_params}
+        self.anchor_opts, self.anchor_lr_sched = get_adam_and_lr_sched(
+            anchor_params,
+            train_cfg.batch_size, 
+            train_cfg.max_step)
+
+        # ------------------------------- deform params ------------------------------ #
+        K = model_cfg.anchor_child_num
+        para_frame_embed = nn.Parameter(
+            torch.zeros(self.frame_length,
+                        model_cfg.frame_embed_dim).to(device))
+        
+        if model_cfg.deform_depth > 0:
+            delta_dims = [3, 3 * K, 3, 3]
+                # d_xyz, d_offsets, d_offset_extend, d_scale_extend
+            self.deform_mlp = TempoMixture(
+                in_dim      =   model_cfg.anchor_embed_dim + model_cfg.frame_embed_dim,
+                hidden_dim  =   model_cfg.deform_hidden_dim, 
+                out_dim     =   model_cfg.anchor_feature_dim, 
+                further_dims=   delta_dims, 
+                skip        =   model_cfg.deform_skip,
+                depth       =   model_cfg.deform_depth
+            ).to(device)
+            deform_params = [
+                ("frame_embed", para_frame_embed, train_cfg.lr_frame_embed),
+                ("mlp_deform", self.deform_mlp.parameters(), train_cfg.lr_mlp_deform)
+            ]
+            self.deform_params = {k: v for k, v, _ in deform_params}
+            self.deform_opts, self.deform_lr_sched = get_adam_and_lr_sched(
+                deform_params,
+                train_cfg.batch_size,
+                train_cfg.max_step)
+        else:
+            self.deform_mlp = None
+            self.deform_opts = {}
+            self.deform_lr_sched = {}
 
     def forward(self, frame) -> Anchors:
         """
@@ -109,28 +115,43 @@ class Deformable(nn.Module):
         """
         frame = frame - self.frame_base
         assert frame < self.frame_length, "frame out of range"
+
+        # -------------------------- if none deform allowed -------------------------- #
+        if self.cfg.deform_depth == 0:
+            aks_dict = {
+                "feature": self.anchor_params["anchor_embed"],
+                "xyz": self.anchor_params["anchor_xyz"],
+                "offsets": self.anchor_params["anchor_offsets"],
+                "offset_extend": self.anchor_params["anchor_offset_extend"],
+                "scale_extend": self.anchor_params["anchor_scale_extend"],
+                "opacity_decay": self.anchor_params["anchor_opacity_decay"]
+            }
+            return Anchors(aks_dict)
+
+        # ------------------------------ deform by frame ----------------------------- #
+        frame_embed = self.deform_params["frame_embed"][frame: frame + 1] # so that we dont have to unsqueeze
+        N = self.anchor_params["anchor_xyz"].shape[0]
+
+        # TODO should i reserve a piece of memory for embeds?
+        embeds = torch.cat([self.anchor_params["anchor_embed"],
+                                   frame_embed.expand(N, -1)],
+                                   dim=-1)
+        (features, 
+         d_xyz, 
+         d_offsets, 
+         d_offset_extend, 
+         d_scale_extend) = self.deform_mlp(embeds)
+        
+        K = self.anchor_params["anchor_offsets"].shape[1]
         aks_dict = {
-            "feature": self.raw_params["anchor_embed"],
-            "xyz": self.raw_params["anchor_xyz"],
-            "offsets": self.raw_params["anchor_offsets"],
-            "offset_extend": self.raw_params["anchor_offset_extend"],
-            "scale_extend": self.raw_params["anchor_scale_extend"],
-            "opacity_decay": self.raw_params["anchor_opacity_decay"]
+            "feature"       : torch.cat([features, self.anchor_params["anchor_embed"]], dim=-1),
+            "xyz"           : self.anchor_params["anchor_xyz"]              + d_xyz,           # linear sum
+            "offsets"       : self.anchor_params["anchor_offsets"]          + d_offsets.reshape(-1, K, 3), # linear sum
+            "offset_extend" : self.anchor_params["anchor_offset_extend"]    + d_offset_extend, # exp sum
+            "scale_extend"  : self.anchor_params["anchor_scale_extend"]     + d_scale_extend,  # exp sum
+            "opacity_decay" : self.anchor_params["anchor_opacity_decay"]
         }
         return Anchors(aks_dict)
-
-def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True):
-    """
-    build a 2 layer mlp module, refer to scaffold-gs
-    """
-    return nn.Sequential(
-        nn.Identity() if view_dependent else IngoreCam(),
-        nn.Linear(in_dim if view_dependent else in_dim - 3,
-                  hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, out_dim),
-        out_act
-    )
 
 def decay(precursor, exp_decay):
     """
@@ -158,15 +179,17 @@ class Scaffold(nn.Module):
                  device):
         super(Scaffold, self).__init__()
 
+        self.cfg = model_cfg
         # ----------------------------------- mlps ----------------------------------- #
-        in_dim = model_cfg.anchor_feature_dim + 3
-        hidden_dim = model_cfg.hidden_dim
+        in_dim = (model_cfg.anchor_feature_dim if model_cfg.deform_depth > 0 else 0 ) \
+                + model_cfg.anchor_embed_dim + 3
+        hidden_dim = model_cfg.spawn_hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), model_cfg.view_dependent).to(device), # scale of offset
-            "quats": MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(), model_cfg.view_dependent).to(device),
-            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, ExpLayer(), model_cfg.view_dependent).to(device),
-            "colors": MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), True).to(device)
+            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  model_cfg.view_dependent).to(device), # scale of offset
+            "quats":     MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(), model_cfg.view_dependent).to(device),
+            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, ExpLayer(),    model_cfg.view_dependent).to(device),
+            "colors":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  True).to(device)     # color must be view dependent
         })
 
         # --------------------------------- optimizer -------------------------------- #
@@ -181,7 +204,7 @@ class Scaffold(nn.Module):
         """
         forward pass
         """
-        # anchor
+        # --------------------------- read value of anchor --------------------------- #
         means = aks.childs_xyz                                  # [N, K, 3]
         N = means.shape[0]
         K = means.shape[1]
@@ -190,6 +213,7 @@ class Scaffold(nn.Module):
         opacity_decay = aks.opacity_decay                       # [N,]
         opacity_decay = opacity_decay.unsqueeze(1).expand(-1, K).flatten()
 
+        # --------------------------- neural gaussian spawn -------------------------- #
         feature = aks.feature                                   # [N, D]
         ob_view = cam.c2w_t.float().to(aks.device) - anchor_xyz         # [N, 3]
         ob_view = ob_view / torch.norm(ob_view, dim=-1, keepdim=True)
@@ -248,7 +272,9 @@ class DecafPipeline(nn.Module):
     def optimize(self):
         for opt in self.scaffold.opts.values():
             opt.step()
-        for opt in self.deform.opts.values():
+        for opt in self.deform.anchor_opts.values():
+            opt.step()
+        for opt in self.deform.deform_opts.values():
             opt.step()
 
     def zero_grad(self):
@@ -256,11 +282,15 @@ class DecafPipeline(nn.Module):
         # dont zero grad before all opt has been stepped
         for opt in self.scaffold.opts.values():
             opt.zero_grad()
-        for opt in self.deform.opts.values():
+        for opt in self.deform.anchor_opts.values():
+            opt.zero_grad()
+        for opt in self.deform.deform_opts.values():
             opt.zero_grad()
     
     def update_lr(self, step):
         for lr_sched in self.scaffold.lr_sched.values():
             lr_sched.step()
-        for lr_sched in self.deform.lr_sched.values():
+        for lr_sched in self.deform.anchor_lr_sched.values():
+            lr_sched.step()
+        for lr_sched in self.deform.deform_lr_sched.values():
             lr_sched.step()

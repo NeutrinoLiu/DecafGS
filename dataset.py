@@ -4,10 +4,9 @@ data set loading and sampling policy
 expected file structure:
     - scene_name
         - cam00
-            - images
-                - 0.png
-                - 1.png
-                - ...
+            - 0.png
+            - 1.png
+            - ...
         - cam01
         - ...
         - cams.json
@@ -174,7 +173,7 @@ init type: {cfg.init_type}
         img = self.cached.get(
             (cam, frame, downscale), None)
         if img is None: # cache miss
-            img_path = os.path.join(self.cams[cam].path, "images", f"{frame}.png")
+            img_path = os.path.join(self.cams[cam].path, f"{frame}.png")
             with Image.open(img_path) as f:
                 img = f.resize((cam_obj.width, 
                           cam_obj.height))

@@ -2,10 +2,10 @@
 data:
   format: "volumetric_video"
   data_dir: "scenes/coffee"
-  frame_total: 10
+  frame_total: 300
   resolution: 2
   # image cached in the memory
-  max_cached_img: 100
+  max_cached_img: 1000
   # point cloud init
   init_type: "sfm"
   init_random_num: 10000
@@ -14,14 +14,19 @@ data:
 model:
   # anchor embedding
   anchor_num: 40000
-  anchor_feature_dim: 32
+  anchor_embed_dim: 32    # trainable embedding
+  anchor_feature_dim: 32  # intermidiate feature
   anchor_child_num: 5
   # frame embedding
   frame_start: 0
   frame_end: 1
-  frame_dim: 200
+  frame_embed_dim: 200    # trainable embedding
+  # deform MLP
+  deform_hidden_dim: 32
+  deform_depth: 6
+  deform_skip: 3
   # neural GS MLP
-  hidden_dim: 32
+  spawn_hidden_dim: 32
   rotate6: False
   trim_by_opacity: True
   view_dependent: False
@@ -45,6 +50,9 @@ train:
   # lr_shN: 1.25e-4
   # [anchor] learning rate
   lr_frame_embed: 0.0075
+  lr_mlp_deform: 
+    - 4e-4
+    - 4e-6
   lr_anchor_embed: 0.0075
   lr_anchor_xyz: 
     - 1e-4
@@ -69,45 +77,44 @@ train:
   reg_opacity: 1e-2
   reg_scale: 0
   reg_volume: 1e-1
+  reg_offset: 1e-3
   # densification with MCMC relocation
   growing_rate: 0.05
   perturb_intensity: 0
   reloc_start_iter: 500
   reloc_stop_iter: 25000
-  reloc_every: 100
-  reloc_dead_thres: 0.01
+  reloc_every: 400
+  reloc_dead_thres: 0.005
+  reloc_dead_spawns: 0
   impact_momentum: 0
   scale_decay: 0.95 # an approximate of MCMC rescale after relocation
   # evaluation
+  save_eval_img: True
   test_every: 25
   test_steps:
-    - 1000
-    - 2000
-    - 3000
-    - 4000
-    - 5000
-    - 6000
-    - 7000
-    - 8000
-    - 9000
     - 10000
-    - 11000
-    - 12000
-    - 13000
-    - 14000
-    - 15000
-    - 16000
-    - 17000
-    - 18000
-    - 19000
     - 20000
-    - 21000
-    - 22000
-    - 23000
-    - 24000
-    - 25000
-    - 26000
-    - 27000
-    - 28000
-    - 29000
     - 30000
+    - 40000
+    - 50000
+    # - 10000
+    # - 11000
+    # - 12000
+    # - 13000
+    # - 14000
+    # - 15000
+    # - 16000
+    # - 17000
+    # - 18000
+    # - 19000
+    # - 20000
+    # - 21000
+    # - 22000
+    # - 23000
+    # - 24000
+    # - 25000
+    # - 26000
+    # - 27000
+    # - 28000
+    # - 29000
+    # - 30000
