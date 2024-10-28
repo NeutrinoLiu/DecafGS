@@ -164,14 +164,14 @@ init points: {len(points)}
 init type: {cfg.init_type}
 ''')
 
-        # 4) image cache
+        # 4) optional image cache
         self.cached = {}
         self.max_cache = cfg.max_cached_img
 
     def get(self, cam, frame, downscale):
         """
         load the image from disk,
-        for external usage
+        for torch dataloader
         """
         cam_obj = self.cams[cam][frame].thumbnail(downscale)
         return cam_obj, self._get(cam_obj)
@@ -215,6 +215,7 @@ init type: {cfg.init_type}
         get a batch of images
         storage awared loader
         image format: [3, H, W]
+        for our own loader only
         """
         assert isinstance(triplets, list), "batch_get expects a list of triplets"
         if len(triplets) > self.max_cache:
@@ -248,7 +249,7 @@ init type: {cfg.init_type}
         }
         return ret
 
-class NaiveSampler:
+class BatchLoader:
     def __init__(self, 
                  getter,
                  # range
@@ -267,7 +268,6 @@ class NaiveSampler:
         self.further_downscale = further_downscale
         # runtime
         self._pool = None
-        print(f"data sampler pool size: {len(self.cams) * len(self.frames)}")
     def __len__(self):
         return - (len(self.cams) * len(self.frames) // -self.batch_size)
     def __iter__(self):
@@ -297,47 +297,77 @@ class DataIter(Dataset):
     def __len__(self):
         return len(self.sequence)
 
-class DatasetEmulator:
+class DataManager:
     def __init__(self, 
-                 getter,
+                 # context
+                 scene: SceneReader,
                  # range
                  cams_idx, 
                  frames_idx,
                  further_downscale=1,
                  # options
-                 batch_size = 1, 
+                 batch_size = 1,
                  policy: Literal["random", "sequential"] = "sequential",
                  num_workers = 4,
+                 use_torch_loader = False,
                  ):
-        self.getter = getter
+        
+        self.scene = scene
         self.policy = policy
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.use_torch_loader = use_torch_loader
 
         self.cams = cams_idx.copy()
         self.frames = frames_idx.copy()
         self.further_downscale = further_downscale
-        
-    def _get_iter(self, info, step):
+
+        self.cached_loader = None
+    
+    # -------------------------- for our own loader only ------------------------- #
+    # our own loader use [cached_get_batch] to load images
+    def _get_batch_loader(self):
+        if self.cached_loader is None:
+            self.cached_loader = BatchLoader(
+                self.scene.cached_get_batch,
+                self.cams,
+                self.frames,
+                self.further_downscale,
+                self.batch_size,
+                self.policy
+            )
+        return self.cached_loader
+
+    # ------------------------- for torch dataloader only ------------------------ #
+    # torch dataloader need an iterator to fetch data
+    # in this case, simple [get] is used to fetch single image
+    def _get_torch_iter(self, info, step):
         if self.policy == "random":
             seq = [(c, f, self.further_downscale) \
                    for c in self.cams for f in self.frames]
             random.shuffle(seq)
-            return DataIter(self.getter, seq)
+            return DataIter(self.scene.get, seq)
         elif self.policy == "sequential":
             seq = sorted([(c, f, self.further_downscale) \
                           for c in self.cams for f in self.frames],
                           key=lambda x: (x[0], x[1]))
-            return DataIter(self.getter, seq)
+            return DataIter(self.scene.get, seq)
     
+    # ------------------- unified api for training and testing ------------------- #
     def gen_loader(self, info, step):
-        loader = DataLoader(
-                    self._get_iter(info, step),
-                    batch_size=self.batch_size,
-                    shuffle=False,                  # follow our own sampling order
-                    num_workers=self.num_workers,
-                    pin_memory=True,
-                    collate_fn=lambda x: x,         # no need to collate,
-                    prefetch_factor=2,              # prefetch 2 batches
-                )
+        # we rebuild the loader every time after exhausted
+        # because we want to adjust the sampling order according to (info, step)
+        if self.use_torch_loader:
+            data_iter = self._get_torch_iter(info, step)
+            loader = DataLoader(
+                        data_iter,
+                        batch_size=self.batch_size,
+                        shuffle=False,                  # follow our own sampling order
+                        num_workers=self.num_workers,
+                        pin_memory=True,
+                        collate_fn=lambda x: x,         # no need to collate,
+                        prefetch_factor=2,              # prefetch 2 batches
+                    )
+        else:
+            loader = self._get_batch_loader()
         return loader

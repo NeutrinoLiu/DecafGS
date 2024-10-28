@@ -26,7 +26,7 @@ from gsplat.rendering import rasterization
 from examples.utils import set_random_seed
 
 from strategy import DecafMCMCStrategy
-from dataset import SceneReader, NaiveSampler, DatasetEmulator, dataset_split
+from dataset import SceneReader, BatchLoader, DataManager, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
@@ -76,38 +76,24 @@ class Runner:
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
 
-        if self.use_torch_loader:
-            self.train_sampler = DatasetEmulator(
-                self.scene.get,                     # img getter
-                train_cam_idx,                      # train cam only
-                list(range(min_frame, max_frame)),  # full frame
-                batch_size = train_cfg.batch_size,
-                policy = "random",
-                num_workers=data_cfg.num_workers
-                )
-            self.test_sampler = DatasetEmulator(
-                self.scene.get,                     # img getter
-                test_cam_idx,                       # test cam only
-                list(range(min_frame, max_frame)),  # full frame
-                batch_size = 1,
-                policy = "sequential",
-                num_workers=data_cfg.num_workers
-                )
-        else: # use custom loader
-            self.train_sampler = NaiveSampler(
-                self.scene.cached_get_batch,        # batch getter
-                train_cam_idx,                      
-                list(range(min_frame, max_frame)),
-                batch_size = train_cfg.batch_size,
-                policy = "random"
-                )
-            self.test_sampler = NaiveSampler(
-                self.scene.cached_get_batch,        # batch getter
-                test_cam_idx,                       
-                list(range(min_frame, max_frame)),
-                batch_size = 1,
-                policy = "sequential"
-                )
+        self.train_loader_gen = DataManager(
+            self.scene,                         # img reader
+            train_cam_idx,                      # train cam only
+            list(range(min_frame, max_frame)),  # full frame
+            batch_size = train_cfg.batch_size,
+            policy = "random",
+            num_workers=data_cfg.num_workers,
+            use_torch_loader=self.use_torch_loader
+            )
+        self.test_sampler_gen = DataManager(
+            self.scene,                         # img reader
+            test_cam_idx,                       # test cam only
+            list(range(min_frame, max_frame)),  # full frame
+            batch_size = 1,
+            policy = "sequential",
+            num_workers=data_cfg.num_workers,
+            use_torch_loader=self.use_torch_loader
+            )
         
         print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
         print(f"training frame {min_frame} ~ {max_frame}\n")
@@ -198,9 +184,7 @@ class Runner:
         pbar = tqdm(range(init_step, max_step))
 
         train_loader = iter(
-            self.train_sampler.gen_loader({}, init_step)
-        ) if self.use_torch_loader else \
-            iter(self.train_sampler)
+            self.train_loader_gen.gen_loader({}, init_step))
 
         for step in pbar:
             
@@ -215,9 +199,7 @@ class Runner:
             except StopIteration:
                 # self.train_sampler.learn() # TODO adaptive data loader
                 train_loader = iter(
-                    self.train_sampler.gen_loader(self.state, step)
-                ) if self.use_torch_loader else \
-                    iter(self.train_sampler)
+                    self.train_loader_gen.gen_loader(self.state, step))
                 data = next(train_loader)
             
             # ------------------------------ forward pass ------------------------------ #
@@ -352,14 +334,11 @@ class Runner:
     def eval(self, step):
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
-        test_loader = iter(self.test_sampler._get_iter({}, 0)) \
-            if self.use_torch_loader else \
-                self.test_sampler
+        test_loader = iter(self.test_sampler_gen.gen_loader({}, 0))
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
         for i, data in enumerate(sub_bar):
-            if isinstance(data, list):
-                assert len(data) == 1, "only support batch size = 1"
-                data = data[0]
+            assert len(data) == 1, "test batch size must be 1"
+            data = data[0]
             cam, gt = data
             start_time = time.time()
             pc, _ = self.model.produce(cam)
