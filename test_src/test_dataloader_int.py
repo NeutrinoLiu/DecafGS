@@ -22,7 +22,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import MCMCStrategy 
 from examples.utils import knn, rgb_to_sh, set_random_seed
 
-from dataset import SceneReader, CamSampler, dataset_split
+from dataset import SceneReader, NaiveSampler, dataset_split
 
 from fused_ssim import fused_ssim
 
@@ -140,14 +140,14 @@ class Runner:
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
             cfg.test_every)
-        self.trainset = CamSampler(
+        self.trainset = NaiveSampler(
             self.scene,
             train_cam_idx,
             [0],
             batch_size = cfg.batch_size,
             policy = "random",
             )
-        self.valset = CamSampler(
+        self.valset = NaiveSampler(
             self.scene,
             test_cam_idx,
             [0]

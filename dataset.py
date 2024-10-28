@@ -83,10 +83,13 @@ def read_ply(ply_path):
     return points, colors
 
 class SceneReader:
-    def __init__(self, cfg, cache_in_GPU=False, return_dict=False):
-        self.cache_device = torch.device("cuda") \
-            if torch.cuda.is_available() and cache_in_GPU \
-            else torch.device("cpu")
+    def __init__(self, cfg, cache=None, return_dict=False):
+        if cache == "gpu":
+            self.cache_device = torch.device("cuda")
+        elif cache == "cpu":
+            self.cache_device = torch.device("cpu")
+        else:
+            self.cache_device = None
         self.return_dict = return_dict
         self.path = cfg.data_dir
 
@@ -160,7 +163,26 @@ init type: {cfg.init_type}
         self.cached = {}
         self.max_cache = cfg.max_cached_img
 
-    def _get(self, 
+    def _get(self, cam=-1, frame=-1, downscale=-1, cam_obj=None):
+        """
+        load the image from disk
+        """
+        if cam_obj is None:
+            assert cam >= 0 and frame >= 0 and downscale > 0, \
+                "cam, frame, downscale must be set"
+            cam_obj = self.cams[cam][frame].thumbnail(downscale)
+        img_path = os.path.join(cam_obj.path, f"{cam_obj.frame}.png")
+        with Image.open(img_path) as f:
+            img = f.resize((cam_obj.width, 
+                      cam_obj.height))
+            img = np.asarray(img)
+            img = torch.tensor(img).permute(2, 0, 1) / 255.
+        return img
+
+    # _cached_get and cached_get_batch are self-designed interface to
+    # load images from disk and cache them, yet using torch dataloader should 
+    # be more convenient
+    def _cached_get(self, 
             cam: int, 
             frame: int,
             downscale): # -> Camera, GT image
@@ -169,21 +191,17 @@ init type: {cfg.init_type}
         cam attr and image are loaded separately
         since image is lazy loaded
         """
+        assert self.cache_device is not None, "cache_device is not set"
         cam_obj = self.cams[cam][frame].thumbnail(downscale)
         img = self.cached.get(
             (cam, frame, downscale), None)
         if img is None: # cache miss
-            img_path = os.path.join(self.cams[cam].path, f"{frame}.png")
-            with Image.open(img_path) as f:
-                img = f.resize((cam_obj.width, 
-                          cam_obj.height))
-                img = np.asarray(img)
-                img = torch.tensor(img).permute(2, 0, 1) / 255. # [3, H, W]
+            img = self._get(cam_obj=cam_obj)
             img = img.to(self.cache_device)
             self.cached[(cam, frame, downscale)] = img
         return cam_obj, img
     
-    def batch_get(self, triplets: list):
+    def cached_get_batch(self, triplets: list):
         """
         get a batch of images
         storage awared loader
@@ -198,11 +216,11 @@ init type: {cfg.init_type}
         uneed = ready - want
         if len(more) + len(ready) > self.max_cache:
             # clear cache
-            for tri in uneed[:len(more)]:
+            for tri in list(uneed)[:len(more)]:
                 del self.cached[tri]
         ret = []
         for tri in want:
-            ret.append(self._get(*tri))
+            ret.append(self._cached_get(*tri))
         
         # a formatter for gsplat compatibility
         if self.return_dict:
@@ -222,9 +240,11 @@ init type: {cfg.init_type}
         return ret
 
 
-class CamSampler:
+
+
+class NaiveSampler:
     def __init__(self, 
-                 scene: SceneReader,
+                 getter,
                  # range
                  cams_idx, 
                  frames_idx,
@@ -233,7 +253,7 @@ class CamSampler:
                  batch_size = 1, 
                  policy: Literal["random", "sequential"] = "sequential"
                  ):
-        self.scene = scene
+        self.getter = getter
         self.policy = policy
         self.cams = cams_idx.copy()
         self.frames = frames_idx.copy()
@@ -248,13 +268,85 @@ class CamSampler:
         # reset the iterator
         self._pool = sorted([(c, f, self.further_downscale) \
                              for c in self.cams for f in self.frames], key=lambda x: (x[0], x[1]))
+        if self.policy == "random":
+            random.shuffle(self._pool)
         return self
     def __next__(self):
         # return a batch of cams
         if len(self._pool) == 0:
             raise StopIteration
-        if self.policy == "random":
-            random.shuffle(self._pool)
         batch = self._pool[:self.batch_size]
         self._pool = self._pool[self.batch_size:]
-        return self.scene.batch_get(batch)
+        return self.getter(batch)
+    
+
+class AdaptiveSampler:
+    STATE_WARMUP = 0
+    STATE_GENRAL = 1
+    STATE_REFINE = 2
+    STATE = ["warmup", "general", "refine"]
+    @classmethod
+    def maximize_discrpency(cls, affinity, total):
+        # TODO: implement this
+        pass
+    def __init__(self, 
+                 getter,
+                 # range
+                 cams_idx, 
+                 frames_idx,
+                 further_downscale=1,
+                 # options
+                 batch_size = 1, 
+                 policy = [3000, 20000]
+                 ):
+        self.getter = getter
+        self.policy = policy
+        self.cams = cams_idx.copy()
+        self.frames = frames_idx.copy()
+        self.batch_size = batch_size
+        self.further_downscale = further_downscale
+        # runtime
+        self._state_machine = AdaptiveSampler.STATE_WARMUP
+        self._pool = None
+        self._reference = {}
+        print(f"AdaptiveSampler pool size: {len(self.cams) * len(self.frames)}")
+
+    def refer(self, info, step):
+        self._reference["per_frame_psnr"] = info["per_frame_psnr"]
+        if self._state_machine < len(self.policy) and step > self.policy[self._state_machine]:
+            self._state_machine += 1
+            print(f"AdaptiveSampler state change to {AdaptiveSampler.STATE[self._state_machine]}")
+
+    def __iter__(self):
+        # reset the iterator
+        assert "per_frame_psnr" in self._reference, "reference missing per_frame_psnr"
+        assert "camera_affinity" in self._reference, "reference missing camera_affinity"
+        # ---------------------------------- warmup ---------------------------------- #
+        if self._state_machine == AdaptiveSampler.STATE_WARMUP:
+            ds = self.further_downscale * 2
+            self._pool = [(c, f, ds) for c in self.cams for f in self.frames]
+            random.shuffle(self._pool)
+            return self
+        # ---------------------------------- general ---------------------------------- #
+        if self._state_machine == AdaptiveSampler.STATE_GENRAL:
+            # TODO: implement general sampling
+            return self
+        # ---------------------------------- refine ---------------------------------- #
+        if self._state_machine == AdaptiveSampler.STATE_REFINE:
+            total = len(self.cams) * len(self.frames)
+            prob = self._reference["per_frame_psnr"]
+            target_frames = random.choices(self.frames, weights=prob, k=total)
+            affinity = self._reference["camera_affinity"]
+            target_cams = AdaptiveSampler.maximize_discrpency(affinity, total)
+            self._pool = [(c, f, self.further_downscale) for c, f in zip(target_cams, target_frames)]
+
+        return self
+    def __next__(self):
+        # return a batch of cams
+        if len(self._pool) == 0:
+            self._reference = {} # reset reference info after exhausted
+            raise StopIteration
+        
+        batch = self._pool[:self.batch_size]
+        self._pool = self._pool[self.batch_size:]
+        return self.getter(batch)

@@ -68,7 +68,7 @@ class DecafMCMCStrategy:
             "anchor_impacts": torch.ones(N, device=device, dtype=torch.float32),
         }
 
-    def step_pre_backward(self, state, ak_childs, ak_ops, ak_grads):
+    def step_pre_backward(self, state, ak_childs, ak_ops, ak_grads=None):
         assert "anchor_impacts" in state, "state should have <anchor_impacts>"
         # nothing need to be done for MCMC strategy pre backward
         # just follow the convention of gsplat strategy
@@ -78,9 +78,10 @@ class DecafMCMCStrategy:
         impact_lambda = 0.5
         normalize = lambda x: (x - x.min()) / (x.max() - x.min() + 1e-6)
         ops = normalize(ak_ops)
-        # grads = normlize(ak_grads)
-        # impacts = ops * impact_lambda + grads * (1 - impact_lambda)
-        impacts = ops
+
+        grads = normalize(ak_grads) if ak_grads is not None \
+                else torch.zeros_like(ops)
+        impacts = ops * impact_lambda + grads * (1 - impact_lambda)
         
         state["anchor_impacts"] = self.impact_momentum * state["anchor_impacts"] + \
                                     (1 - self.impact_momentum) * impacts
@@ -250,3 +251,53 @@ class DecafMCMCStrategy:
                  * noise_resistance * intensity * aks_params["anchor_scale_extend"]
         
         aks_params["anchor_xyz"] += noise
+
+    # borrowed from gsplat.strategy.default, used to calculate grad2d for gs
+    def _calculate_grads(
+            self,
+            aks_params: Dict[str, torch.nn.Parameter],
+            state: Dict[str, Any],
+            info: Dict[str, Any],
+            packed: bool,
+            absgrad: bool,
+        ):
+            for key in [
+                "width",
+                "height",
+                "n_cameras",
+                "radii",
+                "gaussian_ids",
+                self.key_for_gradient,
+            ]:
+                assert key in info, f"{key} is required but missing."
+
+            # normalize grads to [-1, 1] screen space
+            if absgrad:
+                grads = info[self.key_for_gradient].absgrad.clone()
+            else:
+                grads = info[self.key_for_gradient].grad.clone()
+            grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+            grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+
+            # initialize state on the first run
+            n_gaussian = len(list(aks_params.values())[0])
+
+            if state["grad2d"] is None:
+                state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
+            if state["count"] is None:
+                state["count"] = torch.zeros(n_gaussian, device=grads.device)
+
+            # update the running state
+            if packed:
+                # grads is [nnz, 2]
+                gs_ids = info["gaussian_ids"]  # [nnz]
+            else:
+                # grads is [C, N, 2]
+                sel = info["radii"] > 0.0  # [C, N]
+                gs_ids = torch.where(sel)[1]  # [nnz]
+                grads = grads[sel]  # [nnz, 2]
+
+            state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
+            state["count"].index_add_(
+                0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
+            )

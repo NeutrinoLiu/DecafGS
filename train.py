@@ -25,7 +25,7 @@ from gsplat.rendering import rasterization
 from examples.utils import set_random_seed
 
 from strategy import DecafMCMCStrategy
-from dataset import SceneReader, CamSampler, dataset_split
+from dataset import SceneReader, NaiveSampler, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
@@ -63,21 +63,21 @@ class Runner:
 
         # ------------------------------- data loading ------------------------------- #
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.scene = SceneReader(data_cfg, True)
+        self.scene = SceneReader(data_cfg, data_cfg.cache_device)
 
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
-        self.train_sampler = CamSampler(
-            self.scene,
+        self.train_sampler = NaiveSampler(
+            self.scene.cached_get_batch,        # img getter
             train_cam_idx,                      # train cam only
             list(range(min_frame, max_frame)),  # full frame
             batch_size = train_cfg.batch_size,
             policy = "random")
-        self.test_sampler = CamSampler(
-            self.scene,
+        self.test_sampler = NaiveSampler(
+            self.scene.cached_get_batch,        # img getter
             test_cam_idx,                       # test cam only
             list(range(min_frame, max_frame))   # full frame
             )
@@ -219,6 +219,7 @@ class Runner:
                     sh_degree=0
                 ) # img and info are batched actually, but batch size = 1
 
+                gt = gt.to(self.device)
                 metrics["l1loss"] += F.l1_loss(img[None], gt[None])
                 metrics["ssimloss"] += 1 - fused_ssim(img[None], gt[None], padding="valid")
                 if self.cfg.reg_opacity > 0:
@@ -348,7 +349,7 @@ class Runner:
 
         # log print
         results.update(
-            {"step": step, "elapsed": elapsed}
+            {"step": step, "fps": results_avg['fps']}
         )
         with open(self.log.stat, 'a') as f:
             f.write(json.dumps(results) + '\n')

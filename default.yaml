@@ -5,7 +5,10 @@ data:
   frame_total: 300
   resolution: 2
   # image cached in the memory
+  # small dataset can be cached in the GPU
+  # large dataset should be cached in the CPU, given the limited GPU memory
   max_cached_img: 1000
+  cache_device: "gpu"
   # point cloud init
   init_type: "sfm"
   init_random_num: 10000
@@ -33,6 +36,7 @@ model:
   rotate6: False
   trim_by_opacity: True
   view_dependent: False
+  six_dof_rotate: False
 
 train:
   # logging

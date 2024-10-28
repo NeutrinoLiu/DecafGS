@@ -16,7 +16,7 @@ from gsplat.strategy import MCMCStrategy
 from gsplat.rendering import rasterization
 from examples.utils import knn, rgb_to_sh, set_random_seed
 
-from dataset import SceneReader, CamSampler, dataset_split
+from dataset import SceneReader, NaiveSampler, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DummyPipeline
 
@@ -81,13 +81,13 @@ class Runner:
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
-        self.train_sampler = CamSampler(
+        self.train_sampler = NaiveSampler(
             self.scene,
             train_cam_idx,                      # train cam only
             list(range(min_frame, max_frame)),  # full frame
             batch_size = train_cfg.batch_size,
             policy = "random")
-        self.test_sampler = CamSampler(
+        self.test_sampler = NaiveSampler(
             self.scene,
             test_cam_idx,                       # test cam only
             list(range(min_frame, max_frame))   # full frame
