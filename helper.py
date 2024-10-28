@@ -5,6 +5,7 @@ from omegaconf import ListConfig
 import os
 import shutil
 from PIL import Image
+import time
 import torchvision.transforms as T
 
 def cur_time():
@@ -176,3 +177,13 @@ def count_opt_params(optimizer):
         total_params += group_params
     
     return total_params
+
+# function executiong time profiling decorator
+def timeit(func):
+    def timed(*args, **kw):
+        ts = time.time()
+        result = func(*args, **kw)
+        te = time.time()
+        print(f"{func.__name__} executed in {te-ts:.2f} s")
+        return result
+    return timed

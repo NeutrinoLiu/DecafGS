@@ -17,6 +17,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torch.utils.tensorboard import SummaryWriter
 
 
+
 import nerfview
 import viser
 
@@ -25,7 +26,7 @@ from gsplat.rendering import rasterization
 from examples.utils import set_random_seed
 
 from strategy import DecafMCMCStrategy
-from dataset import SceneReader, NaiveSampler, dataset_split
+from dataset import SceneReader, NaiveSampler, DatasetEmulator, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
@@ -63,24 +64,50 @@ class Runner:
 
         # ------------------------------- data loading ------------------------------- #
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        assert data_cfg.cache_device in ["torch", "cpu", "gpu"], \
+            "only support cpu/gpu cache or torch dataloader"
         self.scene = SceneReader(data_cfg, data_cfg.cache_device)
+        self.use_torch_loader = data_cfg.cache_device == "torch"
 
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
-        self.train_sampler = NaiveSampler(
-            self.scene.cached_get_batch,        # img getter
-            train_cam_idx,                      # train cam only
-            list(range(min_frame, max_frame)),  # full frame
-            batch_size = train_cfg.batch_size,
-            policy = "random")
-        self.test_sampler = NaiveSampler(
-            self.scene.cached_get_batch,        # img getter
-            test_cam_idx,                       # test cam only
-            list(range(min_frame, max_frame))   # full frame
-            )
+
+        if self.use_torch_loader:
+            self.train_sampler = DatasetEmulator(
+                self.scene.get,                     # img getter
+                train_cam_idx,                      # train cam only
+                list(range(min_frame, max_frame)),  # full frame
+                batch_size = train_cfg.batch_size,
+                policy = "random",
+                num_workers=data_cfg.num_workers
+                )
+            self.test_sampler = DatasetEmulator(
+                self.scene.get,                     # img getter
+                test_cam_idx,                       # test cam only
+                list(range(min_frame, max_frame)),  # full frame
+                batch_size = 1,
+                policy = "sequential",
+                num_workers=data_cfg.num_workers
+                )
+        else: # use custom loader
+            self.train_sampler = NaiveSampler(
+                self.scene.cached_get_batch,        # batch getter
+                train_cam_idx,                      
+                list(range(min_frame, max_frame)),
+                batch_size = train_cfg.batch_size,
+                policy = "random"
+                )
+            self.test_sampler = NaiveSampler(
+                self.scene.cached_get_batch,        # batch getter
+                test_cam_idx,                       
+                list(range(min_frame, max_frame)),
+                batch_size = 1,
+                policy = "sequential"
+                )
         
         print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
         print(f"training frame {min_frame} ~ {max_frame}\n")
@@ -170,7 +197,10 @@ class Runner:
         max_step = self.cfg.max_step
         pbar = tqdm(range(init_step, max_step))
 
-        train_loader = iter(self.train_sampler)
+        train_loader = iter(
+            self.train_sampler.gen_loader({}, init_step)
+        ) if self.use_torch_loader else \
+            iter(self.train_sampler)
 
         for step in pbar:
             
@@ -184,7 +214,10 @@ class Runner:
                 data = next(train_loader)
             except StopIteration:
                 # self.train_sampler.learn() # TODO adaptive data loader
-                train_loader = iter(self.train_sampler)
+                train_loader = iter(
+                    self.train_sampler.gen_loader(self.state, step)
+                ) if self.use_torch_loader else \
+                    iter(self.train_sampler)
                 data = next(train_loader)
             
             # ------------------------------ forward pass ------------------------------ #
@@ -210,6 +243,7 @@ class Runner:
             }
 
             pc_batched = []
+            
             for cam, gt in data:
                 pc, aks = self.model.produce(cam)
 
@@ -312,17 +346,21 @@ class Runner:
         with open(self.log.summary, 'a') as f:
             f.write(json.dumps(self.model.count_params(), indent=4))
         print("training finished, viewer lingering...")
-        time.sleep(10000)
+        time.sleep(10)
 
     @torch.no_grad()
     def eval(self, step):
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
-        test_loader = iter(self.test_sampler)
+        test_loader = iter(self.test_sampler._get_iter({}, 0)) \
+            if self.use_torch_loader else \
+                self.test_sampler
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
         for i, data in enumerate(sub_bar):
-            assert len(data) == 1, "batch size should be 1 for test"
-            cam, gt = data[0]
+            if isinstance(data, list):
+                assert len(data) == 1, "only support batch size = 1"
+                data = data[0]
+            cam, gt = data
             start_time = time.time()
             pc, _ = self.model.produce(cam)
             img, _, _ = self.single_render(

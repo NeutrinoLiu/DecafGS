@@ -4,11 +4,11 @@ data:
   data_dir: "scenes/coffee"
   frame_total: 300
   resolution: 2
-  # image cached in the memory
-  # small dataset can be cached in the GPU
-  # large dataset should be cached in the CPU, given the limited GPU memory
+  cache_device: "torch" # ["cpu", "gpu", "torch"]
+  # self implemented dataloader
   max_cached_img: 1000
-  cache_device: "gpu"
+  # torch based data loader
+  num_workers: 4
   # point cloud init
   init_type: "sfm"
   init_random_num: 10000
@@ -100,6 +100,7 @@ train:
   save_eval_img: False
   test_every: 25
   test_steps:
+    - 1000
     - 5000
     - 7500
     - 10000

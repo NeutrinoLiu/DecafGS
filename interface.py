@@ -20,6 +20,12 @@ class Camera:
     height: int
     frame: int = None
 
+    def to(self, device, **kwargs):
+        self.intri = self.intri.to(device, **kwargs)
+        self.c2w_R = self.c2w_R.to(device, **kwargs)
+        self.c2w_t = self.c2w_t.to(device, **kwargs)
+        return self
+
     def __getitem__(self, frame:int):
         return Camera(
             self.path,

@@ -6,3 +6,7 @@ output*
 *.prof
 experiments
 batch_config.txt
+
+**/*.egg-info
+**/*.egg
+**/*.pyc

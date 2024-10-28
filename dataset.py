@@ -36,9 +36,13 @@ import torch
 import numpy as np
 import json
 from PIL import Image
+import cv2
 import random
+from torch.utils.data import DataLoader, Dataset
 
 from interface import Camera
+from helper import timeit
+
 from examples.datasets.normalize import (
     similarity_from_cameras,
     transform_cameras,
@@ -89,6 +93,7 @@ class SceneReader:
         elif cache == "cpu":
             self.cache_device = torch.device("cpu")
         else:
+            print("no cache device set, cache disabled")
             self.cache_device = None
         self.return_dict = return_dict
         self.path = cfg.data_dir
@@ -163,20 +168,24 @@ init type: {cfg.init_type}
         self.cached = {}
         self.max_cache = cfg.max_cached_img
 
-    def _get(self, cam=-1, frame=-1, downscale=-1, cam_obj=None):
+    def get(self, cam, frame, downscale):
         """
-        load the image from disk
+        load the image from disk,
+        for external usage
         """
-        if cam_obj is None:
-            assert cam >= 0 and frame >= 0 and downscale > 0, \
-                "cam, frame, downscale must be set"
-            cam_obj = self.cams[cam][frame].thumbnail(downscale)
+        cam_obj = self.cams[cam][frame].thumbnail(downscale)
+        return cam_obj, self._get(cam_obj)
+
+    def _get(self, cam_obj=None):
+        """
+        load the image from disk using OpenCV
+        """
         img_path = os.path.join(cam_obj.path, f"{cam_obj.frame}.png")
-        with Image.open(img_path) as f:
-            img = f.resize((cam_obj.width, 
-                      cam_obj.height))
-            img = np.asarray(img)
-            img = torch.tensor(img).permute(2, 0, 1) / 255.
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (cam_obj.width, cam_obj.height))
+        img = img.astype(np.float32) / 255.0
+        img = torch.from_numpy(img).permute(2, 0, 1)
         return img
 
     # _cached_get and cached_get_batch are self-designed interface to
@@ -239,9 +248,6 @@ init type: {cfg.init_type}
         }
         return ret
 
-
-
-
 class NaiveSampler:
     def __init__(self, 
                  getter,
@@ -278,17 +284,20 @@ class NaiveSampler:
         batch = self._pool[:self.batch_size]
         self._pool = self._pool[self.batch_size:]
         return self.getter(batch)
-    
 
-class AdaptiveSampler:
-    STATE_WARMUP = 0
-    STATE_GENRAL = 1
-    STATE_REFINE = 2
-    STATE = ["warmup", "general", "refine"]
-    @classmethod
-    def maximize_discrpency(cls, affinity, total):
-        # TODO: implement this
-        pass
+class DataIter(Dataset):
+    def __init__(self,
+                 getter,
+                 sample_sequence: list,):
+        self.getter = getter
+        self.sequence = sample_sequence
+    def __getitem__(self, idx):
+        cam, gt = self.getter(*self.sequence[idx])
+        return cam, gt
+    def __len__(self):
+        return len(self.sequence)
+
+class DatasetEmulator:
     def __init__(self, 
                  getter,
                  # range
@@ -297,56 +306,38 @@ class AdaptiveSampler:
                  further_downscale=1,
                  # options
                  batch_size = 1, 
-                 policy = [3000, 20000]
+                 policy: Literal["random", "sequential"] = "sequential",
+                 num_workers = 4,
                  ):
         self.getter = getter
         self.policy = policy
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
         self.cams = cams_idx.copy()
         self.frames = frames_idx.copy()
-        self.batch_size = batch_size
         self.further_downscale = further_downscale
-        # runtime
-        self._state_machine = AdaptiveSampler.STATE_WARMUP
-        self._pool = None
-        self._reference = {}
-        print(f"AdaptiveSampler pool size: {len(self.cams) * len(self.frames)}")
-
-    def refer(self, info, step):
-        self._reference["per_frame_psnr"] = info["per_frame_psnr"]
-        if self._state_machine < len(self.policy) and step > self.policy[self._state_machine]:
-            self._state_machine += 1
-            print(f"AdaptiveSampler state change to {AdaptiveSampler.STATE[self._state_machine]}")
-
-    def __iter__(self):
-        # reset the iterator
-        assert "per_frame_psnr" in self._reference, "reference missing per_frame_psnr"
-        assert "camera_affinity" in self._reference, "reference missing camera_affinity"
-        # ---------------------------------- warmup ---------------------------------- #
-        if self._state_machine == AdaptiveSampler.STATE_WARMUP:
-            ds = self.further_downscale * 2
-            self._pool = [(c, f, ds) for c in self.cams for f in self.frames]
-            random.shuffle(self._pool)
-            return self
-        # ---------------------------------- general ---------------------------------- #
-        if self._state_machine == AdaptiveSampler.STATE_GENRAL:
-            # TODO: implement general sampling
-            return self
-        # ---------------------------------- refine ---------------------------------- #
-        if self._state_machine == AdaptiveSampler.STATE_REFINE:
-            total = len(self.cams) * len(self.frames)
-            prob = self._reference["per_frame_psnr"]
-            target_frames = random.choices(self.frames, weights=prob, k=total)
-            affinity = self._reference["camera_affinity"]
-            target_cams = AdaptiveSampler.maximize_discrpency(affinity, total)
-            self._pool = [(c, f, self.further_downscale) for c, f in zip(target_cams, target_frames)]
-
-        return self
-    def __next__(self):
-        # return a batch of cams
-        if len(self._pool) == 0:
-            self._reference = {} # reset reference info after exhausted
-            raise StopIteration
         
-        batch = self._pool[:self.batch_size]
-        self._pool = self._pool[self.batch_size:]
-        return self.getter(batch)
+    def _get_iter(self, info, step):
+        if self.policy == "random":
+            seq = [(c, f, self.further_downscale) \
+                   for c in self.cams for f in self.frames]
+            random.shuffle(seq)
+            return DataIter(self.getter, seq)
+        elif self.policy == "sequential":
+            seq = sorted([(c, f, self.further_downscale) \
+                          for c in self.cams for f in self.frames],
+                          key=lambda x: (x[0], x[1]))
+            return DataIter(self.getter, seq)
+    
+    def gen_loader(self, info, step):
+        loader = DataLoader(
+                    self._get_iter(info, step),
+                    batch_size=self.batch_size,
+                    shuffle=False,                  # follow our own sampling order
+                    num_workers=self.num_workers,
+                    pin_memory=True,
+                    collate_fn=lambda x: x,         # no need to collate,
+                    prefetch_factor=2,              # prefetch 2 batches
+                )
+        return loader
