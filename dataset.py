@@ -87,7 +87,7 @@ def read_ply(ply_path):
     return points, colors
 
 class SceneReader:
-    def __init__(self, cfg, cache=None, return_dict=False):
+    def __init__(self, cfg, cache=None):
         if cache == "gpu":
             self.cache_device = torch.device("cuda")
         elif cache == "cpu":
@@ -95,7 +95,6 @@ class SceneReader:
         else:
             print("no cache device set, cache disabled")
             self.cache_device = None
-        self.return_dict = return_dict
         self.path = cfg.data_dir
 
         # 1) load cameras' info
@@ -168,20 +167,31 @@ init type: {cfg.init_type}
         self.cached = {}
         self.max_cache = cfg.max_cached_img
 
+    def get_cam(self, triad) -> Camera:
+        """
+        get the camera object from the triad
+        """
+        assert len(triad) == 3, "get_cam expects a triad"
+        assert triad[0] < self.cam_num, f"cam index {triad[0]} out of range"
+        assert triad[1] < self.frame_total, f"frame index {triad[1]} out of range"
+        return self.cams[triad[0]][triad[1]].thumbnail(triad[2])
+
     def get(self, cam, frame, downscale):
         """
         load the image from disk,
         for torch dataloader
         """
-        cam_obj = self.cams[cam][frame].thumbnail(downscale)
-        return cam_obj, self._get(cam_obj)
+        cam_obj = self.get_cam((cam, frame, downscale))
+        return self._get(cam_obj)
 
-    def _get(self, cam_obj=None):
+    def _get(self, cam_obj):
         """
         load the image from disk using OpenCV
         """
         img_path = os.path.join(cam_obj.path, f"{cam_obj.frame}.png")
         img = cv2.imread(img_path)
+        if img is None:
+            raise ValueError(f"failed to load {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (cam_obj.width, cam_obj.height))
         img = img.astype(np.float32) / 255.0
@@ -201,14 +211,14 @@ init type: {cfg.init_type}
         since image is lazy loaded
         """
         assert self.cache_device is not None, "cache_device is not set"
-        cam_obj = self.cams[cam][frame].thumbnail(downscale)
+        cam_obj = self.get_cam((cam, frame, downscale))
         img = self.cached.get(
             (cam, frame, downscale), None)
         if img is None: # cache miss
             img = self._get(cam_obj=cam_obj)
             img = img.to(self.cache_device)
             self.cached[(cam, frame, downscale)] = img
-        return cam_obj, img
+        return img
     
     def cached_get_batch(self, triplets: list):
         """
@@ -228,26 +238,15 @@ init type: {cfg.init_type}
             # clear cache
             for tri in list(uneed)[:len(more)]:
                 del self.cached[tri]
-        ret = []
+        ret_x = []
+        ret_y = []
         for tri in want:
-            ret.append(self._cached_get(*tri))
+            ret_x.append(tri)
+            ret_y.append(self._cached_get(*tri))
         
         # a formatter for gsplat compatibility
-        if self.return_dict:
-            ret = self.cam_formatter(ret)
-        return ret
+        return ret_x, ret_y
     
-    @staticmethod
-    def cam_formatter(get_res):
-        """
-        format the get_res to a dict
-        """
-        ret = {
-            "camtoworld": torch.stack([cam.c2w for cam, _ in get_res], dim=0),
-            "K": torch.stack([cam.intri for cam, _ in get_res], dim=0),
-            "image": torch.stack([img.permute(1, 2, 0) for _, img in get_res], dim=0)
-        }
-        return ret
 
 class BatchLoader:
     def __init__(self, 
@@ -276,6 +275,10 @@ class BatchLoader:
                              for c in self.cams for f in self.frames], key=lambda x: (x[0], x[1]))
         if self.policy == "random":
             random.shuffle(self._pool)
+        elif self.policy == "sequential":
+            pass
+        else:
+            raise ValueError(f"unknown policy {self.policy}")
         return self
     def __next__(self):
         # return a batch of cams
@@ -289,10 +292,12 @@ class DataIter(Dataset):
     def __init__(self,
                  getter,
                  sample_sequence: list,):
+        # sample_sequence: [(cam, frame, downscale), ...]
         self.getter = getter
         self.sequence = sample_sequence
     def __getitem__(self, idx):
-        cam, gt = self.getter(*self.sequence[idx])
+        cam = torch.tensor(self.sequence[idx], dtype=torch.int32)
+        gt = self.getter(*self.sequence[idx])
         return cam, gt
     def __len__(self):
         return len(self.sequence)
@@ -307,7 +312,9 @@ class DataManager:
                  further_downscale=1,
                  # options
                  batch_size = 1,
-                 policy: Literal["random", "sequential"] = "sequential",
+                 policy: Literal["random", 
+                                 "sequential",
+                                 "adaptive"] = "sequential",
                  num_workers = 4,
                  use_torch_loader = False,
                  ):
@@ -344,14 +351,17 @@ class DataManager:
     def _get_torch_iter(self, info, step):
         if self.policy == "random":
             seq = [(c, f, self.further_downscale) \
-                   for c in self.cams for f in self.frames]
+                    for c in self.cams for f in self.frames]
             random.shuffle(seq)
-            return DataIter(self.scene.get, seq)
         elif self.policy == "sequential":
-            seq = sorted([(c, f, self.further_downscale) \
-                          for c in self.cams for f in self.frames],
-                          key=lambda x: (x[0], x[1]))
-            return DataIter(self.scene.get, seq)
+            seq = [(c, f, self.further_downscale) \
+                    for c in self.cams for f in self.frames]
+        elif self.policy == "adaptive":
+            pass
+        else:
+            raise ValueError(f"unknown policy {self.policy}")
+        
+        return DataIter(self.scene.get, seq)
     
     # ------------------- unified api for training and testing ------------------- #
     def gen_loader(self, info, step):
@@ -365,8 +375,6 @@ class DataManager:
                         shuffle=False,                  # follow our own sampling order
                         num_workers=self.num_workers,
                         pin_memory=True,
-                        collate_fn=lambda x: x,         # no need to collate,
-                        prefetch_factor=2,              # prefetch 2 batches
                     )
         else:
             loader = self._get_batch_loader()

@@ -32,14 +32,13 @@ from pipeline import DecafPipeline
 
 from helper import LogDirMgr, save_tensor_images, GlobalWriter
 
-@torch.no_grad()
-def batch_analyse(pc_batched, K, dead_thres):
+def opacity_analysis(pc_batched, K, dead_thres):
     # pc_batched is a list of pc, each pc is a Gaussians instance
     # we need to analyse the batched pc to get the average spawn and opacity
     anchor_avg_spawn = []
     anchor_opacity = []
     for pc in pc_batched:
-        ops_per_anchor = pc.opacities.reshape(-1, K)
+        ops_per_anchor = pc.opacities.detach().reshape(-1, K)
         spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
         opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
         anchor_avg_spawn.append(spawn_per_anchor)
@@ -225,17 +224,21 @@ class Runner:
             }
 
             pc_batched = []
-            
-            for cam, gt in data:
-                pc, aks = self.model.produce(cam)
+            cams = [self.scene.get_cam(cam_triad).to(
+                        self.device, non_blocking=True) \
+                    for cam_triad in data[0]] 
+            gts = [gt.to(self.device, non_blocking=True) \
+                    for gt in data[1]] # to_cuda earlier to overlap with model forward
 
+            for cam, gt in zip(cams, gts):
+
+                pc, aks = self.model.produce(cam)
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
                     sh_degree=0
                 ) # img and info are batched actually, but batch size = 1
 
-                gt = gt.to(self.device)
                 metrics["l1loss"] += F.l1_loss(img[None], gt[None])
                 metrics["ssimloss"] += 1 - fused_ssim(img[None], gt[None], padding="valid")
                 if self.cfg.reg_opacity > 0:
@@ -250,17 +253,18 @@ class Runner:
             K = self.model.model_cfg.anchor_child_num
             thres = self.cfg.reloc_dead_thres
 
-            # analysis
+            # --------------------------- anchor level analysis -------------------------- #
             aks_last = aks  # aks we used here is the last aks in the batch, 
                             # but aks (except frame_embedding) is the same across the same batch
                             # so we can use it to represent the whole batch
             (anchor_avg_spawn,
-             anchor_opacity) = batch_analyse(pc_batched, K, thres)
+             anchor_opacity) = opacity_analysis(pc_batched, K, thres)
+            
             offsets = aks_last.childs_xyz - aks_last.anchor_xyz.unsqueeze(1).expand(-1, K, -1)
             offsets = torch.norm(offsets, dim=-1)
             metrics["offset"] = torch.mean(offsets) # offset is the same across the batch
-
-            # gs spawn distribution >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
+            
+            # gs spawn distribution >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
             if step % 400 == 0:
                 with torch.no_grad():
                     self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
@@ -337,9 +341,13 @@ class Runner:
         test_loader = iter(self.test_sampler_gen.gen_loader({}, 0))
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
         for i, data in enumerate(sub_bar):
-            assert len(data) == 1, "test batch size must be 1"
-            data = data[0]
-            cam, gt = data
+            assert data[0].shape[0] == 1, "batch size should be 1"
+
+            cam = self.scene.get_cam(data[0][0]).to(
+                self.device, non_blocking=True)
+            gt = data[1][0].to(
+                self.device, non_blocking=True)
+
             start_time = time.time()
             pc, _ = self.model.produce(cam)
             img, _, _ = self.single_render(
@@ -348,7 +356,6 @@ class Runner:
                 sh_degree=0
             )
             elapsed.append(time.time() - start_time)
-            gt = gt.to(self.device)
             img = img
             for k, func in self.eval_funcs.items():
                 results[k].append(func(img[None], gt[None]).item())  # metrics func expect batches

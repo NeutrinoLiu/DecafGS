@@ -132,16 +132,17 @@ class Viewer(object):
             )
             self._train_util_slider.on_update(self.rerender)
 
-            self._render_frame_slider = self.server.gui.add_slider(
-                "Frame", min=self._frame_start, max=self._frame_end, step=1, initial_value=self._frame_start
-            )
-            self._render_frame_slider.on_update(self.rerender)
-
         with self.server.gui.add_folder("Rendering") as self._rendering_folder:
             self._max_img_res_slider = self.server.gui.add_slider(
                 "Max Img Res", min=64, max=2048, step=1, initial_value=2048
             )
             self._max_img_res_slider.on_update(self.rerender)
+
+        with self.server.gui.add_folder("Dynamic") as self._camera_folder:
+            self._render_frame_slider = self.server.gui.add_slider(
+                "Frame", min=self._frame_start, max=self._frame_end, step=1, initial_value=self._frame_start
+            )
+            self._render_frame_slider.on_update(self.rerender)
 
         gui_reset_up = self.server.gui.add_button(
             "Reset up direction",

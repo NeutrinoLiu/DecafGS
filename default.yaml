@@ -1,7 +1,7 @@
 # default config
 data:
   format: "volumetric_video"
-  data_dir: "scenes/coffee"
+  data_dir: "scenes/cook"
   frame_total: 300
   resolution: 2
   cache_device: "torch" # ["cpu", "gpu", "torch"]
@@ -9,6 +9,7 @@ data:
   max_cached_img: 1000
   # torch based data loader
   num_workers: 4
+  
   # point cloud init
   init_type: "sfm"
   init_random_num: 10000
@@ -41,7 +42,7 @@ model:
 train:
   # logging
   random_seed: 103
-  root: "output/coffee"
+  root: "output/cook"
   # training
   max_step: 30000
   batch_size: 1
