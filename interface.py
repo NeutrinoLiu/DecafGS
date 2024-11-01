@@ -156,6 +156,7 @@ class Gaussians:
         filter gaussians by opacities
         """
         mask = gs.opacities > thres
+        idx = torch.nonzero(mask).squeeze()
         return Gaussians({
             "means": gs.means[mask],
             "scales": gs.scales[mask],
@@ -163,4 +164,4 @@ class Gaussians:
             "opacities": gs.opacities[mask],
             "sh0": gs.sh0[mask],
             "shN": gs.shN[mask]
-        })
+        }), idx

@@ -144,6 +144,12 @@ class Viewer(object):
             )
             self._render_frame_slider.on_update(self.rerender)
 
+        with self.server.gui.add_folder("Visualize Mode") as self._camera_folder:
+            self._visualize_mode = self.server.gui.add_dropdown(
+                "Visualize Mode", ["RGB", "A", "B", "C"], initial_value="RGB"
+            )
+            self._visualize_mode.on_update(self.rerender)
+
         gui_reset_up = self.server.gui.add_button(
             "Reset up direction",
             hint="Set the camera control 'up' direction to the current camera's 'up'.",

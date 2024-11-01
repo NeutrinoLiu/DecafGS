@@ -18,24 +18,25 @@ data:
 model:
   # anchor embedding
   anchor_num: 40000
-  anchor_embed_dim: 32    # trainable embedding
-  anchor_feature_dim: 32  # intermidiate feature
+  anchor_embed_dim: 64    # trainable embedding
+  anchor_feature_dim: 64  # intermidiate feature
   anchor_child_num: 5
   # frame embedding
   frame_start: 0
-  frame_end: 1
+  frame_end: 300
   frame_embed_dim: 200    # trainable embedding
+  frame_embed_accumulative: False # accumulate frame embedding
   # deform MLP
-  deform_hidden_dim: 32
-  deform_depth: 6
-  deform_skip: 3
+  deform_hidden_dim: 64
+  deform_depth: 8
+  deform_skip: 4
   deform_anchor_xyz: True
-  deform_child_offsets: True
-  deform_child_scales: True
+  deform_child_offsets: False
+  deform_child_scales: False
   # neural GS MLP
-  spawn_hidden_dim: 32
-  rotate6: False
-  trim_by_opacity: True
+  spawn_hidden_dim: 64
+  spawn_xyz_bypass: True
+  filter_by_ops: True
   view_dependent: False
   six_dof_rotate: False
 
@@ -45,7 +46,8 @@ train:
   root: "output/cook"
   # training
   max_step: 30000
-  batch_size: 1
+  batch_size: 4
+  frame_sustained_release: False # increase trainable frame by steps
   # [legacy] 
   # init_opacity: 0.1
   # init_scale: 1.0
@@ -93,15 +95,17 @@ train:
   reloc_start_iter: 500
   reloc_stop_iter: 100000
   reloc_every: 100
-  reloc_dead_thres: 0.005
+  reloc_dead_thres: 0.01
   reloc_dead_spawns: 0
-  impact_momentum: 0
-  scale_decay: 0.95 # an approximate of MCMC rescale after relocation
+  state_ewma_alpha: 0.9
+  grad2d_for_impact: 0
+  scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   # evaluation
   save_eval_img: False
   test_every: 25
   test_steps:
     - 1000
+    - 2500
     - 5000
     - 7500
     - 10000
@@ -113,6 +117,10 @@ train:
     - 25000
     - 27500
     - 30000
+    - 35000
+    - 40000
+    - 45000
+    - 50000
     # - 10000
     # - 11000
     # - 12000

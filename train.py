@@ -5,7 +5,7 @@ import time
 from line_profiler import profile
 
 import os
-
+import math
 from tqdm import tqdm
 import numpy as np
 import hydra
@@ -23,35 +23,22 @@ import viser
 
 from fused_ssim import fused_ssim
 from gsplat.rendering import rasterization
-from examples.utils import set_random_seed
+from examples.utils import set_random_seed, rgb_to_sh
 
 from strategy import DecafMCMCStrategy
-from dataset import SceneReader, BatchLoader, DataManager, dataset_split
+from dataset import SceneReader, DataManager, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
-from helper import LogDirMgr, save_tensor_images, GlobalWriter
+from helper import LogDirMgr, save_tensor_images, calculate_grads, opacity_analysis, normalize, ewma_update
 
-def opacity_analysis(pc_batched, K, dead_thres):
-    # pc_batched is a list of pc, each pc is a Gaussians instance
-    # we need to analyse the batched pc to get the average spawn and opacity
-    anchor_avg_spawn = []
-    anchor_opacity = []
-    for pc in pc_batched:
-        ops_per_anchor = pc.opacities.detach().reshape(-1, K)
-        spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
-        opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
-        anchor_avg_spawn.append(spawn_per_anchor)
-        anchor_opacity.append(opacity_per_anchor)
-    anchor_avg_spawn = sum(anchor_avg_spawn) / len(pc_batched)
-    anchor_opacity = sum(anchor_opacity) / len(pc_batched)
 
-    return anchor_avg_spawn, anchor_opacity
 
 class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
 
         self.cfg = train_cfg
+        self.model_cfg = model_cfg
         # --------------------------------- setup log -------------------------------- #
         self.log = LogDirMgr(self.cfg.root)
         with open(self.log.config, 'w') as f:
@@ -75,14 +62,30 @@ class Runner:
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
 
+        # ------------------------- other training schedulers ------------------------ #
+        policy_complex = {
+            150 : "downsample_8",
+            500 : "downsample_4",
+            1300 : "downsample_2",
+            train_cfg.max_step : "max_parallex"
+        }
+        sustained_release = None
+        if train_cfg.frame_sustained_release:
+            sustained_release = [1000] 
+            for i in range(1, max_frame - min_frame):
+                interval = 5 * int(i ** 0.5)
+                sustained_release.append(sustained_release[-1] + interval)
+        # ------------------------------------- - ------------------------------------ #
+
         self.train_loader_gen = DataManager(
             self.scene,                         # img reader
             train_cam_idx,                      # train cam only
             list(range(min_frame, max_frame)),  # full frame
             batch_size = train_cfg.batch_size,
-            policy = "random",
+            policy = policy_complex,
             num_workers=data_cfg.num_workers,
-            use_torch_loader=self.use_torch_loader
+            use_torch_loader=self.use_torch_loader,
+            sustained_release=sustained_release
             )
         self.test_sampler_gen = DataManager(
             self.scene,                         # img reader
@@ -110,7 +113,8 @@ class Runner:
             train_cfg=train_cfg,
             max_cap=model_cfg.anchor_num,
             verbose=False)
-        self.state = {}
+        
+        self.state = {}         # running state, not only for strategy
         N = self.model.deform.anchor_params['anchor_xyz'].shape[0]
         self.state.update(
             self.strategy.initialize_state(N, self.device))
@@ -136,7 +140,6 @@ class Runner:
 
         # ----------------------------- setup tensorboard ---------------------------- #
         self.writer = SummaryWriter(log_dir=self.log.tb)
-        GlobalWriter(writer=self.writer)
 
     def single_render( self,
                 pc: Gaussians,
@@ -150,7 +153,11 @@ class Runner:
         width = cam.width
         height = cam.height
 
-        pc = Gaussians.filter_by_ops(pc, self.cfg.reloc_dead_thres)
+        if self.model_cfg.filter_by_ops:
+            pc, filter_idx = Gaussians.filter_by_ops(pc, self.cfg.reloc_dead_thres)
+            # idx[i] = j means, the i-th filtered gaussian is the j-th gaussian in the original pc
+        else:
+            filter_idx = torch.arange(pc.means.shape[0], device=pc.device)
 
         img, alpha, info = rasterization(
             # gaussian attrs
@@ -165,6 +172,7 @@ class Runner:
             width       =   width,
             height      =   height,
             # options
+            sh_degree   =   0,
             packed      =   True,                            # to save memory
             absgrad     =   True,                           # return abs grad
             **kwargs)
@@ -173,6 +181,8 @@ class Runner:
         # we need to permute to (N, 3, H, W) for loss calculation
         if permute:
             img = img.permute(0, 3, 1, 2).clamp(0, 1.)
+        
+        info["filter_idx"] = filter_idx
 
         return img[0], alpha[0], info
 
@@ -196,7 +206,6 @@ class Runner:
             try:
                 data = next(train_loader)
             except StopIteration:
-                # self.train_sampler.learn() # TODO adaptive data loader
                 train_loader = iter(
                     self.train_loader_gen.gen_loader(self.state, step))
                 data = next(train_loader)
@@ -223,12 +232,20 @@ class Runner:
                 "offset": self.cfg.reg_offset
             }
 
-            pc_batched = []
-            cams = [self.scene.get_cam(cam_triad).to(
-                        self.device, non_blocking=True) \
-                    for cam_triad in data[0]] 
-            gts = [gt.to(self.device, non_blocking=True) \
-                    for gt in data[1]] # to_cuda earlier to overlap with model forward
+            # running state per batch,
+            # self.state is a longer term state over the whole dataset
+            key_for_gradient = "means2d"
+            batch_state = {
+                "ops": [],
+                "info": [],
+            }
+            K = self.model.deform.anchor_params['anchor_offsets'].shape[1]
+            N = self.model.deform.anchor_params['anchor_offsets'].shape[0]
+
+
+            cams = [self.scene.get_cam(cam).to(self.device, non_blocking=True) \
+                    for cam in data[0]]
+            gts = data[1].to(self.device, non_blocking=True)
 
             for cam, gt in zip(cams, gts):
 
@@ -236,7 +253,6 @@ class Runner:
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
-                    sh_degree=0
                 ) # img and info are batched actually, but batch size = 1
 
                 metrics["l1loss"] += F.l1_loss(img[None], gt[None])
@@ -247,31 +263,18 @@ class Runner:
                     metrics["l1scale"] += torch.abs(pc.scales).mean()
                 if self.cfg.reg_volume > 0:
                     metrics["volume"] += torch.prod(pc.scales, dim=1).mean()
+                if self.cfg.reg_offset > 0:
+                    offsets = aks.childs_xyz - aks.anchor_xyz.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
+                    gs_offsets = torch.norm(offsets, dim=-1)                                    # [N, K]
+                    ak_radius = torch.norm(gs_offsets, dim=-1) / K ** 0.5                       # [N]
+                    metrics["offset"] += torch.mean(ak_radius)                                  # [1]
 
-                pc_batched.append(pc)
+                batch_state["ops"].append(pc.opacities)
+                batch_state["info"].append(info)
+                if self.cfg.grad2d_for_impact > 0:
+                    info[key_for_gradient].retain_grad()
 
-            K = self.model.model_cfg.anchor_child_num
-            thres = self.cfg.reloc_dead_thres
-
-            # --------------------------- anchor level analysis -------------------------- #
-            aks_last = aks  # aks we used here is the last aks in the batch, 
-                            # but aks (except frame_embedding) is the same across the same batch
-                            # so we can use it to represent the whole batch
-            (anchor_avg_spawn,
-             anchor_opacity) = opacity_analysis(pc_batched, K, thres)
-            
-            offsets = aks_last.childs_xyz - aks_last.anchor_xyz.unsqueeze(1).expand(-1, K, -1)
-            offsets = torch.norm(offsets, dim=-1)
-            metrics["offset"] = torch.mean(offsets) # offset is the same across the batch
-            
-            # gs spawn distribution >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
-            if step % 400 == 0:
-                with torch.no_grad():
-                    self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
-                    self.writer.add_histogram("train/childs_offsets", offsets.clamp(-1,1), step)
-                    anchor_shift = aks_last.anchor_xyz - self.model.deform.anchor_params['anchor_xyz']
-                    anchor_shift = torch.norm(anchor_shift, dim=-1)
-                    self.writer.add_histogram("train/anchor_shift", anchor_shift, step)
+            # ------------------------------- loss calculation --------------------------- #
 
             # losses averaged by batch
             metrics = {k: v / len(data) for k, v in metrics.items()}
@@ -280,16 +283,29 @@ class Runner:
             # ------------------------------- backward pass ------------------------------ #
             self.strategy.step_pre_backward(
                 state=self.state,
-                ak_childs=anchor_avg_spawn,
-                ak_ops=anchor_opacity,
-                ak_grads=None
+                info=info,
             )
 
             loss.backward()
             desc = f"loss={loss.item():.3f}| anchor#={aks.anchor_xyz.shape[0]}"
             pbar.set_description(desc)
             
-            # relocate and densification
+            # ------------------- use batch state update training state ------------------ #
+
+            (anchor_avg_childs,
+             anchor_opacity) = opacity_analysis(batch_state, K, self.cfg.reloc_dead_thres)
+            (anchor_grad2d, 
+             anchor_count) = calculate_grads(batch_state, N=N, K=K, device=self.device)
+            ewma_update(self.state, {
+                "anchor_opacity": anchor_opacity,
+                "anchor_childs": anchor_avg_childs,
+                "anchor_grad2d": anchor_grad2d,
+                "anchor_count": anchor_count,
+            }, self.cfg.state_ewma_alpha)
+            self.state["anchor_impact"] = self.cfg.grad2d_for_impact        * normalize(anchor_grad2d) + \
+                                        (1 - self.cfg.grad2d_for_impact)    * normalize(anchor_opacity)
+
+            # ------------------------ relocate and densification ------------------------ #
             cur_anchor_xyz_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
             report = self.strategy.step_post_backward(
                 state=self.state,
@@ -305,12 +321,16 @@ class Runner:
 
             # tensorboard >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
             with torch.no_grad():
+                if step % 400 == 0:
+                    self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
+                    self.writer.add_histogram("train/grads2d", anchor_grad2d, step)
+                    self.writer.add_histogram("train/childs_offsets", gs_offsets.flatten().clamp(-1,1), step) # last offsets in the batch
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", metrics["l1loss"].item(), step)
                 self.writer.add_scalar("train/ssimloss", metrics["ssimloss"].item(), step)
                 self.writer.add_scalar("train/time", time.time() - tic, step)
-                self.writer.add_scalar("train/active_gs", torch.sum(anchor_avg_spawn), step)
-                self.writer.add_scalar("train/average_child", torch.mean(anchor_avg_spawn), step)
+                self.writer.add_scalar("train/active_gs", torch.sum(anchor_avg_childs), step)
+                self.writer.add_scalar("train/average_child", torch.mean(anchor_avg_childs), step)
                 if report.get("relocated", None) is not None:
                     self.writer.add_scalar("train/relocated", report["relocated"], step)
             
@@ -353,7 +373,6 @@ class Runner:
             img, _, _ = self.single_render(
                 pc=pc,
                 cam=cam,
-                sh_degree=0
             )
             elapsed.append(time.time() - start_time)
             img = img
@@ -380,7 +399,7 @@ class Runner:
 
     @torch.no_grad()
     def viewer_callback(
-        self, camera_state: nerfview.CameraState, img_wh: "tuple[int, int]", frame=0
+        self, camera_state: nerfview.CameraState, img_wh: "tuple[int, int]", frame=0, mode="RGB"
     ):
         W, H = img_wh
         c2w = camera_state.c2w
@@ -399,16 +418,62 @@ class Runner:
             height=H,
             frame=frame
         )
+        # --------------------------- pure image rendering --------------------------- #
+        if mode == "RGB":
+            pc, _ = self.model.produce(cam)
+        # ------------------- anchor location and opacity rendering ------------------ #
+        elif mode == "A":
+            gs, aks = self.model.produce(cam)
+            info = {
+                "ops" : [gs.opacities]
+            }
+            _, aks_opacity = opacity_analysis(info,
+                                              self.model_cfg.anchor_child_num,
+                                              self.cfg.reloc_dead_thres)
+            quats = torch.zeros(aks.anchor_xyz.shape[0], 4, device=self.device)
+            quats[:, 0] = 1.0
+            scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * 0.01
+            colors = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device)
 
-        pc, _ = self.model.produce(cam)
+            pc_dict = {
+                "means" : aks.anchor_xyz,
+                "quats" : quats,
+                "scales" : scales,
+                "opacities" : aks_opacity,
+                "sh0": rgb_to_sh(colors).unsqueeze(1),
+                "shN": torch.zeros(aks.anchor_xyz.shape[0], 0, 3, device=self.device)
+            }
+            pc = Gaussians(pc_dict)
+        # -------------------------- anchor grad2d rendering ------------------------- #
+        elif mode == "B":
+            gs, aks = self.model.produce(cam)
+            grad2d = self.state["anchor_grad2d"]
+            if grad2d is None:
+                return self.buffered_viewer_img.cpu().numpy()
+            grad2d = normalize(grad2d)
+            quats = torch.zeros(aks.anchor_xyz.shape[0], 4, device=self.device)
+            quats[:, 0] = 1.0
+            ops = torch.ones(aks.anchor_xyz.shape[0], device=self.device)
+            scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * grad2d.unsqueeze(1).expand(-1, 3) * 0.3
+            colors = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) 
+
+            pc_dict = {
+                "means" : aks.anchor_xyz,
+                "quats" : quats,
+                "scales" : scales,
+                "opacities" : ops,
+                "sh0": rgb_to_sh(colors).unsqueeze(1),
+                "shN": torch.zeros(aks.anchor_xyz.shape[0], 0, 3, device=self.device)
+            }
+            pc = Gaussians(pc_dict)
+
         img, _, _ = self.single_render(
             pc=pc,
             cam=cam,
             permute=False,      # no need to permute, viewer need (H, W, 3)
-            sh_degree=0,
-            radius_clip=3.0,                # boost rendering speed
             )
 
+        self.buffered_viewer_img = img
         return img.cpu().numpy()
 
 

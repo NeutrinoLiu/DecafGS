@@ -109,6 +109,15 @@ class Deformable(nn.Module):
             self.deform_opts = {}
             self.deform_lr_sched = {}
 
+    def get_frame_embed(self, frame):
+        """
+        get frame embed
+        """
+        if self.cfg.frame_embed_accumulative:
+            return self.deform_params["frame_embed"][:frame + 1].sum(dim=0)
+        else:
+            return self.deform_params["frame_embed"][frame: frame + 1]
+
     def forward(self, frame) -> Anchors:
         """
         forward pass
@@ -129,7 +138,7 @@ class Deformable(nn.Module):
             return Anchors(aks_dict)
 
         # ------------------------------ deform by frame ----------------------------- #
-        frame_embed = self.deform_params["frame_embed"][frame: frame + 1] # so that we dont have to unsqueeze
+        frame_embed = self.get_frame_embed(frame)
         N = self.anchor_params["anchor_xyz"].shape[0]
 
         # TODO should i reserve a piece of memory for embeds?
@@ -191,7 +200,9 @@ class Scaffold(nn.Module):
         self.cfg = model_cfg
         # ----------------------------------- mlps ----------------------------------- #
         in_dim = (model_cfg.anchor_feature_dim if model_cfg.deform_depth > 0 else 0 ) \
-                + model_cfg.anchor_embed_dim + 3
+                + (3 if model_cfg.spawn_xyz_bypass else 0) \
+                + model_cfg.anchor_embed_dim + 3 # feature, embed, ob_view, xyz
+        
         hidden_dim = model_cfg.spawn_hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
@@ -226,7 +237,10 @@ class Scaffold(nn.Module):
         feature = aks.feature                                   # [N, D]
         ob_view = cam.c2w_t.float().to(aks.device) - anchor_xyz         # [N, 3]
         ob_view = ob_view / torch.norm(ob_view, dim=-1, keepdim=True)
-        fea_ob = torch.cat([feature, ob_view], dim=-1)          # [N, D + 3]
+        if self.cfg.spawn_xyz_bypass:
+            fea_ob = torch.cat([feature, ob_view, anchor_xyz], dim=-1)
+        else:
+            fea_ob = torch.cat([feature, ob_view], dim=-1)          # [N, D + 3]
 
         # attrs
         means = means.reshape(-1, 3)                            # [N * K, 3]

@@ -144,7 +144,8 @@ class Renderer(threading.Thread):
                     # ---------------------------------- DecafGS --------------------------------- #
                     # specify frame in user UI
                     T = self.viewer._render_frame_slider.value
-                    rendered = self.viewer.render_fn(task.camera_state, img_wh, T)
+                    mode = self.viewer._visualize_mode.value
+                    rendered = self.viewer.render_fn(task.camera_state, img_wh, T, mode)
                     if isinstance(rendered, tuple):
                         img, depth = rendered
                     else:

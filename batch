@@ -3,6 +3,7 @@
 # Function to clean up and exit
 cleanup_and_exit() {
     echo "Script interrupted. Cleaning up and exiting..."
+    cp batch_config.txt experiments/$exp_name/config.txt
     exit 1
 }
 

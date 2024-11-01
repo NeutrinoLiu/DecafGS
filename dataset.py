@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from interface import Camera
 from helper import timeit
+from datasampler import *
 
 from examples.datasets.normalize import (
     similarity_from_cameras,
@@ -247,7 +248,6 @@ init type: {cfg.init_type}
         # a formatter for gsplat compatibility
         return ret_x, ret_y
     
-
 class BatchLoader:
     def __init__(self, 
                  getter,
@@ -314,22 +314,36 @@ class DataManager:
                  batch_size = 1,
                  policy: Literal["random", 
                                  "sequential",
-                                 "adaptive"] = "sequential",
+                                 "max_parallex"] = "sequential",
                  num_workers = 4,
                  use_torch_loader = False,
+                 sustained_release = None
                  ):
         
         self.scene = scene
         self.policy = policy
-        self.batch_size = batch_size
         self.num_workers = num_workers
         self.use_torch_loader = use_torch_loader
+        self.frame_release_schedule = sustained_release
 
         self.cams = cams_idx.copy()
         self.frames = frames_idx.copy()
-        self.further_downscale = further_downscale
+        self.downscale_base = further_downscale
+        self.batch_size_base = batch_size
 
         self.cached_loader = None
+        self.cached_cam_dist = None
+    
+    @property
+    def cam_dist(self):
+        if self.cached_cam_dist is None:
+            self.cached_cam_dist = np.zeros((len(self.cams), len(self.cams)))
+            for i in range(len(self.cams)):
+                for j in range(len(self.cams)):
+                    t1 = self.scene.cams[i].c2w_t
+                    t2 = self.scene.cams[j].c2w_t
+                    self.cached_cam_dist[i, j] = np.linalg.norm(t1 - t2)
+        return self.cached_cam_dist
     
     # -------------------------- for our own loader only ------------------------- #
     # our own loader use [cached_get_batch] to load images
@@ -339,27 +353,58 @@ class DataManager:
                 self.scene.cached_get_batch,
                 self.cams,
                 self.frames,
-                self.further_downscale,
-                self.batch_size,
+                self.downscale_base,
+                self.batch_size_base,
                 self.policy
             )
         return self.cached_loader
 
+    def _sustained_release(self, step):
+        if self.frame_release_schedule is not None:
+            # find the i-th element in frame_release_schedule that larger than step
+            for i, s in enumerate(self.frame_release_schedule):
+                if step < s:
+                    return self.frames[:i+1]
+        return self.frames
+
     # ------------------------- for torch dataloader only ------------------------ #
     # torch dataloader need an iterator to fetch data
     # in this case, simple [get] is used to fetch single image
-    def _get_torch_iter(self, info, step):
-        if self.policy == "random":
-            seq = [(c, f, self.further_downscale) \
-                    for c in self.cams for f in self.frames]
-            random.shuffle(seq)
-        elif self.policy == "sequential":
-            seq = [(c, f, self.further_downscale) \
-                    for c in self.cams for f in self.frames]
-        elif self.policy == "adaptive":
-            pass
+    def _get_torch_iter(self, policy, info, step, downscale, batch_size):
+        frame_range = self._sustained_release(step)
+        sample_nums = len(frame_range) * batch_size
+        if isinstance(policy, list):
+            p = random.choice(policy)
+            return self._get_torch_iter(p, info, step, downscale, batch_size)
+        if policy == "random":
+            frams = uniform_frame_sampler(frame_range, sample_nums)
+            cams = uniform_camera_sampler(self.cams, sample_nums)
+            seq = [(c, f, downscale) for c,f in zip(cams, frams)]
+        elif policy == "sequential":
+            seq = sequential_sampler(
+                    self.cams,
+                    frame_range,
+                    downscale)
+        elif policy == "max_parallex":
+            frames = uniform_frame_sampler(frame_range, sample_nums)
+            cams = max_parallex_sampler(self.cams, sample_nums,
+                    self.cam_dist,
+                    batch_size)
+            seq = [(c, f, downscale) for c,f in zip(cams, frames)]
+        elif policy == "screening":
+            cams = max_parallex_sampler(self.cams, sample_nums,
+                    self.cam_dist,
+                    batch_size)
+            # copy frames for twice
+            frames = np.array(frame_range.copy()).repeat(batch_size)
+            seq = [(c, f, downscale) for c,f in zip(cams, frames)]
+        elif policy == "first_frame_only":
+            sample_nums = 1000 * batch_size
+            frams = uniform_frame_sampler(self.frames[:1], sample_nums)
+            cams = uniform_camera_sampler(self.cams, sample_nums)
+            seq = [(c, f, downscale) for c,f in zip(cams, frams)]
         else:
-            raise ValueError(f"unknown policy {self.policy}")
+            raise ValueError(f"unknown policy {policy}")
         
         return DataIter(self.scene.get, seq)
     
@@ -368,10 +413,29 @@ class DataManager:
         # we rebuild the loader every time after exhausted
         # because we want to adjust the sampling order according to (info, step)
         if self.use_torch_loader:
-            data_iter = self._get_torch_iter(info, step)
+            if isinstance(self.policy, str):
+                data_iter = self._get_torch_iter(
+                    self.policy, info, step, self.downscale_base, self.batch_size_base)
+                batch_size = self.batch_size_base
+            else:
+                data_iter = None
+                for s, p in self.policy.items():
+                    if step < s:
+                        if p.startswith("downsample"):
+                            ratio = int(p.split("_")[1])
+                            batch_size = self.batch_size_base * ratio
+                            downscale = self.downscale_base * ratio
+                            data_iter = self._get_torch_iter(
+                                ["random"], info, step, downscale, batch_size)
+                        else:
+                            data_iter = self._get_torch_iter(
+                                p, info, step, self.downscale_base, self.batch_size_base)
+                            batch_size = self.batch_size_base
+                assert data_iter is not None, f"no specified policy for step {step}"
+
             loader = DataLoader(
                         data_iter,
-                        batch_size=self.batch_size,
+                        batch_size=batch_size,
                         shuffle=False,                  # follow our own sampling order
                         num_workers=self.num_workers,
                         pin_memory=True,

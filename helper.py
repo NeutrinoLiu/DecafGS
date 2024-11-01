@@ -7,6 +7,7 @@ import shutil
 from PIL import Image
 import time
 import torchvision.transforms as T
+from typing import List, Dict, Any
 
 def cur_time():
     import datetime
@@ -187,3 +188,82 @@ def timeit(func):
         print(f"{func.__name__} executed in {te-ts:.2f} s")
         return result
     return timed
+
+# -------------------- per batch analysis helper functions ------------------- #
+
+def opacity_analysis(batch_state, K, dead_thres):
+    # pc_batched is a list of pc, each pc is a Gaussians instance
+    # we need to analyse the batched pc to get the average spawn and opacity
+    anchor_avg_spawn = []
+    anchor_opacity = []
+    ops = batch_state["ops"]
+    for op in ops:
+        ops_per_anchor = op.detach().reshape(-1, K)
+        spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
+        opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
+        anchor_avg_spawn.append(spawn_per_anchor)
+        anchor_opacity.append(opacity_per_anchor)
+    anchor_avg_spawn = sum(anchor_avg_spawn) / len(ops)
+    anchor_opacity = sum(anchor_opacity) / len(ops)
+
+    return anchor_avg_spawn, anchor_opacity
+
+# borrowed from gsplat.strategy.default, used to calculate grad2d for gs
+def calculate_grads(
+        batch_state: Dict[str, Any],
+        N: int,
+        K: int,
+        device,
+        packed: bool = True,
+        absgrad: bool = True,
+    ):
+        batched_info = batch_state["info"]
+        key_for_gradient = "means2d"
+        n_gaussian = K * N
+        # initialize state on the first run
+        grad2d = torch.zeros(n_gaussian, device=device)
+        count = torch.zeros(n_gaussian, device=device)
+
+        for info in batched_info:
+            filter_idx = info["filter_idx"]
+
+            # normalize grads to [-1, 1] screen space
+            if absgrad:
+                grads = info[key_for_gradient].absgrad.clone()
+            else:
+                grads = info[key_for_gradient].grad.clone()
+
+            grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
+            grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
+
+            # update the running state
+            if packed:
+                # grads is [nnz, 2]
+                gs_ids = info["gaussian_ids"]  # [nnz]
+            else:
+                # grads is [C, N, 2]
+                sel = info["radii"] > 0.0  # [C, N]
+                gs_ids = torch.where(sel)[1]  # [nnz]
+                grads = grads[sel]  # [nnz, 2]
+
+            gs_ids = filter_idx[gs_ids]     # map from filtered gs to full NxK gs
+            grad2d.index_add_(0, gs_ids, grads.norm(dim=-1))
+            count.index_add_(
+                0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32)
+            )
+
+        # mapper from child gs to anchors
+        grad2d_aks = grad2d.reshape(-1, K).sum(dim=-1)
+        count_aks = count.reshape(-1, K).sum(dim=-1)
+
+        return grad2d_aks, count_aks
+
+def normalize(v, eps=1e-6):
+    return (v - v.min()) / (v.max() - v.min() + eps)
+
+def ewma_update(d, new_kv, alpha=0.9):
+    for k, v in new_kv.items():
+        if d.get(k) is not None:
+            d[k] = d[k] * alpha + v * (1 - alpha)
+        else:
+            d[k] = v
