@@ -9,7 +9,6 @@ data:
   max_cached_img: 1000
   # torch based data loader
   num_workers: 4
-  
   # point cloud init
   init_type: "sfm"
   init_random_num: 10000
@@ -31,11 +30,11 @@ model:
   deform_depth: 8
   deform_skip: 4
   deform_anchor_xyz: True
-  deform_child_offsets: False
+  deform_child_offsets: True
   deform_child_scales: False
   # neural GS MLP
   spawn_hidden_dim: 64
-  spawn_xyz_bypass: True
+  spawn_xyz_bypass: False
   filter_by_ops: True
   view_dependent: False
   six_dof_rotate: False
@@ -48,22 +47,11 @@ train:
   max_step: 30000
   batch_size: 4
   frame_sustained_release: False # increase trainable frame by steps
-  # [legacy] 
-  # init_opacity: 0.1
-  # init_scale: 1.0
-  # sh_degree: 3
-  # sh_degree_interval: 1000
-  # lr_mean: 1e-4
-  # lr_scale: 5e-3
-  # lr_opacity: 5e-2
-  # lr_quat: 1e-3
-  # lr_sh0: 2.5e-3
-  # lr_shN: 1.25e-4
   # [anchor] learning rate
   lr_frame_embed: 0.0075
   lr_mlp_deform: 
-    - 4e-4
-    - 4e-6
+    - 1e-2
+    - 1e-4
   lr_anchor_embed: 0.0075
   lr_anchor_xyz: 
     - 1e-4
@@ -101,9 +89,11 @@ train:
   grad2d_for_impact: 0
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   # evaluation
-  save_eval_img: False
+  save_eval_img: True
+  save_model_onnx: True
   test_every: 25
   test_steps:
+    - 100
     - 1000
     - 2500
     - 5000

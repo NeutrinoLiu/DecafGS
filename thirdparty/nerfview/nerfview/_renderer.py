@@ -145,7 +145,8 @@ class Renderer(threading.Thread):
                     # specify frame in user UI
                     T = self.viewer._render_frame_slider.value
                     mode = self.viewer._visualize_mode.value
-                    rendered = self.viewer.render_fn(task.camera_state, img_wh, T, mode)
+                    scale = self.viewer._vis_gs_scale.value
+                    rendered = self.viewer.render_fn(task.camera_state, img_wh, T, mode, scale)
                     if isinstance(rendered, tuple):
                         img, depth = rendered
                     else:

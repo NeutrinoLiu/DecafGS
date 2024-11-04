@@ -268,6 +268,21 @@ class Scaffold(nn.Module):
         }
         return Gaussians(gs_dict)
 
+    def freeze(self):
+        """
+        freeze all params
+        """
+        for mlp in self.mlp.values():
+            for p in mlp.parameters():
+                p.requires_grad = False
+    def unfreeze(self):
+        """
+        unfreeze all params
+        """
+        for mlp in self.mlp.values():
+            for p in mlp.parameters():
+                p.requires_grad = True
+
 class DecafPipeline(nn.Module):
     """
     a wrapper of system pipeline

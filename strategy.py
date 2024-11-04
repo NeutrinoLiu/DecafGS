@@ -62,10 +62,8 @@ class DecafMCMCStrategy:
         self.min_childs: int = train_cfg.reloc_dead_spawns
         self.verbose: bool = verbose
 
-    def initialize_state(self, N, device) -> Dict[str, Any]:
-        return {
-            "anchor_impacts": torch.ones(N, device=device, dtype=torch.float32),
-        }
+    def initialize_state(self) -> Dict[str, Any]:
+        return {}
 
     def step_pre_backward(self, state, info):
         pass
@@ -77,8 +75,9 @@ class DecafMCMCStrategy:
         aks_opts: Dict[str, torch.optim.Optimizer],
         step: int,
         anchor_xyz_lr: float,
+        dead_func,
+        impact_func,
     ):
-        assert "anchor_impacts" in state, "state should have <anchor_impacts>"
         report = {}
         if (step < self.refine_stop_iter
             and step >= self.refine_start_iter
@@ -87,16 +86,11 @@ class DecafMCMCStrategy:
             n_reloacted_aks, dead_idx, target_idx = self._reloate_anchor(
                 state=state,
                 aks_params=aks_params,
-                opts=aks_opts
+                opts=aks_opts,
+                dead_func=dead_func,
+                impact_func=impact_func
             )
-            if n_reloacted_aks > 0:
-                # update anchor_impacts
-                state["anchor_impacts"][target_idx] = compute_impact_after_split(
-                    impacts=state["anchor_impacts"][target_idx],
-                    counts=torch.bincount(target_idx)[target_idx] + 1,
-                )
-                state["anchor_impacts"][dead_idx] = state["anchor_impacts"][target_idx]
-                if self.verbose:
+            if n_reloacted_aks > 0 and self.verbose:
                     print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
             # ---------------------------------- add aks --------------------------------- #
@@ -104,17 +98,9 @@ class DecafMCMCStrategy:
                 state=state,
                 aks_params=aks_params,
                 opts=aks_opts,
+                impact_func=impact_func
             )
-            if n_new_aks > 0:
-                # add new anchor impacts
-                state["anchor_impacts"][growed_idx] = compute_impact_after_split(
-                    impacts=state["anchor_impacts"][growed_idx],
-                    counts=torch.bincount(growed_idx)[growed_idx] + 1,
-                )
-                state["anchor_impacts"] = torch.cat(
-                    [state["anchor_impacts"],
-                     state["anchor_impacts"][growed_idx]])
-                if self.verbose:
+            if n_new_aks > 0 and self.verbose:
                     print(
                         f"Step {step}: Added {n_new_aks} Anchors. "
                         f"Now having {aks_params['anchor_offsets'].shape[0]} Anchors."
@@ -129,14 +115,14 @@ class DecafMCMCStrategy:
 
             # reset state after relocate
             for k in state:
-                if k != "anchor_impacts":
-                    state[k] = None
+                state[k] = None
 
         # --------------------------------- add noise -------------------------------- #
         self._inject_noise_to_position(
             state=state,
             aks_params=aks_params,
-            intensity=self.noise_lr * anchor_xyz_lr
+            intensity=self.noise_lr * anchor_xyz_lr,
+            impact_func=impact_func
         )
 
         return report
@@ -147,19 +133,21 @@ class DecafMCMCStrategy:
         state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         opts: Dict[str, torch.optim.Optimizer],
+        dead_func,
+        impact_func,
     ):
-        anchor_impacts = state["anchor_impacts"]
-        anchor_opacity = state["anchor_opacity"]
+        aks_impacts = impact_func(state)
+        dead_mask = dead_func(state)
+
         N = aks_params["anchor_offsets"].shape[0]
-        assert anchor_impacts.shape[0] == N, "shape mismatch"
-        dead_mask = anchor_opacity <= self.min_opacity
+        assert aks_impacts.shape[0] == N, "shape mismatch"
         n = dead_mask.sum().item()
         if n == 0: return 0, None, None
 
         # use neural gs's opacity to decide dead/alive anchor
         dead_idx = dead_mask.nonzero(as_tuple=True)[0]
         alive_idx = (~dead_mask).nonzero(as_tuple=True)[0]
-        probs = anchor_impacts[alive_idx]
+        probs = aks_impacts[alive_idx]
 
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         sampled_idx = alive_idx[sampled_idx]
@@ -168,8 +156,8 @@ class DecafMCMCStrategy:
             decays = aks_params["anchor_opacity_decay"][sampled_idx],
             counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
         )
-
         new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
+        
         def param_update(name: str, p: torch.Tensor) -> torch.Tensor:
             if name == "anchor_opacity_decay":
                 p[sampled_idx] = new_opacity_decay
@@ -191,6 +179,7 @@ class DecafMCMCStrategy:
         state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         opts: Dict[str, torch.optim.Optimizer],
+        impact_func,
     ):
         N = aks_params["anchor_offsets"].shape[0]
         ratio = 1 + self.growing_rate
@@ -198,14 +187,14 @@ class DecafMCMCStrategy:
         n = max(0, N_target - N)
         if n == 0: return 0, None
 
-        probs = state["anchor_impacts"]
+        probs = impact_func(state)
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         new_opacity_decay = compute_decay_after_split(
             decays = aks_params["anchor_opacity_decay"][sampled_idx],
             counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
         )
-
         new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
+        
         def param_update(name: str, p: torch.Tensor) -> torch.Tensor:
             if name == "anchor_opacity_decay":
                 p[sampled_idx] = new_opacity_decay
@@ -227,13 +216,14 @@ class DecafMCMCStrategy:
         state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         intensity,
+        impact_func,
     ):
         if intensity == 0: return
         def op_sigmoid(x, k=100, x0=0.995):
             """higher opacity, less noise"""
             return 1 / (1 + torch.exp(-k * (x - x0)))
         
-        noise_resistance = op_sigmoid(1 - state["anchor_impacts"]).unsqueeze(1)
+        noise_resistance = op_sigmoid(1 - impact_func(state)).unsqueeze(1)
         noise = torch.randn_like(aks_params["anchor_xyz"]) \
                  * noise_resistance * intensity * aks_params["anchor_scale_extend"]
         

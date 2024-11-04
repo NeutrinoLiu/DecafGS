@@ -16,7 +16,7 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torch.utils.tensorboard import SummaryWriter
 
-
+import random
 
 import nerfview
 import viser
@@ -30,7 +30,7 @@ from dataset import SceneReader, DataManager, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
-from helper import LogDirMgr, save_tensor_images, calculate_grads, opacity_analysis, normalize, ewma_update
+from helper import LogDirMgr, save_tensor_images_threaded, calculate_grads, opacity_analysis, normalize, ewma_update
 
 
 
@@ -64,9 +64,7 @@ class Runner:
 
         # ------------------------- other training schedulers ------------------------ #
         policy_complex = {
-            150 : "downsample_8",
-            500 : "downsample_4",
-            1300 : "downsample_2",
+            # 1000 : "downsample_2",
             train_cfg.max_step : "max_parallex"
         }
         sustained_release = None
@@ -107,7 +105,7 @@ class Runner:
             init_pts=torch.Tensor(self.scene.init_pts).float(),
             device=self.device
         )
-        
+
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
             train_cfg=train_cfg,
@@ -115,17 +113,15 @@ class Runner:
             verbose=False)
         
         self.state = {}         # running state, not only for strategy
-        N = self.model.deform.anchor_params['anchor_xyz'].shape[0]
         self.state.update(
-            self.strategy.initialize_state(N, self.device))
+            self.strategy.initialize_state())
 
         # ----------------------------------- eval ----------------------------------- #å
         self.eval_funcs = {
             "psnr": PeakSignalNoiseRatio(data_range=1.0).to(self.device),
             "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
             "lpips": LearnedPerceptualImagePatchSimilarity(
-                net_type="alex",
-                normalize=True).to(self.device),
+                net_type="alex", normalize=True).to(self.device),
         }
 
         # ------------------------------- online viewer ------------------------------ #
@@ -302,17 +298,20 @@ class Runner:
                 "anchor_grad2d": anchor_grad2d,
                 "anchor_count": anchor_count,
             }, self.cfg.state_ewma_alpha)
-            self.state["anchor_impact"] = self.cfg.grad2d_for_impact        * normalize(anchor_grad2d) + \
-                                        (1 - self.cfg.grad2d_for_impact)    * normalize(anchor_opacity)
 
             # ------------------------ relocate and densification ------------------------ #
             cur_anchor_xyz_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
+            dead_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
+            impact_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
+                                (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
             report = self.strategy.step_post_backward(
                 state=self.state,
                 aks_params=self.model.deform.anchor_params,
                 aks_opts=self.model.deform.anchor_opts,
                 step=step,
-                anchor_xyz_lr=cur_anchor_xyz_lr
+                anchor_xyz_lr=cur_anchor_xyz_lr,
+                dead_func=dead_fn,
+                impact_func=impact_fn
             )
             
             self.model.optimize()
@@ -359,6 +358,8 @@ class Runner:
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
         test_loader = iter(self.test_sampler_gen.gen_loader({}, 0))
+        n = len(test_loader)
+        selected_idx = random.sample(range(n), min(n, 10))
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
         for i, data in enumerate(sub_bar):
             assert data[0].shape[0] == 1, "batch size should be 1"
@@ -378,8 +379,8 @@ class Runner:
             img = img
             for k, func in self.eval_funcs.items():
                 results[k].append(func(img[None], gt[None]).item())  # metrics func expect batches
-            if self.cfg.save_eval_img:
-                save_tensor_images(img, gt, self.log.render(f"{step}_{i}"))
+            if (self.cfg.save_eval_img or step == self.cfg.max_step - 1) and i in selected_idx:
+                save_tensor_images_threaded(img, gt, self.log.render(f"{step}_{i}"))
 
         results_avg = {k: sum(results[k]) / len(results[k]) for k in results.keys()}
         results_avg['fps'] = len(elapsed) / sum(elapsed)
@@ -399,7 +400,12 @@ class Runner:
 
     @torch.no_grad()
     def viewer_callback(
-        self, camera_state: nerfview.CameraState, img_wh: "tuple[int, int]", frame=0, mode="RGB"
+        self, 
+        camera_state: nerfview.CameraState,
+        img_wh: "tuple[int, int]",
+        frame=0,
+        mode="RGB",
+        init_scale=0.02
     ):
         W, H = img_wh
         c2w = camera_state.c2w
@@ -422,50 +428,37 @@ class Runner:
         if mode == "RGB":
             pc, _ = self.model.produce(cam)
         # ------------------- anchor location and opacity rendering ------------------ #
-        elif mode == "A":
+        else:
             gs, aks = self.model.produce(cam)
-            info = {
-                "ops" : [gs.opacities]
-            }
-            _, aks_opacity = opacity_analysis(info,
-                                              self.model_cfg.anchor_child_num,
-                                              self.cfg.reloc_dead_thres)
-            quats = torch.zeros(aks.anchor_xyz.shape[0], 4, device=self.device)
-            quats[:, 0] = 1.0
-            scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * 0.01
-            colors = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device)
-
-            pc_dict = {
-                "means" : aks.anchor_xyz,
-                "quats" : quats,
-                "scales" : scales,
-                "opacities" : aks_opacity,
-                "sh0": rgb_to_sh(colors).unsqueeze(1),
-                "shN": torch.zeros(aks.anchor_xyz.shape[0], 0, 3, device=self.device)
-            }
-            pc = Gaussians(pc_dict)
-        # -------------------------- anchor grad2d rendering ------------------------- #
-        elif mode == "B":
-            gs, aks = self.model.produce(cam)
-            grad2d = self.state["anchor_grad2d"]
-            if grad2d is None:
+            num_childs = aks.childs_xyz.shape[1]
+            if mode == "ops":
+                vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1)
+            elif mode == "avg-ops":
+                vis_ops = self.state["anchor_opacity"]
+            elif mode == "avg-grad":
+                vis_ops = self.state["anchor_grad2d"]
+            elif mode == "avg-impact":
+                impact_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
+                                    (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
+                vis_ops = impact_fn(self.state)
+            if vis_ops is None:
                 return self.buffered_viewer_img.cpu().numpy()
-            grad2d = normalize(grad2d)
+            vis_ops = normalize(vis_ops)
             quats = torch.zeros(aks.anchor_xyz.shape[0], 4, device=self.device)
             quats[:, 0] = 1.0
-            ops = torch.ones(aks.anchor_xyz.shape[0], device=self.device)
-            scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * grad2d.unsqueeze(1).expand(-1, 3) * 0.3
+            scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * init_scale
             colors = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) 
 
             pc_dict = {
                 "means" : aks.anchor_xyz,
                 "quats" : quats,
                 "scales" : scales,
-                "opacities" : ops,
+                "opacities" : vis_ops,
                 "sh0": rgb_to_sh(colors).unsqueeze(1),
                 "shN": torch.zeros(aks.anchor_xyz.shape[0], 0, 3, device=self.device)
             }
             pc = Gaussians(pc_dict)
+
 
         img, _, _ = self.single_render(
             pc=pc,

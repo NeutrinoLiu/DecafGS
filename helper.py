@@ -2,11 +2,13 @@ import torch
 import math
 from omegaconf import ListConfig
 
+import threading
 import os
 import shutil
 from PIL import Image
 import time
 import torchvision.transforms as T
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 from typing import List, Dict, Any
 
 def cur_time():
@@ -62,6 +64,7 @@ class LogDirMgr:
 
         self.root = root
         self.tb = root
+        self.onnx = os.path.join(root, "model.onnx")
         self.config = os.path.join(root, "config.json")
         self.log = os.path.join(root, "log.json")
         self.stat = os.path.join(root, "stat.json")
@@ -70,6 +73,11 @@ class LogDirMgr:
         self.render = self._dir_builder("render", lambda x: f"render_{x}.png")
     def _dir_builder(self, dir, fmt):
         return lambda x: os.path.join(self.root, dir, fmt(x))
+
+def save_tensor_images_threaded(img_tensor, gt_tensor, save_path):
+    thread = threading.Thread(target=save_tensor_images, args=(img_tensor, gt_tensor, save_path))
+    thread.start()
+    return 
 
 def save_tensor_images(img_tensor, gt_tensor, save_path):
     """
@@ -90,28 +98,44 @@ def save_tensor_images(img_tensor, gt_tensor, save_path):
     
     # Convert tensors to PIL images
     to_pil = T.ToPILImage()
-    
+
     # If tensors are not in range [0,1], normalize them
     if img_tensor.max() > 1.0:
         img_tensor = img_tensor / 255.0
-    if gt_tensor.max() > 1.0:
         gt_tensor = gt_tensor / 255.0
+
+    l1diff = torch.abs(img_tensor - gt_tensor)
+
+    # Compute SSIM map using torchmetrics
+    ssim = StructuralSimilarityIndexMeasure(data_range=1.0, return_full_image=True).to(img_tensor.device)
+    # Add batch dimension as required by torchmetrics
+    img_batch = img_tensor.unsqueeze(0)
+    gt_batch = gt_tensor.unsqueeze(0)
+    _, ssim_map = ssim(img_batch, gt_batch)
+    
+    # Convert SSIM map to RGB for visualization (ssim_map is already in range [0,1])
+    ssim_map = ssim_map.squeeze(0)  # Remove batch dimension
+    # ssim_map_rgb = ssim_map.repeat(3, 1, 1)  # Convert to RGB
+
     
     img_pil = to_pil(img_tensor)
     gt_pil = to_pil(gt_tensor)
+    l1diff_pil = to_pil(l1diff)
+    ssim_map_pil = to_pil(ssim_map)
     
     # Create a new image with twice the width
     w, h = img_pil.size
-    combined = Image.new('RGB', (w * 2, h))
+    combined = Image.new('RGB', (w * 4, h))
     
     # Paste the images side by side
-    combined.paste(img_pil, (0, 0))
-    combined.paste(gt_pil, (w, 0))
+    combined.paste(gt_pil, (0, 0))
+    combined.paste(img_pil, (w, 0))
+    combined.paste(l1diff_pil, (w*2, 0))
+    combined.paste(ssim_map_pil, (w*3, 0))
     
     # Save the combined image
     combined.save(save_path)
-    
-    return combined
+    return 
 
 def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
     ret_opts = {}

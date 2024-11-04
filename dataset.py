@@ -426,11 +426,12 @@ class DataManager:
                             batch_size = self.batch_size_base * ratio
                             downscale = self.downscale_base * ratio
                             data_iter = self._get_torch_iter(
-                                ["random"], info, step, downscale, batch_size)
+                                ["max_parallex"], info, step, downscale, batch_size)
                         else:
                             data_iter = self._get_torch_iter(
                                 p, info, step, self.downscale_base, self.batch_size_base)
                             batch_size = self.batch_size_base
+                        break
                 assert data_iter is not None, f"no specified policy for step {step}"
 
             loader = DataLoader(

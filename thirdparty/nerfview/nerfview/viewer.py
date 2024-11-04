@@ -146,9 +146,13 @@ class Viewer(object):
 
         with self.server.gui.add_folder("Visualize Mode") as self._camera_folder:
             self._visualize_mode = self.server.gui.add_dropdown(
-                "Visualize Mode", ["RGB", "A", "B", "C"], initial_value="RGB"
+                "Visualize Mode", ["RGB", "ops", "avg-ops", "avg-grad", "avg-impact"], initial_value="RGB"
             )
             self._visualize_mode.on_update(self.rerender)
+            self._vis_gs_scale= self.server.gui.add_slider(
+                "GS Scale", min=0.001, max=0.05, step=0.001, initial_value=0.01
+            )
+            self._vis_gs_scale.on_update(self.rerender)
 
         gui_reset_up = self.server.gui.add_button(
             "Reset up direction",
