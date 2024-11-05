@@ -50,15 +50,15 @@ train:
   # [anchor] learning rate
   lr_frame_embed: 0.0075
   lr_mlp_deform: 
-    - 1e-2
     - 1e-4
+    - 1e-6
   lr_anchor_embed: 0.0075
   lr_anchor_xyz: 
     - 1e-4
     - 1e-6
   lr_anchor_offsets: 
-    - 1e-2
-    - 1e-4
+    - 2e-4
+    - 2e-6
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
   lr_anchor_opacity_decay: 1e-5
@@ -89,6 +89,7 @@ train:
   grad2d_for_impact: 0
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   # evaluation
+  tb_histogram: False
   save_eval_img: True
   save_model_onnx: True
   test_every: 25
@@ -111,24 +112,3 @@ train:
     - 40000
     - 45000
     - 50000
-    # - 10000
-    # - 11000
-    # - 12000
-    # - 13000
-    # - 14000
-    # - 15000
-    # - 16000
-    # - 17000
-    # - 18000
-    # - 19000
-    # - 20000
-    # - 21000
-    # - 22000
-    # - 23000
-    # - 24000
-    # - 25000
-    # - 26000
-    # - 27000
-    # - 28000
-    # - 29000
-    # - 30000

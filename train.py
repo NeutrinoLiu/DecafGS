@@ -320,7 +320,10 @@ class Runner:
 
             # tensorboard >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
             with torch.no_grad():
-                if step % 400 == 0:
+                frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]
+                frame_embeds_std = torch.std(frame_embeds, dim=1)
+                self.writer.add_scalar("train/frame_embeds_std", frame_embeds_std.mean(), step)
+                if step % 400 == 0 and self.cfg.tb_histogram > 0:
                     self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
                     self.writer.add_histogram("train/grads2d", anchor_grad2d, step)
                     self.writer.add_histogram("train/childs_offsets", gs_offsets.flatten().clamp(-1,1), step) # last offsets in the batch
