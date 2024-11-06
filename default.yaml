@@ -9,6 +9,7 @@ data:
   max_cached_img: 1000
   # torch based data loader
   num_workers: 4
+  min_iter_per_loader: 100
   # point cloud init
   init_type: "sfm"
   init_random_num: 10000
@@ -16,21 +17,23 @@ data:
 
 model:
   # anchor embedding
-  anchor_num: 40000
+  anchor_num: 60000
   anchor_embed_dim: 64    # trainable embedding
   anchor_feature_dim: 64  # intermidiate feature
-  anchor_child_num: 5
+  anchor_child_num: 8
   # frame embedding
   frame_start: 0
   frame_end: 300
   frame_embed_dim: 200    # trainable embedding
-  frame_embed_accumulative: False # accumulate frame embedding
+  frame_embed_entangle_range: 0 # per frame embed is weighted avg of nearby frames 
+  # accumulative embedding
+  embed_accumulative: False # accumulate frame embedding
   # deform MLP
   deform_hidden_dim: 64
   deform_depth: 8
   deform_skip: 4
   deform_anchor_xyz: True
-  deform_child_offsets: True
+  deform_child_offsets: True # deform child offsets as well
   deform_child_scales: False
   # neural GS MLP
   spawn_hidden_dim: 64
@@ -44,9 +47,9 @@ train:
   random_seed: 103
   root: "output/cook"
   # training
+  incremental_routine: True
   max_step: 30000
   batch_size: 4
-  frame_sustained_release: False # increase trainable frame by steps
   # [anchor] learning rate
   lr_frame_embed: 0.0075
   lr_mlp_deform: 
@@ -61,7 +64,7 @@ train:
     - 2e-6
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
-  lr_anchor_opacity_decay: 1e-5
+  lr_anchor_opacity_decay: 1e-4
   # [neural GS] learning rate
   lr_mlp_scales: 0.004
   lr_mlp_quats: 0.004
@@ -73,10 +76,10 @@ train:
     - 5e-5
   # loss and regularization
   ssim_lambda: 0.2
-  reg_opacity: 1e-2
+  reg_opacity: 1e-3
   reg_scale: 0
   reg_volume: 1e-1
-  reg_offset: 1e-3
+  reg_offset: 1e-2
   # densification with MCMC relocation
   growing_rate: 0.05
   perturb_intensity: 0
@@ -86,13 +89,14 @@ train:
   reloc_dead_thres: 0.01
   reloc_dead_spawns: 0
   state_ewma_alpha: 0.9
-  grad2d_for_impact: 0
+  grad2d_for_impact: 0.1
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   # evaluation
   tb_histogram: False
-  save_eval_img: True
-  save_model_onnx: True
+  save_eval_img: False
+  save_model_onnx: False
   test_every: 25
+  test_steps_every: 100
   test_steps:
     - 100
     - 1000

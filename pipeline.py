@@ -111,10 +111,25 @@ class Deformable(nn.Module):
 
     def get_frame_embed(self, frame):
         """
-        get frame embed
+        get frame embed, return a tensor of shape [1, D]
         """
-        if self.cfg.frame_embed_accumulative:
+        if frame < 0 or frame >= self.frame_length:
+            return None
+        if self.cfg.embed_accumulative:
             return self.deform_params["frame_embed"][:frame + 1].sum(dim=0)
+        elif self.cfg.frame_embed_entangle_range > 0:
+            r = self.cfg.frame_embed_entangle_range
+            weighted = self.deform_params["frame_embed"][frame]
+            weights = 1.
+            for i in range(-r, r + 1):
+                idx = frame + i
+                if idx == frame or idx < 0 or idx >= self.frame_length:
+                    continue
+                w = 2 ** (-abs(i))
+                weighted = weighted + self.deform_params["frame_embed"][idx] * w
+                weights += w
+            weighted = weighted / weights
+            return weighted.unsqueeze(0)
         else:
             return self.deform_params["frame_embed"][frame: frame + 1]
 
@@ -139,18 +154,19 @@ class Deformable(nn.Module):
 
         # ------------------------------ deform by frame ----------------------------- #
         frame_embed = self.get_frame_embed(frame)
+
         N = self.anchor_params["anchor_xyz"].shape[0]
 
-        # TODO should i reserve a piece of memory for embeds?
         embeds = torch.cat([self.anchor_params["anchor_embed"],
-                                   frame_embed.expand(N, -1)],
-                                   dim=-1)
+                            frame_embed.expand(N, -1)],
+                            dim=-1)
         (features, 
          d_xyz, 
          d_offsets, 
          d_offset_extend, 
          d_scale_extend) = self.deform_mlp(embeds)
-        
+
+        # ----------------------------- anchor attributes ---------------------------- #
         K = self.anchor_params["anchor_offsets"].shape[1]
         xyz = self.anchor_params["anchor_xyz"] + \
             (d_xyz if self.cfg.deform_anchor_xyz else 0)
@@ -179,10 +195,9 @@ def decay(precursor, exp_decay):
     https://arxiv.org/abs/2404.06109
     https://arxiv.org/abs/2404.09591
     """
-    eps = torch.finfo(precursor.dtype).eps
-    eps = torch.tensor(eps, device=precursor.device)
-    return 1 - torch.exp(
-        - precursor / torch.max(exp_decay, eps))
+    eps = 1e-6
+    header = precursor / (exp_decay + eps)
+    return 1 - torch.exp(-header)
 
 class Scaffold(nn.Module):
     """
@@ -208,7 +223,7 @@ class Scaffold(nn.Module):
         self.mlp = nn.ModuleDict({
             "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  model_cfg.view_dependent).to(device), # scale of offset
             "quats":     MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(), model_cfg.view_dependent).to(device),
-            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, ExpLayer(),    model_cfg.view_dependent).to(device),
+            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Sigmoid(),    model_cfg.view_dependent).to(device),
             "colors":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  True).to(device)     # color must be view dependent
         })
 

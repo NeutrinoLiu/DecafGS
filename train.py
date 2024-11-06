@@ -61,34 +61,21 @@ class Runner:
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
-
-        # ------------------------- other training schedulers ------------------------ #
-        policy_complex = {
-            # 1000 : "downsample_2",
-            train_cfg.max_step : "max_parallex"
-        }
-        sustained_release = None
-        if train_cfg.frame_sustained_release:
-            sustained_release = [1000] 
-            for i in range(1, max_frame - min_frame):
-                interval = 5 * int(i ** 0.5)
-                sustained_release.append(sustained_release[-1] + interval)
-        # ------------------------------------- - ------------------------------------ #
+        self.frames = list(range(min_frame, max_frame))
 
         self.train_loader_gen = DataManager(
             self.scene,                         # img reader
             train_cam_idx,                      # train cam only
-            list(range(min_frame, max_frame)),  # full frame
+            self.frames,                        # full frame
             batch_size = train_cfg.batch_size,
-            policy = policy_complex,
+            policy = "max_parallex",
             num_workers=data_cfg.num_workers,
             use_torch_loader=self.use_torch_loader,
-            sustained_release=sustained_release
             )
         self.test_sampler_gen = DataManager(
             self.scene,                         # img reader
             test_cam_idx,                       # test cam only
-            list(range(min_frame, max_frame)),  # full frame
+            self.frames,                        # full frame
             batch_size = 1,
             policy = "sequential",
             num_workers=data_cfg.num_workers,
@@ -105,6 +92,49 @@ class Runner:
             init_pts=torch.Tensor(self.scene.init_pts).float(),
             device=self.device
         )
+
+        # ------------------------- other training schedulers ------------------------ #
+        self.unlocked_frame = 0
+        self.train_frame_embed_only = False
+        def freeze_scaffold_and_anchor_deform():
+            self.train_frame_embed_only = True
+            self.unlocked_frame += 1
+            if self.unlocked_frame > 0 and self.unlocked_frame < len(self.frames):
+                with torch.no_grad():
+                    self.model.deform.deform_params["frame_embed"][self.unlocked_frame] += \
+                        self.model.deform.deform_params["frame_embed"][self.unlocked_frame - 1]
+            for p in self.model.scaffold.parameters():
+                p.requires_grad = False
+            for p in self.model.deform.anchor_params.values():
+                p.requires_grad = False
+            for p in self.model.deform.deform_params["mlp_deform"]:
+                p.requires_grad = False
+        def unfreeze_scaffold_and_anchor_deform():
+            self.train_frame_embed_only = False
+            for p in self.model.scaffold.parameters():
+                p.requires_grad = True
+            for p in self.model.deform.anchor_params.values():
+                p.requires_grad = True
+            for p in self.model.deform.deform_params["mlp_deform"]:
+                p.requires_grad = True
+        routine = {}
+
+        for i in range(len(self.frames)):
+            f_range = list(range(i + 1))
+            routine[i * 1000] = (f_range, unfreeze_scaffold_and_anchor_deform)
+            routine[i * 1000 + 800] = ([i+1], freeze_scaffold_and_anchor_deform)
+        # drop last of the dict
+        routine.pop(max(routine.keys()))
+
+        def routine_(step):
+            frame_range, fn = routine.get(step, (None, lambda: None))
+            if frame_range is not None:
+                fn()
+                self.train_loader_gen.frames = frame_range
+                self.test_sampler_gen.frames = frame_range
+        
+        self.routine = routine_ if self.cfg.incremental_routine else \
+                        lambda x : None
 
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
@@ -192,7 +222,8 @@ class Runner:
             self.train_loader_gen.gen_loader({}, init_step))
 
         for step in pbar:
-            
+            self.routine(step)
+
             while self.viewer.state.status == "paused":
                 time.sleep(0.01)
             self.viewer.lock.acquire()
@@ -302,8 +333,15 @@ class Runner:
             # ------------------------ relocate and densification ------------------------ #
             cur_anchor_xyz_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
             dead_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
+            hc = N // 20
+            mask_lowest = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
+                                            0, 
+                                            torch.topk(x["anchor_childs"], hc, largest=False).indices,
+                                            True
+                                        )
             impact_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
                                 (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
+            
             report = self.strategy.step_post_backward(
                 state=self.state,
                 aks_params=self.model.deform.anchor_params,
@@ -312,7 +350,7 @@ class Runner:
                 anchor_xyz_lr=cur_anchor_xyz_lr,
                 dead_func=dead_fn,
                 impact_func=impact_fn
-            )
+            ) if not self.train_frame_embed_only else {}
             
             self.model.optimize()
             self.model.zero_grad()
@@ -337,7 +375,8 @@ class Runner:
                     self.writer.add_scalar("train/relocated", report["relocated"], step)
             
             # ----------------------------------- eval ----------------------------------- #
-            if step in [i - 1 for i in self.cfg.test_steps]:
+            if step in [i - 1 for i in self.cfg.test_steps] or \
+                (self.cfg.test_steps_every > 0 and (step+1) % self.cfg.test_steps_every == 0):
                 self.eval(step)
 
             # ---------------------------- viser viewer update --------------------------- #
@@ -364,6 +403,7 @@ class Runner:
         n = len(test_loader)
         selected_idx = random.sample(range(n), min(n, 10))
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
+
         for i, data in enumerate(sub_bar):
             assert data[0].shape[0] == 1, "batch size should be 1"
 
@@ -385,14 +425,20 @@ class Runner:
             if (self.cfg.save_eval_img or step == self.cfg.max_step - 1) and i in selected_idx:
                 save_tensor_images_threaded(img, gt, self.log.render(f"{step}_{i}"))
 
+        frames = self.test_sampler_gen.frames
         results_avg = {k: sum(results[k]) / len(results[k]) for k in results.keys()}
         results_avg['fps'] = len(elapsed) / sum(elapsed)
+        psnr_per_frame = {f"psnr_{frames[i]}": results["psnr"][i] for i in range(len(results["psnr"]))}
 
         # terminal print
+        print(f"\ntraining frames: {self.train_loader_gen.frames[0]} ~ {self.train_loader_gen.frames[-1]}")
+        print(f"test frames: {self.test_sampler_gen.frames[0]} ~ {self.test_sampler_gen.frames[-1]}")
         print(f"step {step}: \n{json.dumps(results_avg, indent=4)}")
         # tb print
-        self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
-        self.writer.add_scalar("eval/ssim", results_avg['ssim'] , step)
+        if not self.train_frame_embed_only:
+            self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
+            self.writer.add_scalar("eval/ssim", results_avg['ssim'] , step)
+        self.writer.add_scalars("eval/perframe", psnr_per_frame, step)
 
         # log print
         results.update(
@@ -430,17 +476,63 @@ class Runner:
         # --------------------------- pure image rendering --------------------------- #
         if mode == "RGB":
             pc, _ = self.model.produce(cam)
+        # ---------------------------- childs gs rendering --------------------------- #
+        elif mode == "childs":
+            gs, aks = self.model.produce(cam)
+            aks_means = aks.anchor_xyz
+            aks_quats = torch.zeros(aks_means.shape[0], 4, device=self.device)
+            aks_quats[:, 0] = 1.0
+            aks_scales = torch.ones(aks_means.shape[0], 3, device=self.device) * init_scale * 2
+            aks_opacities = torch.ones(aks_means.shape[0], device=self.device)
+            aks_colors = torch.ones(aks_means.shape[0], 3, device=self.device)
+
+
+            child_means = aks.childs_xyz.reshape(-1, 3)
+            child_quats = torch.zeros(child_means.shape[0], 4, device=self.device)
+            child_quats[:, 0] = 1.0
+            child_scales = torch.ones(child_means.shape[0], 3, device=self.device) * init_scale
+            child_opacities = torch.ones(child_means.shape[0], device=self.device) * 0.5
+            child_colors = torch.ones(child_means.shape[0], 3, device=self.device)
+            child_colors[:, 0] = 0.0
+            child_colors[:, 2] = 0.0
+
+            pc_dict = {
+                "means" : torch.cat([aks_means, child_means], dim=0),
+                "quats" : torch.cat([aks_quats, child_quats], dim=0),
+                "scales" : torch.cat([aks_scales, child_scales], dim=0),
+                "opacities" : torch.cat([aks_opacities, child_opacities], dim=0),
+                "sh0": torch.cat([rgb_to_sh(aks_colors), rgb_to_sh(child_colors)], dim=0).unsqueeze(1),
+                "shN": torch.zeros(aks_means.shape[0] + child_means.shape[0], 0, 3, device=self.device)
+            }
+            pc = Gaussians(pc_dict)
         # ------------------- anchor location and opacity rendering ------------------ #
         else:
             gs, aks = self.model.produce(cam)
             num_childs = aks.childs_xyz.shape[1]
+            mask = None
             if mode == "ops":
                 vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1)
+            elif mode == "avg-spawn":
+                vis_ops = self.state["anchor_childs"]
+                if vis_ops is None:
+                    return self.buffered_viewer_img.cpu().numpy()
+                N = vis_ops.shape[0]
+                hc = N // 20
+                mask = torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
+                                        0, torch.topk(vis_ops, hc, largest=False).indices, True)
             elif mode == "avg-ops":
                 vis_ops = self.state["anchor_opacity"]
+                if vis_ops is None:
+                    return self.buffered_viewer_img.cpu().numpy()
+                N = vis_ops.shape[0]
+                hc = N // 20
+                mask = torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
+                                        0, torch.topk(vis_ops, hc, largest=False).indices, True)
             elif mode == "avg-grad":
                 vis_ops = self.state["anchor_grad2d"]
             elif mode == "avg-impact":
+                if self.state["anchor_grad2d"] is None or self.state["anchor_opacity"] is None:
+                    return self.buffered_viewer_img.cpu().numpy()
                 impact_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
                                     (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
                 vis_ops = impact_fn(self.state)
@@ -451,6 +543,10 @@ class Runner:
             quats[:, 0] = 1.0
             scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * init_scale
             colors = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) 
+            if mask is not None:
+                colors[mask, 0] = 0.0
+                colors[mask, 2] = 0.0
+                vis_ops[mask] = 1
 
             pc_dict = {
                 "means" : aks.anchor_xyz,

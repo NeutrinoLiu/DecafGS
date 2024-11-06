@@ -5,13 +5,6 @@ import torch
 
 from gsplat.strategy.ops import _update_param_with_optimizer
 
-def compute_impact_after_split(
-        impacts: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-    """
-    impact basically is opacity, so that, we use the same logic for opacity split
-    """
-    return 1 - (1 - impacts) ** (1. / counts)
-
 def compute_decay_after_split(
         decays: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
     """Compute the new decay after relocating the anchor.
@@ -57,7 +50,7 @@ class DecafMCMCStrategy:
         self.scale_decay: float = train_cfg.scale_decay
         self.refine_start_iter: int = train_cfg.reloc_start_iter
         self.refine_stop_iter: int = train_cfg.reloc_stop_iter
-        self.refine_every: int = train_cfg.reloc_every // train_cfg.batch_size
+        self.refine_every: int = train_cfg.reloc_every // int(math.sqrt(train_cfg.batch_size))
         self.min_opacity: float = train_cfg.reloc_dead_thres
         self.min_childs: int = train_cfg.reloc_dead_spawns
         self.verbose: bool = verbose

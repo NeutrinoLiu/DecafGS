@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import time
 
 class ExpLayer(nn.Module):
     """
@@ -38,7 +39,9 @@ class TempoMixture(nn.Module):
                     hidden_dim,
                     out_dim,
                     further_dims,
-                    skip, depth):       # insert skip connection at the input of skip-th layer
+                    skip,
+                    depth,
+                    cascade=True):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
         """
         build a 2 layer mlp module, refer to scaffold-gs
@@ -46,6 +49,7 @@ class TempoMixture(nn.Module):
         super(TempoMixture, self).__init__()
         assert skip < depth, "skip should be less than depth"
         self.skip = skip
+        self.cascade = cascade
         self.layers = nn.ModuleList()
         for i in range(depth):
             sublayer_in_dim = in_dim if i == 0 else hidden_dim
@@ -59,7 +63,8 @@ class TempoMixture(nn.Module):
                 )
             )
         self.further_layers = nn.ModuleList(
-            [nn.Linear(out_dim, further_dim) for further_dim in further_dims]
+            [nn.Linear(out_dim, further_dim) for further_dim in further_dims] if cascade else \
+            [nn.Linear(in_dim, further_dim) for further_dim in further_dims]
         )
         for layer in self.further_layers:
             nn.init.zeros_(layer.weight)
@@ -70,7 +75,9 @@ class TempoMixture(nn.Module):
             if i == self.skip and self.skip > 0:
                 x = torch.cat([x, original_x], dim=-1)
             x = layer(x)
+
         further_x = []
+        further_x_input = x if self.cascade else original_x
         for further_layer in self.further_layers:
-            further_x.append(further_layer(x))
+            further_x.append(further_layer(further_x_input))
         return x, *further_x

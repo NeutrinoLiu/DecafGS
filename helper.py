@@ -9,6 +9,7 @@ from PIL import Image
 import time
 import torchvision.transforms as T
 from torchmetrics.image import StructuralSimilarityIndexMeasure
+from torch.optim.lr_scheduler import LambdaLR
 from typing import List, Dict, Any
 
 def cur_time():
@@ -137,6 +138,16 @@ def save_tensor_images(img_tensor, gt_tensor, save_path):
     combined.save(save_path)
     return 
 
+def lr_lambda_builder(ratio, min_step, max_step):
+    # build exponential decay lr scheduler
+    def lr_lambda(step):
+        if step < min_step:
+            return 1.
+        if step > max_step:
+            return ratio
+        return ratio ** ((step-min_step) / (max_step-min_step))
+    return lr_lambda
+
 def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
     ret_opts = {}
     ret_lr_sched = {}
@@ -145,7 +156,8 @@ def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
             assert len(attr_lr) >= 2, "lr list should have at least 2 elements"
             lr_init = attr_lr[0]
             lr_end = attr_lr[1]
-            gamma = (lr_end / lr_init) ** (1.0 / max_step)
+            lr_delay = attr_lr[2] if len(attr_lr) == 3 else 0
+            ratio = lr_end / lr_init
             ret_opts[attr_name] = torch.optim.Adam(
                 [{
                     'name': attr_name,
@@ -155,9 +167,9 @@ def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
                 eps=1e-15 / math.sqrt(opt_cali),
                 betas=(1 - opt_cali * (1 - 0.9), 1 - opt_cali * (1 - 0.999))
             )
-            ret_lr_sched[attr_name] = torch.optim.lr_scheduler.ExponentialLR(
-                ret_opts[attr_name],
-                gamma=gamma,
+            ret_lr_sched[attr_name] = LambdaLR(
+                ret_opts[attr_name], 
+                lr_lambda_builder(ratio, lr_delay, max_step)
             )
             print(f"lr for {attr_name} initialized with exp decay: ({lr_init}->{lr_end})")
         else:

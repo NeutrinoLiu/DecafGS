@@ -317,14 +317,12 @@ class DataManager:
                                  "max_parallex"] = "sequential",
                  num_workers = 4,
                  use_torch_loader = False,
-                 sustained_release = None
                  ):
         
         self.scene = scene
         self.policy = policy
         self.num_workers = num_workers
         self.use_torch_loader = use_torch_loader
-        self.frame_release_schedule = sustained_release
 
         self.cams = cams_idx.copy()
         self.frames = frames_idx.copy()
@@ -359,20 +357,11 @@ class DataManager:
             )
         return self.cached_loader
 
-    def _sustained_release(self, step):
-        if self.frame_release_schedule is not None:
-            # find the i-th element in frame_release_schedule that larger than step
-            for i, s in enumerate(self.frame_release_schedule):
-                if step < s:
-                    return self.frames[:i+1]
-        return self.frames
-
     # ------------------------- for torch dataloader only ------------------------ #
     # torch dataloader need an iterator to fetch data
     # in this case, simple [get] is used to fetch single image
-    def _get_torch_iter(self, policy, info, step, downscale, batch_size):
-        frame_range = self._sustained_release(step)
-        sample_nums = len(frame_range) * batch_size
+    def _get_torch_iter(self, policy, info, step, downscale, batch_size, sample_nums):
+        frame_range = self.frames
         if isinstance(policy, list):
             p = random.choice(policy)
             return self._get_torch_iter(p, info, step, downscale, batch_size)
@@ -398,11 +387,6 @@ class DataManager:
             # copy frames for twice
             frames = np.array(frame_range.copy()).repeat(batch_size)
             seq = [(c, f, downscale) for c,f in zip(cams, frames)]
-        elif policy == "first_frame_only":
-            sample_nums = 1000 * batch_size
-            frams = uniform_frame_sampler(self.frames[:1], sample_nums)
-            cams = uniform_camera_sampler(self.cams, sample_nums)
-            seq = [(c, f, downscale) for c,f in zip(cams, frams)]
         else:
             raise ValueError(f"unknown policy {policy}")
         
@@ -412,10 +396,17 @@ class DataManager:
     def gen_loader(self, info, step):
         # we rebuild the loader every time after exhausted
         # because we want to adjust the sampling order according to (info, step)
+        min_iters = max(len(self.frames), 100)
         if self.use_torch_loader:
             if isinstance(self.policy, str):
+                sample_nums = min_iters * self.batch_size_base
                 data_iter = self._get_torch_iter(
-                    self.policy, info, step, self.downscale_base, self.batch_size_base)
+                    self.policy, 
+                    info,
+                    step,
+                    self.downscale_base,
+                    self.batch_size_base,
+                    sample_nums)
                 batch_size = self.batch_size_base
             else:
                 data_iter = None
@@ -425,11 +416,22 @@ class DataManager:
                             ratio = int(p.split("_")[1])
                             batch_size = self.batch_size_base * ratio
                             downscale = self.downscale_base * ratio
+                            sample_nums = min_iters * batch_size
                             data_iter = self._get_torch_iter(
-                                ["max_parallex"], info, step, downscale, batch_size)
+                                ["max_parallex"],
+                                info,
+                                step,
+                                downscale,
+                                batch_size,
+                                sample_nums)
                         else:
+                            sample_nums = min_iters * self.batch_size_base
                             data_iter = self._get_torch_iter(
-                                p, info, step, self.downscale_base, self.batch_size_base)
+                                p,
+                                info,
+                                step,
+                                self.downscale_base,
+                                self.batch_size_base)
                             batch_size = self.batch_size_base
                         break
                 assert data_iter is not None, f"no specified policy for step {step}"
