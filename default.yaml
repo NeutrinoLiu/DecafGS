@@ -94,6 +94,7 @@ train:
   # evaluation
   tb_histogram: False
   save_eval_img: False
+  save_eval_img_every: 1000
   save_model_onnx: False
   test_every: 25
   test_steps_every: 100

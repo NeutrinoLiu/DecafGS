@@ -146,7 +146,7 @@ class Viewer(object):
 
         with self.server.gui.add_folder("Visualize Mode") as self._camera_folder:
             self._visualize_mode = self.server.gui.add_dropdown(
-                "Visualize Mode", ["RGB", "childs", "ops", "avg-ops", "avg-spawn", "avg-grad", "avg-impact"], initial_value="RGB"
+                "Visualize Mode", ["RGB", "childs", "ops", "avg-ops", "avg-spawn", "avg-grad", "avg-impact", "avg-blame"], initial_value="RGB"
             )
             self._visualize_mode.on_update(self.rerender)
             self._vis_gs_scale= self.server.gui.add_slider(

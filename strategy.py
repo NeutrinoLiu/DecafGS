@@ -75,6 +75,9 @@ class DecafMCMCStrategy:
         if (step < self.refine_stop_iter
             and step >= self.refine_start_iter
             and step % self.refine_every == 0):
+
+
+
             # --------------------------------- relocate --------------------------------- #
             n_reloacted_aks, dead_idx, target_idx = self._reloate_anchor(
                 state=state,

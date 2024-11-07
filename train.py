@@ -30,7 +30,13 @@ from dataset import SceneReader, DataManager, dataset_split
 from interface import Gaussians, Camera
 from pipeline import DecafPipeline
 
-from helper import LogDirMgr, save_tensor_images_threaded, calculate_grads, opacity_analysis, normalize, ewma_update
+from helper import (LogDirMgr, 
+                    save_tensor_images_threaded,
+                    calculate_grads,
+                    calculate_blames,
+                    opacity_analysis,
+                    normalize,
+                    ewma_update)
 
 
 
@@ -265,6 +271,8 @@ class Runner:
             batch_state = {
                 "ops": [],
                 "info": [],
+                "img": [],
+                "gt": [],
             }
             K = self.model.deform.anchor_params['anchor_offsets'].shape[1]
             N = self.model.deform.anchor_params['anchor_offsets'].shape[0]
@@ -301,6 +309,9 @@ class Runner:
                 if self.cfg.grad2d_for_impact > 0:
                     info[key_for_gradient].retain_grad()
 
+                batch_state["img"].append(img.detach())
+                batch_state["gt"].append(gt.detach())
+
             # ------------------------------- loss calculation --------------------------- #
 
             # losses averaged by batch
@@ -329,27 +340,33 @@ class Runner:
                 "anchor_grad2d": anchor_grad2d,
                 "anchor_count": anchor_count,
             }, self.cfg.state_ewma_alpha)
+            self.state["anchor_blame"] = normalize(calculate_blames(batch_state, N=N, K=K, device=self.device))
 
             # ------------------------ relocate and densification ------------------------ #
-            cur_anchor_xyz_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
-            dead_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
-            hc = N // 20
-            mask_lowest = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
+            opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
+            mask_lowest_fn = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
                                             0, 
-                                            torch.topk(x["anchor_childs"], hc, largest=False).indices,
+                                            torch.topk(
+                                                normalize(x["anchor_opacity"]) + x["anchor_blame"], 
+                                                N // 20, largest=False).indices,
                                             True
                                         )
-            impact_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
+            grad_ops_mixing_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
                                 (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
+            blame_fn = lambda x: x["anchor_blame"]
+            # ---------------------------- different policies ---------------------------- #
+
+            self.dead_func = mask_lowest_fn
+            self.impact_func = blame_fn
             
             report = self.strategy.step_post_backward(
                 state=self.state,
                 aks_params=self.model.deform.anchor_params,
                 aks_opts=self.model.deform.anchor_opts,
                 step=step,
-                anchor_xyz_lr=cur_anchor_xyz_lr,
-                dead_func=dead_fn,
-                impact_func=impact_fn
+                anchor_xyz_lr=self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0],
+                dead_func=self.dead_func,
+                impact_func=self.impact_func
             ) if not self.train_frame_embed_only else {}
             
             self.model.optimize()
@@ -422,7 +439,11 @@ class Runner:
             img = img
             for k, func in self.eval_funcs.items():
                 results[k].append(func(img[None], gt[None]).item())  # metrics func expect batches
-            if (self.cfg.save_eval_img or step == self.cfg.max_step - 1) and i in selected_idx:
+            if  (
+                self.cfg.save_eval_img or \
+                step == self.cfg.max_step - 1 or \
+                ((step + 1) % self.cfg.save_eval_img_every == 0 and self.cfg.save_eval_img_every > 0)
+                ) and i in selected_idx:
                 save_tensor_images_threaded(img, gt, self.log.render(f"{step}_{i}"))
 
         frames = self.test_sampler_gen.frames
@@ -431,8 +452,8 @@ class Runner:
         psnr_per_frame = {f"psnr_{frames[i]}": results["psnr"][i] for i in range(len(results["psnr"]))}
 
         # terminal print
-        print(f"\ntraining frames: {self.train_loader_gen.frames[0]} ~ {self.train_loader_gen.frames[-1]}")
-        print(f"test frames: {self.test_sampler_gen.frames[0]} ~ {self.test_sampler_gen.frames[-1]}")
+        print(f"\ntraining frames: {self.train_loader_gen.frames[0]}-{self.train_loader_gen.frames[-1]}")
+        print(f"test frames: {self.test_sampler_gen.frames[0]}-{self.test_sampler_gen.frames[-1]}")
         print(f"step {step}: \n{json.dumps(results_avg, indent=4)}")
         # tb print
         if not self.train_frame_embed_only:
@@ -533,9 +554,10 @@ class Runner:
             elif mode == "avg-impact":
                 if self.state["anchor_grad2d"] is None or self.state["anchor_opacity"] is None:
                     return self.buffered_viewer_img.cpu().numpy()
-                impact_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
-                                    (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
-                vis_ops = impact_fn(self.state)
+                vis_ops = self.impact_func(self.state)
+                mask = self.dead_func(self.state)
+            elif mode == "avg-blame":
+                vis_ops = self.state["anchor_blame"]
             if vis_ops is None:
                 return self.buffered_viewer_img.cpu().numpy()
             vis_ops = normalize(vis_ops)

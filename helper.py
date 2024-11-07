@@ -7,6 +7,7 @@ import os
 import shutil
 from PIL import Image
 import time
+import torch.nn.functional as F
 import torchvision.transforms as T
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torch.optim.lr_scheduler import LambdaLR
@@ -108,14 +109,15 @@ def save_tensor_images(img_tensor, gt_tensor, save_path):
     l1diff = torch.abs(img_tensor - gt_tensor)
 
     # Compute SSIM map using torchmetrics
-    ssim = StructuralSimilarityIndexMeasure(data_range=1.0, return_full_image=True).to(img_tensor.device)
+    ssim_fn = StructuralSimilarityIndexMeasure(data_range=1.0, return_full_image=True).to(img_tensor.device)
     # Add batch dimension as required by torchmetrics
     img_batch = img_tensor.unsqueeze(0)
     gt_batch = gt_tensor.unsqueeze(0)
-    _, ssim_map = ssim(img_batch, gt_batch)
+    _, ssim_map = ssim_fn(img_batch, gt_batch)
     
     # Convert SSIM map to RGB for visualization (ssim_map is already in range [0,1])
-    ssim_map = ssim_map.squeeze(0)  # Remove batch dimension
+    ssim_map = ((1-ssim_map)/2).squeeze(0)  # Remove batch dimension
+    ssim_map = ssim_map.mean(dim=0).expand(3, -1, -1)  # Average over channels
     # ssim_map_rgb = ssim_map.repeat(3, 1, 1)  # Convert to RGB
 
     
@@ -243,6 +245,100 @@ def opacity_analysis(batch_state, K, dead_thres):
     anchor_opacity = sum(anchor_opacity) / len(ops)
 
     return anchor_avg_spawn, anchor_opacity
+
+def tile_average(image, c):
+    H, W = image.shape
+    pad_h = (c - H % c) % c  # Calculate how much to pad in height
+    pad_w = (c - W % c) % c  # Calculate how much to pad in width
+    padded_image = F.pad(image, (0, pad_w, 0, pad_h), mode='constant', value=0)
+    tiles = padded_image.unfold(0, c, c).unfold(1, c, c)  # shape: (new_H//c, new_W//c, c, c)
+    tile_means = tiles.mean(dim=(-1, -2))  # shape: (new_H//c, new_W//c)
+    return tile_means
+
+def mask_image_by_tile(image, mask, c): # mask in [h//c, w//c]
+    # Step 1: Pad the image so H and W are multiples of c
+    H, W = image.shape
+    pad_h = (c - H % c) % c  # Calculate how much to pad in height
+    pad_w = (c - W % c) % c  # Calculate how much to pad in width
+    padded_image = F.pad(image, (0, pad_w, 0, pad_h), mode='constant', value=0)
+    H, W = padded_image.shape
+    h, w = H // c, W // c
+    if len(mask.shape) == 1:
+        assert mask.shape[0] == h * w, "mask shape mismatch"
+        mask = mask.reshape(h, w)
+    # Step 2: Reshape into tiles
+    tiles = padded_image.unfold(0, c, c).unfold(1, c, c)  # shape: (new_H//c, new_W//c, c, c)
+    mask_tiles = mask.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, c, c)
+    # Step 3: Calculate the mean in each tile
+    masked_tiles = tiles * mask_tiles
+    return masked_tiles.permute(0, 2, 1, 3).contiguous().view(h * c, w * c)
+
+def save_grey_image(img_tensor, save_path):
+    # input tensor should be [H, W], in range [0, 1]
+    img_pil = T.ToPILImage()(img_tensor)
+    img_pil.save(save_path)
+
+def get_gs_idx_from_tile(offsets, records, query_tile):
+    tile_num = len(offsets)
+    start = offsets[query_tile]
+    end = offsets[query_tile + 1] if query_tile < tile_num - 1 else len(records)
+    return records[start:end]
+
+# not necessary for each batch, but needed if error-oriented densification is expected
+def calculate_blames(
+        batch_state: Dict[str, Any],
+        N: int,
+        K: int,
+        device):
+    
+    topk = 200
+    dssim_min = 0.1
+    n_gaussian = K * N
+    batched_info = batch_state["info"]
+    batched_img =  batch_state["img"]
+    batched_gt = batch_state["gt"]
+    ssim_fn = StructuralSimilarityIndexMeasure(data_range=1.0, return_full_image=True).to(device)
+    blame = torch.zeros(n_gaussian, device=device)
+
+    for (info, img, gt) in zip(batched_info, batched_img, batched_gt):
+
+        tile_size = info["tile_size"]
+
+        # --------------------------- get a list of tile id -------------------------- #
+        ssim_error = (1 - ssim_fn(img[None], gt[None])[-1].squeeze().mean(dim=0)) / 2
+        # ssim_error = torch.abs(img-gt).mean(dim=0)
+
+        ssim_error_tiled = tile_average(ssim_error, tile_size)
+        ssim_error_tiled = ssim_error_tiled.flatten()
+        topk_ssim, topk_idx = torch.topk(ssim_error_tiled, topk)
+        # remove idx by ssim larger than dssim_min
+        topk_idx = topk_idx[topk_ssim > dssim_min]
+        topk_ssim = topk_ssim[topk_ssim > dssim_min]
+        
+        # with open("topk.txt", "a") as f:
+        #     sorted_tensor = torch.sort(topk_ssim, descending=True).values
+        #     # Print elements with spacing
+        #     f.write(' '.join(map(str, sorted_tensor.tolist())) + '\n')
+
+        # ----------------------- save masked ssim map for ref ----------------------- #
+        # topk_mask = torch.ones_like(ssim_error_tiled) * 0.3
+        # topk_mask[topk_idx] = 1
+        # masked_ssim = mask_image_by_tile(ssim_error, topk_mask, tile_size)
+        # name = torch.randint(0, 10, (1,)).item()
+        # thread = threading.Thread(target=save_grey_image, args=(masked_ssim, f"masked_ssim_{name}.png"))
+        # thread.start()
+        
+        isect_offsets = info["isect_offsets"].flatten()
+        filter_idx = info["filter_idx"]
+        isect_ids = info["flatten_ids"]
+        # add bad tiles's ssim to the gs blame
+        for idx, score in zip(topk_idx, topk_ssim):
+            gs_idx = get_gs_idx_from_tile(isect_offsets, isect_ids, idx)
+            gs_idx = filter_idx[gs_idx]
+            blame[gs_idx] += score
+    
+    blame_aks = blame.reshape(-1, K).sum(dim=-1)
+    return blame_aks
 
 # borrowed from gsplat.strategy.default, used to calculate grad2d for gs
 def calculate_grads(

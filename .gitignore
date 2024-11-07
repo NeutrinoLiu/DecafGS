@@ -4,8 +4,9 @@ output*
 *.pickle
 *.json
 *.prof
+*.png
 experiments
-batch_config.txt
+*.txt
 
 **/*.egg-info
 **/*.egg
