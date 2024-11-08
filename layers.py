@@ -66,9 +66,9 @@ class TempoMixture(nn.Module):
             [nn.Linear(out_dim, further_dim) for further_dim in further_dims] if cascade else \
             [nn.Linear(in_dim, further_dim) for further_dim in further_dims]
         )
-        for layer in self.further_layers:
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
+        # for layer in self.further_layers:
+        #     nn.init.zeros_(layer.weight)
+        #     nn.init.zeros_(layer.bias)
     def forward(self, x):
         original_x = x
         for i, layer in enumerate(self.layers):

@@ -48,6 +48,8 @@ train:
   root: "output/cook"
   # training
   incremental_routine: True
+  incremental_routine_frame: 100
+  incremental_routine_mixing: 400
   max_step: 30000
   batch_size: 4
   # [anchor] learning rate
@@ -57,14 +59,18 @@ train:
     - 1e-6
   lr_anchor_embed: 0.0075
   lr_anchor_xyz: 
-    - 1e-4
-    - 1e-6
+    - 1e-3
+    - 5e-4
+    - 0
+    - 5000
   lr_anchor_offsets: 
     - 2e-4
-    - 2e-6
+    - 1e-5
+    - 0
+    - 5000
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
-  lr_anchor_opacity_decay: 1e-4
+  lr_anchor_opacity_decay: 1e-2
   # [neural GS] learning rate
   lr_mlp_scales: 0.004
   lr_mlp_quats: 0.004
@@ -84,13 +90,14 @@ train:
   growing_rate: 0.05
   perturb_intensity: 0
   reloc_start_iter: 500
-  reloc_stop_iter: 100000
+  reloc_stop_iter: 1000000
   reloc_every: 100
   reloc_dead_thres: 0.01
   reloc_dead_spawns: 0
   state_ewma_alpha: 0.9
   grad2d_for_impact: 0.1
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
+  always_compute_blame: True
   # evaluation
   tb_histogram: False
   save_eval_img: False

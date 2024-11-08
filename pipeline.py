@@ -80,9 +80,10 @@ class Deformable(nn.Module):
 
         # ------------------------------- deform params ------------------------------ #
         K = model_cfg.anchor_child_num
-        para_frame_embed = nn.Parameter(
-            torch.zeros(self.frame_length,
-                        model_cfg.frame_embed_dim).to(device))
+        para_frame_embed = nn.ParameterList([
+            nn.Parameter(torch.zeros(model_cfg.frame_embed_dim, dtype=torch.float32, device=device))
+            for _ in range(self.frame_length)
+        ]) 
         
         if model_cfg.deform_depth > 0:
             delta_dims = [3, 3 * K, 3, 3]
@@ -96,14 +97,16 @@ class Deformable(nn.Module):
                 depth       =   model_cfg.deform_depth
             ).to(device)
             deform_params = [
-                ("frame_embed", para_frame_embed, train_cfg.lr_frame_embed),
-                ("mlp_deform", self.deform_mlp.parameters(), train_cfg.lr_mlp_deform)
+                ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),
+                ("mlp_deform", list(self.deform_mlp.parameters()), train_cfg.lr_mlp_deform)
             ]
-            self.deform_params = {k: v for k, v, _ in deform_params}
+            self.deform_params = {k: v for k, v, _ in deform_params} # list the para to keep a reference
+
             self.deform_opts, self.deform_lr_sched = get_adam_and_lr_sched(
                 deform_params,
                 train_cfg.batch_size,
                 train_cfg.max_step)
+
         else:
             self.deform_mlp = None
             self.deform_opts = {}
@@ -115,23 +118,25 @@ class Deformable(nn.Module):
         """
         if frame < 0 or frame >= self.frame_length:
             return None
+        
+        embeds = self.deform_params["frame_embed"]
         if self.cfg.embed_accumulative:
-            return self.deform_params["frame_embed"][:frame + 1].sum(dim=0)
+            raise NotImplementedError("accumulative frame embed not implemented")
         elif self.cfg.frame_embed_entangle_range > 0:
             r = self.cfg.frame_embed_entangle_range
-            weighted = self.deform_params["frame_embed"][frame]
+            weighted = embeds[frame]
             weights = 1.
             for i in range(-r, r + 1):
                 idx = frame + i
                 if idx == frame or idx < 0 or idx >= self.frame_length:
                     continue
                 w = 2 ** (-abs(i))
-                weighted = weighted + self.deform_params["frame_embed"][idx] * w
+                weighted = weighted + embeds[idx] * w
                 weights += w
             weighted = weighted / weights
             return weighted.unsqueeze(0)
         else:
-            return self.deform_params["frame_embed"][frame: frame + 1]
+            return embeds[frame].unsqueeze(0)
 
     def forward(self, frame) -> Anchors:
         """
@@ -165,6 +170,12 @@ class Deformable(nn.Module):
          d_offsets, 
          d_offset_extend, 
          d_scale_extend) = self.deform_mlp(embeds)
+        
+        # print(f"frame {frame} embed: {frame_embed}")
+        # print(f"shape of embeds: {embeds.shape}")
+        # print(f"first anchor embed: {self.anchor_params['anchor_embed'][0]}")
+        # print(f"first mlp layer: {self.deform_mlp.layers[0][0].weight}")
+        # print(f"first mlp layer shpae: {self.deform_mlp.layers[0][0].weight.shape}")
 
         # ----------------------------- anchor attributes ---------------------------- #
         K = self.anchor_params["anchor_offsets"].shape[1]

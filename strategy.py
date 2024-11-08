@@ -46,11 +46,11 @@ class DecafMCMCStrategy:
     def __init__(self, train_cfg, max_cap, verbose = True):
         self.cap_max: int = max_cap
         self.growing_rate: float = train_cfg.growing_rate
-        self.noise_lr: float = train_cfg.perturb_intensity
+        self.noise_intensity: float = train_cfg.perturb_intensity
         self.scale_decay: float = train_cfg.scale_decay
         self.refine_start_iter: int = train_cfg.reloc_start_iter
         self.refine_stop_iter: int = train_cfg.reloc_stop_iter
-        self.refine_every: int = train_cfg.reloc_every // int(math.sqrt(train_cfg.batch_size))
+        self.refine_every: int = train_cfg.reloc_every
         self.min_opacity: float = train_cfg.reloc_dead_thres
         self.min_childs: int = train_cfg.reloc_dead_spawns
         self.verbose: bool = verbose
@@ -86,7 +86,9 @@ class DecafMCMCStrategy:
                 dead_func=dead_func,
                 impact_func=impact_func
             )
-            if n_reloacted_aks > 0 and self.verbose:
+            if n_reloacted_aks > 0:
+                # state["anchor_blame"][dead_idx] = state["anchor_blame"][target_idx]
+                if self.verbose:
                     print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
             # ---------------------------------- add aks --------------------------------- #
@@ -96,7 +98,12 @@ class DecafMCMCStrategy:
                 opts=aks_opts,
                 impact_func=impact_func
             )
-            if n_new_aks > 0 and self.verbose:
+            if n_new_aks > 0:
+                # state["anchor_blame"] = torch.cat([
+                #     state["anchor_blame"],
+                #     state["anchor_blame"][growed_idx]
+                # ])
+                if self.verbose:
                     print(
                         f"Step {step}: Added {n_new_aks} Anchors. "
                         f"Now having {aks_params['anchor_offsets'].shape[0]} Anchors."
@@ -114,12 +121,13 @@ class DecafMCMCStrategy:
                 state[k] = None
 
         # --------------------------------- add noise -------------------------------- #
-        self._inject_noise_to_position(
-            state=state,
-            aks_params=aks_params,
-            intensity=self.noise_lr * anchor_xyz_lr,
-            impact_func=impact_func
-        )
+        if self.noise_intensity > 0:
+            self._inject_noise_to_position(
+                state=state,
+                aks_params=aks_params,
+                intensity=self.noise_intensity * anchor_xyz_lr,
+                impact_func=impact_func
+            )
 
         return report
 

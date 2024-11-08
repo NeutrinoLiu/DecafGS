@@ -12,6 +12,11 @@ import torchvision.transforms as T
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torch.optim.lr_scheduler import LambdaLR
 from typing import List, Dict, Any
+from interface import Gaussians
+
+def cached_func(func, *args, **kwargs):
+    ret = func(*args, **kwargs)
+    return lambda x: ret
 
 def cur_time():
     import datetime
@@ -158,7 +163,8 @@ def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
             assert len(attr_lr) >= 2, "lr list should have at least 2 elements"
             lr_init = attr_lr[0]
             lr_end = attr_lr[1]
-            lr_delay = attr_lr[2] if len(attr_lr) == 3 else 0
+            lr_start = attr_lr[2] if len(attr_lr) > 2 else 0
+            lr_stop = attr_lr[3] if len(attr_lr) > 3 else max_step
             ratio = lr_end / lr_init
             ret_opts[attr_name] = torch.optim.Adam(
                 [{
@@ -171,7 +177,7 @@ def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
             )
             ret_lr_sched[attr_name] = LambdaLR(
                 ret_opts[attr_name], 
-                lr_lambda_builder(ratio, lr_delay, max_step)
+                lr_lambda_builder(ratio, lr_start, lr_stop)
             )
             print(f"lr for {attr_name} initialized with exp decay: ({lr_init}->{lr_end})")
         else:
@@ -321,23 +327,26 @@ def calculate_blames(
         #     f.write(' '.join(map(str, sorted_tensor.tolist())) + '\n')
 
         # ----------------------- save masked ssim map for ref ----------------------- #
-        # topk_mask = torch.ones_like(ssim_error_tiled) * 0.3
-        # topk_mask[topk_idx] = 1
-        # masked_ssim = mask_image_by_tile(ssim_error, topk_mask, tile_size)
-        # name = torch.randint(0, 10, (1,)).item()
-        # thread = threading.Thread(target=save_grey_image, args=(masked_ssim, f"masked_ssim_{name}.png"))
-        # thread.start()
+        topk_mask = torch.ones_like(ssim_error_tiled) * 0.3
+        topk_mask[topk_idx] = 1
+        masked_ssim = mask_image_by_tile(ssim_error, topk_mask, tile_size)
+        name = torch.randint(0, 10, (1,)).item()
+        thread = threading.Thread(target=save_grey_image, args=(masked_ssim, f"masked_ssim_{name}.png"))
+        thread.start()
         
         isect_offsets = info["isect_offsets"].flatten()
         filter_idx = info["filter_idx"]
         isect_ids = info["flatten_ids"]
+        culling_idx = info["gaussian_ids"]
+
         # add bad tiles's ssim to the gs blame
         for idx, score in zip(topk_idx, topk_ssim):
             gs_idx = get_gs_idx_from_tile(isect_offsets, isect_ids, idx)
-            gs_idx = filter_idx[gs_idx]
-            blame[gs_idx] += score
+            gs_idx_flatten = filter_idx[culling_idx[gs_idx]]
+            blame[gs_idx_flatten] += score
     
     blame_aks = blame.reshape(-1, K).sum(dim=-1)
+
     return blame_aks
 
 # borrowed from gsplat.strategy.default, used to calculate grad2d for gs

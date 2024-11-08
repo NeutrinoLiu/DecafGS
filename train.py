@@ -36,9 +36,9 @@ from helper import (LogDirMgr,
                     calculate_blames,
                     opacity_analysis,
                     normalize,
-                    ewma_update)
-
-
+                    ewma_update,
+                    cached_func)
+from helper_viewer import ViewerMgr
 
 class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
@@ -105,10 +105,11 @@ class Runner:
         def freeze_scaffold_and_anchor_deform():
             self.train_frame_embed_only = True
             self.unlocked_frame += 1
+            print(f">>>>> unlock training frame {self.unlocked_frame}")
             if self.unlocked_frame > 0 and self.unlocked_frame < len(self.frames):
                 with torch.no_grad():
-                    self.model.deform.deform_params["frame_embed"][self.unlocked_frame] += \
-                        self.model.deform.deform_params["frame_embed"][self.unlocked_frame - 1]
+                    self.model.deform.deform_params["frame_embed"][self.unlocked_frame].data += \
+                        self.model.deform.deform_params["frame_embed"][self.unlocked_frame - 1].data
             for p in self.model.scaffold.parameters():
                 p.requires_grad = False
             for p in self.model.deform.anchor_params.values():
@@ -125,10 +126,13 @@ class Runner:
                 p.requires_grad = True
         routine = {}
 
+        iters_frame_only = self.cfg.incremental_routine_frame
+        iters_mixing = self.cfg.incremental_routine_mixing
+        iters_total = iters_frame_only + self.cfg.incremental_routine_mixing
         for i in range(len(self.frames)):
             f_range = list(range(i + 1))
-            routine[i * 1000] = (f_range, unfreeze_scaffold_and_anchor_deform)
-            routine[i * 1000 + 800] = ([i+1], freeze_scaffold_and_anchor_deform)
+            routine[i * iters_total] = (f_range, unfreeze_scaffold_and_anchor_deform)
+            routine[i * iters_total + iters_mixing] = ([i+1], freeze_scaffold_and_anchor_deform)
         # drop last of the dict
         routine.pop(max(routine.keys()))
 
@@ -160,17 +164,8 @@ class Runner:
                 net_type="alex", normalize=True).to(self.device),
         }
 
-        # ------------------------------- online viewer ------------------------------ #
-        self.server = viser.ViserServer(port=8080, verbose=False)
-        self.viewer = nerfview.Viewer(
-            server=self.server,
-            render_fn=self.viewer_callback,
-            mode="training",
-            min_frame=min_frame,
-            max_frame=max_frame
-        )
-
-        # ----------------------------- setup tensorboard ---------------------------- #
+        # --------------------------------- visualize -------------------------------- #
+        self.viewer_mgr = ViewerMgr(self, min_frame, max_frame)
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
     def single_render( self,
@@ -224,16 +219,11 @@ class Runner:
         max_step = self.cfg.max_step
         pbar = tqdm(range(init_step, max_step))
 
-        train_loader = iter(
-            self.train_loader_gen.gen_loader({}, init_step))
-
+        train_loader = iter([])
         for step in pbar:
             self.routine(step)
 
-            while self.viewer.state.status == "paused":
-                time.sleep(0.01)
-            self.viewer.lock.acquire()
-            tic = time.time()
+            tic = self.viewer_mgr.checkin()
 
             # ------------------------- read train data in batch ------------------------- #
             try:
@@ -334,16 +324,26 @@ class Runner:
              anchor_opacity) = opacity_analysis(batch_state, K, self.cfg.reloc_dead_thres)
             (anchor_grad2d, 
              anchor_count) = calculate_grads(batch_state, N=N, K=K, device=self.device)
+            anchor_blame = calculate_blames(batch_state, N=N, K=K, device=self.device)
+
             ewma_update(self.state, {
                 "anchor_opacity": anchor_opacity,
                 "anchor_childs": anchor_avg_childs,
                 "anchor_grad2d": anchor_grad2d,
                 "anchor_count": anchor_count,
+                "anchor_blame": anchor_blame
             }, self.cfg.state_ewma_alpha)
-            self.state["anchor_blame"] = normalize(calculate_blames(batch_state, N=N, K=K, device=self.device))
+
+            # compute_blame = (step < self.strategy.refine_stop_iter          # densification in this step
+            #                     and step >= self.strategy.refine_start_iter
+            #                     and step % self.strategy.refine_every == 0) or self.cfg.always_compute_blame
+
+            # self.state["anchor_blame"] = normalize(calculate_blames(batch_state, N=N, K=K, device=self.device)) \
+            #     if compute_blame else None
 
             # ------------------------ relocate and densification ------------------------ #
             opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
+            blame_thres_fn = lambda x: normalize(x["anchor_blame"]) < 0.1
             mask_lowest_fn = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
                                             0, 
                                             torch.topk(
@@ -353,20 +353,27 @@ class Runner:
                                         )
             grad_ops_mixing_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
                                 (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
-            blame_fn = lambda x: x["anchor_blame"]
-            # ---------------------------- different policies ---------------------------- #
+            ops_fn = lambda x: normalize(x["anchor_opacity"])
+            blame_fn = lambda x: normalize(x["anchor_blame"])
 
-            self.dead_func = mask_lowest_fn
-            self.impact_func = blame_fn
+            # ---------------------------- different policies ---------------------------- #
+            self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))
+            if step < 1000:
+                self.densify_prefer_func = ops_fn
+            else:
+                self.densify_prefer_func = blame_fn
             
+            xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_xyz', None)
+            xyz_lr = xyz_lr.get_last_lr()[0] \
+                if xyz_lr is not None else self.cfg.lr_anchor_xyz
             report = self.strategy.step_post_backward(
                 state=self.state,
                 aks_params=self.model.deform.anchor_params,
                 aks_opts=self.model.deform.anchor_opts,
                 step=step,
-                anchor_xyz_lr=self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0],
-                dead_func=self.dead_func,
-                impact_func=self.impact_func
+                anchor_xyz_lr=xyz_lr,
+                dead_func= cached_func(self.densify_dead_func, self.state),
+                impact_func= cached_func(self.densify_prefer_func, self.state),
             ) if not self.train_frame_embed_only else {}
             
             self.model.optimize()
@@ -375,21 +382,32 @@ class Runner:
 
             # tensorboard >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
             with torch.no_grad():
-                frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]
-                frame_embeds_std = torch.std(frame_embeds, dim=1)
-                self.writer.add_scalar("train/frame_embeds_std", frame_embeds_std.mean(), step)
+
                 if step % 400 == 0 and self.cfg.tb_histogram > 0:
                     self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
                     self.writer.add_histogram("train/grads2d", anchor_grad2d, step)
                     self.writer.add_histogram("train/childs_offsets", gs_offsets.flatten().clamp(-1,1), step) # last offsets in the batch
-                self.writer.add_scalar("train/loss", loss.item(), step)
-                self.writer.add_scalar("train/l1loss", metrics["l1loss"].item(), step)
-                self.writer.add_scalar("train/ssimloss", metrics["ssimloss"].item(), step)
-                self.writer.add_scalar("train/time", time.time() - tic, step)
-                self.writer.add_scalar("train/active_gs", torch.sum(anchor_avg_childs), step)
-                self.writer.add_scalar("train/average_child", torch.mean(anchor_avg_childs), step)
+
+                self.writer.add_scalar("loss/loss", loss.item(), step)
+                for k, v in metrics.items():
+                    if weights[k] > 0:
+                        self.writer.add_scalar(f"loss/reg:{k}", v * weights[k], step)
+
+                self.writer.add_scalar("runtime/time", time.time() - tic, step)
+                self.writer.add_scalar("runtime/active_gs", torch.sum(anchor_avg_childs), step)
+                self.writer.add_scalar("runtime/average_child", torch.mean(anchor_avg_childs), step)
+                frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]
+                frame_embeds = torch.stack([frame_embeds[i] for i in range(len(self.train_loader_gen.frames))])
+                frame_embeds_std = torch.std(frame_embeds, dim=1)
+                self.writer.add_scalar("runtime/frame_embeds_std", frame_embeds_std.mean(), step)
+                anchor_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
+                self.writer.add_scalar("runtime/anchor_lr", anchor_lr, step)
+                offset_lr = self.model.deform.anchor_lr_sched['anchor_offsets'].get_last_lr()[0]
+                self.writer.add_scalar("runtime/offset_lr", offset_lr, step)
                 if report.get("relocated", None) is not None:
-                    self.writer.add_scalar("train/relocated", report["relocated"], step)
+                    self.writer.add_scalar("runtime/relocated", report["relocated"], step)
+                opacity_decay = self.model.deform.anchor_params["anchor_opacity_decay"].mean()
+                self.writer.add_scalar("runtime/opacity_decay", opacity_decay, step)
             
             # ----------------------------------- eval ----------------------------------- #
             if step in [i - 1 for i in self.cfg.test_steps] or \
@@ -397,15 +415,8 @@ class Runner:
                 self.eval(step)
 
             # ---------------------------- viser viewer update --------------------------- #
-            self.viewer.lock.release()
-            num_train_rays_per_step = (
-                gt.shape[0] * gt.shape[1] * gt.shape[2]
-            )
-            num_train_steps_per_sec = 1.0 / (time.time() - tic)
-            num_train_rays_per_sec = num_train_rays_per_step * num_train_steps_per_sec
-            # static update
-            self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
-            self.viewer.update(step, num_train_rays_per_step)
+            num_rays = gt.shape[0] * gt.shape[1] * gt.shape[2]
+            self.viewer_mgr.checkout(num_rays, step)
         
         with open(self.log.summary, 'a') as f:
             f.write(json.dumps(self.model.count_params(), indent=4))
@@ -467,129 +478,6 @@ class Runner:
         )
         with open(self.log.stat, 'a') as f:
             f.write(json.dumps(results) + '\n')
-
-    @torch.no_grad()
-    def viewer_callback(
-        self, 
-        camera_state: nerfview.CameraState,
-        img_wh: "tuple[int, int]",
-        frame=0,
-        mode="RGB",
-        init_scale=0.02
-    ):
-        W, H = img_wh
-        c2w = camera_state.c2w
-        K = camera_state.get_K(img_wh)
-        c2w = torch.from_numpy(c2w).float()
-        K = torch.from_numpy(K).float()
-        c2w_R = c2w[:3, :3]
-        c2w_t = c2w[:3, 3]
-
-        cam = Camera(
-            path=None,
-            intri=K,
-            c2w_R=c2w_R,
-            c2w_t=c2w_t,
-            width=W,
-            height=H,
-            frame=frame
-        )
-        # --------------------------- pure image rendering --------------------------- #
-        if mode == "RGB":
-            pc, _ = self.model.produce(cam)
-        # ---------------------------- childs gs rendering --------------------------- #
-        elif mode == "childs":
-            gs, aks = self.model.produce(cam)
-            aks_means = aks.anchor_xyz
-            aks_quats = torch.zeros(aks_means.shape[0], 4, device=self.device)
-            aks_quats[:, 0] = 1.0
-            aks_scales = torch.ones(aks_means.shape[0], 3, device=self.device) * init_scale * 2
-            aks_opacities = torch.ones(aks_means.shape[0], device=self.device)
-            aks_colors = torch.ones(aks_means.shape[0], 3, device=self.device)
-
-
-            child_means = aks.childs_xyz.reshape(-1, 3)
-            child_quats = torch.zeros(child_means.shape[0], 4, device=self.device)
-            child_quats[:, 0] = 1.0
-            child_scales = torch.ones(child_means.shape[0], 3, device=self.device) * init_scale
-            child_opacities = torch.ones(child_means.shape[0], device=self.device) * 0.5
-            child_colors = torch.ones(child_means.shape[0], 3, device=self.device)
-            child_colors[:, 0] = 0.0
-            child_colors[:, 2] = 0.0
-
-            pc_dict = {
-                "means" : torch.cat([aks_means, child_means], dim=0),
-                "quats" : torch.cat([aks_quats, child_quats], dim=0),
-                "scales" : torch.cat([aks_scales, child_scales], dim=0),
-                "opacities" : torch.cat([aks_opacities, child_opacities], dim=0),
-                "sh0": torch.cat([rgb_to_sh(aks_colors), rgb_to_sh(child_colors)], dim=0).unsqueeze(1),
-                "shN": torch.zeros(aks_means.shape[0] + child_means.shape[0], 0, 3, device=self.device)
-            }
-            pc = Gaussians(pc_dict)
-        # ------------------- anchor location and opacity rendering ------------------ #
-        else:
-            gs, aks = self.model.produce(cam)
-            num_childs = aks.childs_xyz.shape[1]
-            mask = None
-            if mode == "ops":
-                vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1)
-            elif mode == "avg-spawn":
-                vis_ops = self.state["anchor_childs"]
-                if vis_ops is None:
-                    return self.buffered_viewer_img.cpu().numpy()
-                N = vis_ops.shape[0]
-                hc = N // 20
-                mask = torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
-                                        0, torch.topk(vis_ops, hc, largest=False).indices, True)
-            elif mode == "avg-ops":
-                vis_ops = self.state["anchor_opacity"]
-                if vis_ops is None:
-                    return self.buffered_viewer_img.cpu().numpy()
-                N = vis_ops.shape[0]
-                hc = N // 20
-                mask = torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
-                                        0, torch.topk(vis_ops, hc, largest=False).indices, True)
-            elif mode == "avg-grad":
-                vis_ops = self.state["anchor_grad2d"]
-            elif mode == "avg-impact":
-                if self.state["anchor_grad2d"] is None or self.state["anchor_opacity"] is None:
-                    return self.buffered_viewer_img.cpu().numpy()
-                vis_ops = self.impact_func(self.state)
-                mask = self.dead_func(self.state)
-            elif mode == "avg-blame":
-                vis_ops = self.state["anchor_blame"]
-            if vis_ops is None:
-                return self.buffered_viewer_img.cpu().numpy()
-            vis_ops = normalize(vis_ops)
-            quats = torch.zeros(aks.anchor_xyz.shape[0], 4, device=self.device)
-            quats[:, 0] = 1.0
-            scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) * init_scale
-            colors = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.device) 
-            if mask is not None:
-                colors[mask, 0] = 0.0
-                colors[mask, 2] = 0.0
-                vis_ops[mask] = 1
-
-            pc_dict = {
-                "means" : aks.anchor_xyz,
-                "quats" : quats,
-                "scales" : scales,
-                "opacities" : vis_ops,
-                "sh0": rgb_to_sh(colors).unsqueeze(1),
-                "shN": torch.zeros(aks.anchor_xyz.shape[0], 0, 3, device=self.device)
-            }
-            pc = Gaussians(pc_dict)
-
-
-        img, _, _ = self.single_render(
-            pc=pc,
-            cam=cam,
-            permute=False,      # no need to permute, viewer need (H, W, 3)
-            )
-
-        self.buffered_viewer_img = img
-        return img.cpu().numpy()
-
 
 @hydra.main(config_path='.', config_name='default', version_base=None)
 def main(cfg):

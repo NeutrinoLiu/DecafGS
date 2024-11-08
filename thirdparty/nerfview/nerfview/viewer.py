@@ -77,6 +77,7 @@ class Viewer(object):
                 Tuple[UInt8[np.ndarray, "H W 3"], Optional[Float32[np.ndarray, "H W"]]],
             ],
         ],
+        vis_options: list = ["RGB"],
         mode: Literal["rendering", "training"] = "rendering",
         min_frame = 0,
         max_frame = 1,
@@ -102,9 +103,9 @@ class Viewer(object):
         self._frame_start = min_frame
         self._frame_end = max_frame - 1
 
-        self._define_guis()
+        self._define_guis(vis_options)
 
-    def _define_guis(self):
+    def _define_guis(self, opts):
         with self.server.gui.add_folder(
             "Stats", visible=self.mode == "training"
         ) as self._stats_folder:
@@ -146,7 +147,7 @@ class Viewer(object):
 
         with self.server.gui.add_folder("Visualize Mode") as self._camera_folder:
             self._visualize_mode = self.server.gui.add_dropdown(
-                "Visualize Mode", ["RGB", "childs", "ops", "avg-ops", "avg-spawn", "avg-grad", "avg-impact", "avg-blame"], initial_value="RGB"
+                "Visualize Mode", opts, initial_value="RGB"
             )
             self._visualize_mode.on_update(self.rerender)
             self._vis_gs_scale= self.server.gui.add_slider(
