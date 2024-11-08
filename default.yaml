@@ -62,14 +62,14 @@ train:
   lr_anchor_embed: 0.0075
   lr_anchor_xyz: 
     - 1e-3
-    - 1e-5
+    - 1e-4
     - 0
-    - 40000
+    - 20000
   lr_anchor_offsets: 
     - 2e-4
-    - 2e-6
+    - 2e-5
     - 0
-    - 40000
+    - 20000
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
   lr_anchor_opacity_decay: 1e-2
@@ -90,10 +90,13 @@ train:
   reg_offset: 1e-2
   # densification with MCMC relocation
   growing_rate: 0.05
+  perturb_start_iter: 1000
   perturb_intensity: 0
-  reloc_start_iter: 500
+  densify_start_iter: 1000
+  densify_every: 200
+  reloc_start_iter: 1000
   reloc_stop_iter: 1000000
-  reloc_every: 50
+  reloc_every: 100
   reloc_dead_thres: 0.01
   reloc_dead_spawns: 0
   state_ewma_alpha: 0.9

@@ -44,13 +44,20 @@ class DecafMCMCStrategy:
     """
 
     def __init__(self, train_cfg, max_cap, verbose = True):
-        self.cap_max: int = max_cap
-        self.growing_rate: float = train_cfg.growing_rate
-        self.noise_intensity: float = train_cfg.perturb_intensity
         self.scale_decay: float = train_cfg.scale_decay
-        self.refine_start_iter: int = train_cfg.reloc_start_iter
-        self.refine_stop_iter: int = train_cfg.reloc_stop_iter
-        self.refine_every: int = train_cfg.reloc_every
+        
+        self.reloc_start_iter: int = train_cfg.reloc_start_iter
+        self.reloc_stop_iter: int = train_cfg.reloc_stop_iter
+        self.reloc_every: int = train_cfg.reloc_every
+
+        self.densify_start_iter: int = train_cfg.densify_start_iter
+        self.densify_every: int = train_cfg.densify_every
+        self.growing_rate: float = train_cfg.growing_rate
+        self.cap_max: int = max_cap
+
+        self.noise_intensity: float = train_cfg.perturb_intensity
+        self.noise_start_iter: int = train_cfg.perturb_start_iter
+
         self.min_opacity: float = train_cfg.reloc_dead_thres
         self.min_childs: int = train_cfg.reloc_dead_spawns
         self.verbose: bool = verbose
@@ -72,12 +79,10 @@ class DecafMCMCStrategy:
         impact_func,
     ):
         report = {}
-        if (step < self.refine_stop_iter
-            and step >= self.refine_start_iter
-            and step % self.refine_every == 0):
 
-
-
+        if (step < self.reloc_stop_iter
+            and step >= self.reloc_start_iter
+            and step % self.reloc_every == 0):
             # --------------------------------- relocate --------------------------------- #
             n_reloacted_aks, dead_idx, target_idx = self._reloate_anchor(
                 state=state,
@@ -91,6 +96,12 @@ class DecafMCMCStrategy:
                 if self.verbose:
                     print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
+            torch.cuda.empty_cache()
+            report["relocated"] = n_reloacted_aks if n_reloacted_aks > 0 else None
+
+
+        if (step >= self.densify_start_iter
+            and step % self.densify_every == 0):
             # ---------------------------------- add aks --------------------------------- #
             n_new_aks, growed_idx = self._grow_anchor(
                 state=state,
@@ -110,13 +121,10 @@ class DecafMCMCStrategy:
                     )
 
             torch.cuda.empty_cache()
+            report["grew"] = n_new_aks if n_new_aks > 0 else None
 
-            report.update({
-                "relocated": n_reloacted_aks if n_reloacted_aks > 0 else None,
-                "grew": n_new_aks if n_new_aks > 0 else None
-            })
-
-            # reset state after relocate
+        # reset state after any relocate or grow
+        if len(report) > 0:
             for k in state:
                 state[k] = None
 

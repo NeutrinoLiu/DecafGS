@@ -336,9 +336,9 @@ class Runner:
             (anchor_grad2d, 
              anchor_count) = calculate_grads(batch_state, N=N, K=K, device=self.device)
             
-            blame_start_mod = self.strategy.refine_every - self.cfg.blame_prepare_iters # 10 iters earlier to prepare for blame
-            compute_blame = (step < self.strategy.refine_stop_iter
-                                and (step-1) % self.strategy.refine_every > blame_start_mod) \
+            blame_start_mod = self.strategy.reloc_every - self.cfg.blame_prepare_iters # 10 iters earlier to prepare for blame
+            compute_blame = (step < self.strategy.reloc_stop_iter
+                                and (step-1) % self.strategy.reloc_every > blame_start_mod) \
                                     or self.cfg.always_compute_blame
             anchor_blame = calculate_blames(batch_state, 
                                             N=N, K=K, 

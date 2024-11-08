@@ -284,10 +284,11 @@ def save_grey_image(img_tensor, save_path):
     img_pil = T.ToPILImage()(img_tensor)
     img_pil.save(save_path)
 
-def get_gs_idx_from_tile(offsets, records, query_tile):
+def get_gs_idx_from_tile(offsets, records, query_tile, max_num):
     tile_num = len(offsets)
     start = offsets[query_tile]
     end = offsets[query_tile + 1] if query_tile < tile_num - 1 else len(records)
+    end = min(start + max_num, end)
     return records[start:end]
 
 # not necessary for each batch, but needed if error-oriented densification is expected
@@ -343,8 +344,7 @@ def calculate_blames(
 
         # add bad tiles's ssim to the gs blame
         for idx, score in zip(topk_idx, topk_ssim):
-            gs_idx = get_gs_idx_from_tile(isect_offsets, isect_ids, idx)
-            gs_idx = gs_idx[:max_gs_per_tile] # only consider the closest 1000 gs to the tile
+            gs_idx = get_gs_idx_from_tile(isect_offsets, isect_ids, idx, max_gs_per_tile)
             gs_idx_flatten = filter_idx[culling_idx[gs_idx]]
             blame[gs_idx_flatten] += score
     

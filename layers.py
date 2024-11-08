@@ -41,7 +41,7 @@ class TempoMixture(nn.Module):
                     further_dims,
                     skip,
                     depth,
-                    cascade=True):       # insert skip connection at the input of skip-th layer
+                    decoupled=True):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
         """
         build a 2 layer mlp module, refer to scaffold-gs
@@ -49,7 +49,40 @@ class TempoMixture(nn.Module):
         super(TempoMixture, self).__init__()
         assert skip < depth, "skip should be less than depth"
         self.skip = skip
-        self.cascade = cascade
+        self.decoupled = decoupled
+        self.mlp_w_skip = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth)
+
+        self.pre_delta_mlps = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth) if decoupled else None
+        self.delta_mlps = nn.ModuleList(
+            [ nn.Sequential(
+                nn.Linear(out_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, further_dim))
+            for further_dim in further_dims ] 
+        )
+    def forward(self, x):
+        feature = self.mlp_w_skip(x)
+        delta_input = self.pre_delta_mlps(x) if self.decoupled else feature
+
+        delta_outputs = []
+        for mlp in self.delta_mlps:
+            delta_outputs.append(mlp(delta_input))
+        return feature, *delta_outputs
+
+class SkippableMLP(nn.Module):
+    def __init__(self,
+                in_dim,
+                hidden_dim,
+                out_dim,
+                skip,
+                depth):       # insert skip connection at the input of skip-th layer
+                                    # skip = 0 means no skip connection
+        """
+        build a 2 layer mlp module, refer to scaffold-gs
+        """
+        super(SkippableMLP, self).__init__()
+        assert skip < depth, "skip should be less than depth"
+        self.skip = skip
         self.layers = nn.ModuleList()
         for i in range(depth):
             sublayer_in_dim = in_dim if i == 0 else hidden_dim
@@ -62,22 +95,10 @@ class TempoMixture(nn.Module):
                     nn.ReLU()
                 )
             )
-        self.further_layers = nn.ModuleList(
-            [nn.Linear(out_dim, further_dim) for further_dim in further_dims] if cascade else \
-            [nn.Linear(in_dim, further_dim) for further_dim in further_dims]
-        )
-        # for layer in self.further_layers:
-        #     nn.init.zeros_(layer.weight)
-        #     nn.init.zeros_(layer.bias)
     def forward(self, x):
         original_x = x
         for i, layer in enumerate(self.layers):
             if i == self.skip and self.skip > 0:
                 x = torch.cat([x, original_x], dim=-1)
             x = layer(x)
-
-        further_x = []
-        further_x_input = x if self.cascade else original_x
-        for further_layer in self.further_layers:
-            further_x.append(further_layer(further_x_input))
-        return x, *further_x
+        return x
