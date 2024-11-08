@@ -295,7 +295,9 @@ def calculate_blames(
         batch_state: Dict[str, Any],
         N: int,
         K: int,
-        device):
+        device,
+        max_gs_per_tile: int = 1000,
+        ):
     
     topk = 200
     dssim_min = 0.1
@@ -327,12 +329,12 @@ def calculate_blames(
         #     f.write(' '.join(map(str, sorted_tensor.tolist())) + '\n')
 
         # ----------------------- save masked ssim map for ref ----------------------- #
-        topk_mask = torch.ones_like(ssim_error_tiled) * 0.3
-        topk_mask[topk_idx] = 1
-        masked_ssim = mask_image_by_tile(ssim_error, topk_mask, tile_size)
-        name = torch.randint(0, 10, (1,)).item()
-        thread = threading.Thread(target=save_grey_image, args=(masked_ssim, f"masked_ssim_{name}.png"))
-        thread.start()
+        # topk_mask = torch.ones_like(ssim_error_tiled) * 0.3
+        # topk_mask[topk_idx] = 1
+        # masked_ssim = mask_image_by_tile(ssim_error, topk_mask, tile_size)
+        # name = torch.randint(0, 10, (1,)).item()
+        # thread = threading.Thread(target=save_grey_image, args=(masked_ssim, f"masked_ssim_{name}.png"))
+        # thread.start()
         
         isect_offsets = info["isect_offsets"].flatten()
         filter_idx = info["filter_idx"]
@@ -342,6 +344,7 @@ def calculate_blames(
         # add bad tiles's ssim to the gs blame
         for idx, score in zip(topk_idx, topk_ssim):
             gs_idx = get_gs_idx_from_tile(isect_offsets, isect_ids, idx)
+            gs_idx = gs_idx[:max_gs_per_tile] # only consider the closest 1000 gs to the tile
             gs_idx_flatten = filter_idx[culling_idx[gs_idx]]
             blame[gs_idx_flatten] += score
     
@@ -404,7 +407,7 @@ def normalize(v, eps=1e-6):
 
 def ewma_update(d, new_kv, alpha=0.9):
     for k, v in new_kv.items():
-        if d.get(k) is not None:
+        if d.get(k) is not None and v is not None:
             d[k] = d[k] * alpha + v * (1 - alpha)
         else:
             d[k] = v

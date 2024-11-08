@@ -102,14 +102,16 @@ class Runner:
         # ------------------------- other training schedulers ------------------------ #
         self.unlocked_frame = 0
         self.train_frame_embed_only = False
-        def freeze_scaffold_and_anchor_deform():
-            self.train_frame_embed_only = True
+        def unlock_one_frame():
             self.unlocked_frame += 1
             print(f">>>>> unlock training frame {self.unlocked_frame}")
             if self.unlocked_frame > 0 and self.unlocked_frame < len(self.frames):
                 with torch.no_grad():
                     self.model.deform.deform_params["frame_embed"][self.unlocked_frame].data += \
                         self.model.deform.deform_params["frame_embed"][self.unlocked_frame - 1].data
+        def freeze_scaffold_and_anchor_deform():
+            self.train_frame_embed_only = True
+            unlock_one_frame()
             for p in self.model.scaffold.parameters():
                 p.requires_grad = False
             for p in self.model.deform.anchor_params.values():
@@ -126,14 +128,23 @@ class Runner:
                 p.requires_grad = True
         routine = {}
 
+        iters_shift = self.cfg.incremental_routine_first_frame
         iters_frame_only = self.cfg.incremental_routine_frame
         iters_mixing = self.cfg.incremental_routine_mixing
         iters_total = iters_frame_only + self.cfg.incremental_routine_mixing
+
         for i in range(len(self.frames)):
-            f_range = list(range(i + 1))
-            routine[i * iters_total] = (f_range, unfreeze_scaffold_and_anchor_deform)
-            routine[i * iters_total + iters_mixing] = ([i+1], freeze_scaffold_and_anchor_deform)
-        # drop last of the dict
+            if iters_frame_only > 0:        # iters reserved for train a single frame
+                f_range = list(range(i + 1))
+                routine[iters_shift + i * iters_total] = (f_range, unfreeze_scaffold_and_anchor_deform)
+                routine[iters_shift + i * iters_total + iters_mixing] = ([i+1], freeze_scaffold_and_anchor_deform)
+            else:                           # no such reserved iters
+                f_range = list(range(i + 1))
+                routine[iters_shift + i * iters_total] = (f_range, unlock_one_frame)
+
+        # add first iter 
+        routine[0] = ([0], unfreeze_scaffold_and_anchor_deform)
+        # drop the last iter
         routine.pop(max(routine.keys()))
 
         def routine_(step):
@@ -324,7 +335,16 @@ class Runner:
              anchor_opacity) = opacity_analysis(batch_state, K, self.cfg.reloc_dead_thres)
             (anchor_grad2d, 
              anchor_count) = calculate_grads(batch_state, N=N, K=K, device=self.device)
-            anchor_blame = calculate_blames(batch_state, N=N, K=K, device=self.device)
+            
+            blame_start_mod = self.strategy.refine_every - self.cfg.blame_prepare_iters # 10 iters earlier to prepare for blame
+            compute_blame = (step < self.strategy.refine_stop_iter
+                                and (step-1) % self.strategy.refine_every > blame_start_mod) \
+                                    or self.cfg.always_compute_blame
+            anchor_blame = calculate_blames(batch_state, 
+                                            N=N, K=K, 
+                                            device=self.device,
+                                            max_gs_per_tile=self.cfg.blame_max_gs_per_tile) \
+                if compute_blame else None
 
             ewma_update(self.state, {
                 "anchor_opacity": anchor_opacity,
@@ -333,13 +353,6 @@ class Runner:
                 "anchor_count": anchor_count,
                 "anchor_blame": anchor_blame
             }, self.cfg.state_ewma_alpha)
-
-            # compute_blame = (step < self.strategy.refine_stop_iter          # densification in this step
-            #                     and step >= self.strategy.refine_start_iter
-            #                     and step % self.strategy.refine_every == 0) or self.cfg.always_compute_blame
-
-            # self.state["anchor_blame"] = normalize(calculate_blames(batch_state, N=N, K=K, device=self.device)) \
-            #     if compute_blame else None
 
             # ------------------------ relocate and densification ------------------------ #
             opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
@@ -358,7 +371,7 @@ class Runner:
 
             # ---------------------------- different policies ---------------------------- #
             self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))
-            if step < 1000:
+            if step < self.cfg.blame_start_iter:
                 self.densify_prefer_func = ops_fn
             else:
                 self.densify_prefer_func = blame_fn
@@ -372,8 +385,8 @@ class Runner:
                 aks_opts=self.model.deform.anchor_opts,
                 step=step,
                 anchor_xyz_lr=xyz_lr,
-                dead_func= cached_func(self.densify_dead_func, self.state),
-                impact_func= cached_func(self.densify_prefer_func, self.state),
+                dead_func= self.densify_dead_func,
+                impact_func= self.densify_prefer_func,
             ) if not self.train_frame_embed_only else {}
             
             self.model.optimize()
@@ -396,10 +409,12 @@ class Runner:
                 self.writer.add_scalar("runtime/time", time.time() - tic, step)
                 self.writer.add_scalar("runtime/active_gs", torch.sum(anchor_avg_childs), step)
                 self.writer.add_scalar("runtime/average_child", torch.mean(anchor_avg_childs), step)
-                frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]
-                frame_embeds = torch.stack([frame_embeds[i] for i in range(len(self.train_loader_gen.frames))])
-                frame_embeds_std = torch.std(frame_embeds, dim=1)
-                self.writer.add_scalar("runtime/frame_embeds_std", frame_embeds_std.mean(), step)
+
+                if len(self.train_loader_gen.frames) > 1:
+                    frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]
+                    frame_embeds = torch.stack([frame_embeds[i] for i in range(len(self.train_loader_gen.frames))])
+                    frame_embeds_std = torch.std(frame_embeds, dim=0)
+                    self.writer.add_scalar("runtime/frame_embeds_std", frame_embeds_std.mean(), step)
                 anchor_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
                 self.writer.add_scalar("runtime/anchor_lr", anchor_lr, step)
                 offset_lr = self.model.deform.anchor_lr_sched['anchor_offsets'].get_last_lr()[0]
@@ -470,7 +485,8 @@ class Runner:
         if not self.train_frame_embed_only:
             self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
             self.writer.add_scalar("eval/ssim", results_avg['ssim'] , step)
-        self.writer.add_scalars("eval/perframe", psnr_per_frame, step)
+        if self.cfg.tb_per_frame_psnr:
+            self.writer.add_scalars("eval/perframe", psnr_per_frame, step)
 
         # log print
         results.update(
