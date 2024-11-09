@@ -10,7 +10,7 @@ import math
 from examples.utils import rgb_to_sh
 from helper import get_adam_and_lr_sched, count_opt_params
 from interface import Camera, Gaussians, Anchors
-from layers import MLP_builder, ExpLayer, TempoMixture
+from helper_layers import MLP_builder, TempoMixture
 
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
@@ -94,7 +94,8 @@ class Deformable(nn.Module):
                 out_dim     =   model_cfg.anchor_feature_dim, 
                 further_dims=   delta_dims, 
                 skip        =   model_cfg.deform_skip,
-                depth       =   model_cfg.deform_depth
+                depth       =   model_cfg.deform_depth,
+                decoupled   =   model_cfg.deform_decoupled_delta
             ).to(device)
             deform_params = [
                 ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),

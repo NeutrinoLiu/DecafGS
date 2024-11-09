@@ -41,7 +41,7 @@ class TempoMixture(nn.Module):
                     further_dims,
                     skip,
                     depth,
-                    decoupled=True):       # insert skip connection at the input of skip-th layer
+                    decoupled=False):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
         """
         build a 2 layer mlp module, refer to scaffold-gs
@@ -54,11 +54,12 @@ class TempoMixture(nn.Module):
 
         self.pre_delta_mlps = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth) if decoupled else None
         self.delta_mlps = nn.ModuleList(
-            [ nn.Sequential(
-                nn.Linear(out_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, further_dim))
-            for further_dim in further_dims ] 
+            [ MLP_builder(
+                in_dim=out_dim,
+                hidden_dim=hidden_dim,
+                out_dim=further_dim,
+                out_act=nn.Identity()
+                ) for further_dim in further_dims ]
         )
     def forward(self, x):
         feature = self.mlp_w_skip(x)

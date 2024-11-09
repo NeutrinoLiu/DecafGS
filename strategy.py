@@ -50,9 +50,9 @@ class DecafMCMCStrategy:
         self.reloc_stop_iter: int = train_cfg.reloc_stop_iter
         self.reloc_every: int = train_cfg.reloc_every
 
-        self.densify_start_iter: int = train_cfg.densify_start_iter
-        self.densify_every: int = train_cfg.densify_every
-        self.growing_rate: float = train_cfg.growing_rate
+        self.densify_start_iter: int = train_cfg.grow_start_iter
+        self.densify_every: int = train_cfg.grow_every
+        self.growing_rate: float = train_cfg.grow_rate
         self.cap_max: int = max_cap
 
         self.noise_intensity: float = train_cfg.perturb_intensity
@@ -79,11 +79,13 @@ class DecafMCMCStrategy:
         impact_func,
     ):
         report = {}
+        dead_idx = None
+        appended_idx = None
 
+        # ---------------------------------- relocate gs -------------------------------- #
         if (step < self.reloc_stop_iter
             and step >= self.reloc_start_iter
             and step % self.reloc_every == 0):
-            # --------------------------------- relocate --------------------------------- #
             n_reloacted_aks, dead_idx, target_idx = self._reloate_anchor(
                 state=state,
                 aks_params=aks_params,
@@ -96,14 +98,12 @@ class DecafMCMCStrategy:
                 if self.verbose:
                     print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
-            torch.cuda.empty_cache()
             report["relocated"] = n_reloacted_aks if n_reloacted_aks > 0 else None
 
-
+        # ---------------------------------- grow gs --------------------------------- #
         if (step >= self.densify_start_iter
             and step % self.densify_every == 0):
-            # ---------------------------------- add aks --------------------------------- #
-            n_new_aks, growed_idx = self._grow_anchor(
+            n_new_aks, appended_idx, growed_idx = self._grow_anchor(
                 state=state,
                 aks_params=aks_params,
                 opts=aks_opts,
@@ -120,22 +120,40 @@ class DecafMCMCStrategy:
                         f"Now having {aks_params['anchor_offsets'].shape[0]} Anchors."
                     )
 
-            torch.cuda.empty_cache()
             report["grew"] = n_new_aks if n_new_aks > 0 else None
 
-        # reset state after any relocate or grow
-        if len(report) > 0:
-            for k in state:
-                state[k] = None
-
         # --------------------------------- add noise -------------------------------- #
-        if self.noise_intensity > 0:
+        if dead_idx is not None and appended_idx is None:
+            apply_noise_idx = dead_idx
+            idx_ops = state["anchor_opacity"][target_idx]
+        elif dead_idx is None and appended_idx is not None:
+            apply_noise_idx = appended_idx
+            idx_ops = state["anchor_opacity"][growed_idx]
+        elif dead_idx is not None and appended_idx is not None:
+            apply_noise_idx = torch.cat([dead_idx, appended_idx])
+            idx_ops = torch.cat([
+                state["anchor_opacity"][target_idx],
+                state["anchor_opacity"][growed_idx]
+            ])
+        else:
+            apply_noise_idx = None
+
+        if self.noise_intensity > 0 \
+            and step >= self.noise_start_iter \
+            and apply_noise_idx is not None:
             self._inject_noise_to_position(
                 state=state,
                 aks_params=aks_params,
                 intensity=self.noise_intensity * anchor_xyz_lr,
-                impact_func=impact_func
+                idx=apply_noise_idx,
+                idx_ops=idx_ops, # always use opacity for noise adding
             )
+
+        # reset state after any relocate or grow
+        if len(report) > 0:
+            # torch.cuda.empty_cache()
+            for k in state:
+                state[k] = None
 
         return report
 
@@ -197,7 +215,7 @@ class DecafMCMCStrategy:
         ratio = 1 + self.growing_rate
         N_target = min(self.cap_max, int(ratio * N))
         n = max(0, N_target - N)
-        if n == 0: return 0, None
+        if n == 0: return 0, None, None
 
         probs = impact_func(state)
         sampled_idx = torch.multinomial(probs, n, replacement=True)
@@ -219,8 +237,9 @@ class DecafMCMCStrategy:
             return torch.cat([v, v_new])
         
         _update_param_with_optimizer(param_update, opt_update, aks_params, opts)
+        appended_idx = torch.arange(N, N_target, device=sampled_idx.device)
 
-        return n, sampled_idx
+        return n, appended_idx, sampled_idx
 
     @torch.no_grad()
     def _inject_noise_to_position(
@@ -228,15 +247,21 @@ class DecafMCMCStrategy:
         state: Dict[str, Any],
         aks_params: Dict[str, torch.nn.Parameter],
         intensity,
-        impact_func,
+        idx,
+        idx_ops,
     ):
+        # add noise to indexed anchors
         if intensity == 0: return
         def op_sigmoid(x, k=100, x0=0.995):
             """higher opacity, less noise"""
             return 1 / (1 + torch.exp(-k * (x - x0)))
         
-        noise_resistance = op_sigmoid(1 - impact_func(state)).unsqueeze(1)
-        noise = torch.randn_like(aks_params["anchor_xyz"]) \
-                 * noise_resistance * intensity * aks_params["anchor_scale_extend"]
+        assert idx_ops.shape[0] == idx.shape[0], f"shape mismatch, {idx_ops.shape[0]} != {idx.shape[0]}"
+        noise_resistance = op_sigmoid(1 - idx_ops).unsqueeze(1)
+        noise = torch.randn_like(aks_params["anchor_xyz"][idx]) \
+                 * noise_resistance * intensity * aks_params["anchor_scale_extend"][idx]
         
-        aks_params["anchor_xyz"] += noise
+        aks_params["anchor_xyz"][idx] += noise
+
+        noise_norm = noise.norm(dim=-1)
+        print(f"noise mean: {noise_norm.mean().item()}, std: {noise_norm.std().item()}\n noise max: {noise_norm.max().item()}, min: {noise_norm.min().item()}")

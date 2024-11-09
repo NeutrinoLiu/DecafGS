@@ -39,6 +39,7 @@ from helper import (LogDirMgr,
                     ewma_update,
                     cached_func)
 from helper_viewer import ViewerMgr
+from helper_routine import RoutineMgr
 
 class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
@@ -78,7 +79,7 @@ class Runner:
             num_workers=data_cfg.num_workers,
             use_torch_loader=self.use_torch_loader,
             )
-        self.test_sampler_gen = DataManager(
+        self.test_loader_gen = DataManager(
             self.scene,                         # img reader
             test_cam_idx,                       # test cam only
             self.frames,                        # full frame
@@ -100,59 +101,24 @@ class Runner:
         )
 
         # ------------------------- other training schedulers ------------------------ #
-        self.unlocked_frame = 0
-        self.train_frame_embed_only = False
-        def unlock_one_frame():
-            self.unlocked_frame += 1
-            print(f">>>>> unlock training frame {self.unlocked_frame}")
-            if self.unlocked_frame > 0 and self.unlocked_frame < len(self.frames):
-                with torch.no_grad():
-                    self.model.deform.deform_params["frame_embed"][self.unlocked_frame].data += \
-                        self.model.deform.deform_params["frame_embed"][self.unlocked_frame - 1].data
-        def freeze_scaffold_and_anchor_deform():
-            self.train_frame_embed_only = True
-            unlock_one_frame()
-            for p in self.model.scaffold.parameters():
-                p.requires_grad = False
-            for p in self.model.deform.anchor_params.values():
-                p.requires_grad = False
-            for p in self.model.deform.deform_params["mlp_deform"]:
-                p.requires_grad = False
-        def unfreeze_scaffold_and_anchor_deform():
-            self.train_frame_embed_only = False
-            for p in self.model.scaffold.parameters():
-                p.requires_grad = True
-            for p in self.model.deform.anchor_params.values():
-                p.requires_grad = True
-            for p in self.model.deform.deform_params["mlp_deform"]:
-                p.requires_grad = True
-        routine = {}
 
-        iters_shift = self.cfg.incremental_routine_first_frame
-        iters_frame_only = self.cfg.incremental_routine_frame
-        iters_mixing = self.cfg.incremental_routine_mixing
-        iters_total = iters_frame_only + self.cfg.incremental_routine_mixing
-
-        for i in range(len(self.frames)):
-            if iters_frame_only > 0:        # iters reserved for train a single frame
-                f_range = list(range(i + 1))
-                routine[iters_shift + i * iters_total] = (f_range, unfreeze_scaffold_and_anchor_deform)
-                routine[iters_shift + i * iters_total + iters_mixing] = ([i+1], freeze_scaffold_and_anchor_deform)
-            else:                           # no such reserved iters
-                f_range = list(range(i + 1))
-                routine[iters_shift + i * iters_total] = (f_range, unlock_one_frame)
-
-        # add first iter 
-        routine[0] = ([0], unfreeze_scaffold_and_anchor_deform)
-        # drop the last iter
-        routine.pop(max(routine.keys()))
-
+        self.routine_mgr = RoutineMgr(self.model, self.frames)
+        # self.routine = self.routine_mgr.frame_by_frame_routine(
+        #     init_phase      =   self.cfg.perframe_routine_init,
+        #     freeze_phase    =   self.cfg.perframe_routine_freeze,
+        #     mixing_phase    =   self.cfg.perframe_routine_mixing
+        # )
+        routine_schedule = self.routine_mgr.fence_by_fence_routine(
+            fence_interval = self.cfg.fenced_routine_interval,
+            iters_shift = self.cfg.fenced_routine_init,
+            iters_per_fence = self.cfg.fenced_routine_iters
+        )
         def routine_(step):
-            frame_range, fn = routine.get(step, (None, lambda: None))
+            frame_range, fn = routine_schedule.get(step, (None, lambda: None))
             if frame_range is not None:
                 fn()
                 self.train_loader_gen.frames = frame_range
-                self.test_sampler_gen.frames = frame_range
+                self.test_loader_gen.frames = frame_range
         
         self.routine = routine_ if self.cfg.incremental_routine else \
                         lambda x : None
@@ -387,7 +353,7 @@ class Runner:
                 anchor_xyz_lr=xyz_lr,
                 dead_func= self.densify_dead_func,
                 impact_func= self.densify_prefer_func,
-            ) if not self.train_frame_embed_only else {}
+            ) if not self.routine_mgr.freezed else {}
             
             self.model.optimize()
             self.model.zero_grad()
@@ -442,7 +408,7 @@ class Runner:
     def eval(self, step):
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
-        test_loader = iter(self.test_sampler_gen.gen_loader({}, 0))
+        test_loader = iter(self.test_loader_gen.gen_loader({}, 0))
         n = len(test_loader)
         selected_idx = random.sample(range(n), min(n, 10))
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
@@ -472,17 +438,17 @@ class Runner:
                 ) and i in selected_idx:
                 save_tensor_images_threaded(img, gt, self.log.render(f"{step}_{i}"))
 
-        frames = self.test_sampler_gen.frames
+        frames = self.test_loader_gen.frames
         results_avg = {k: sum(results[k]) / len(results[k]) for k in results.keys()}
         results_avg['fps'] = len(elapsed) / sum(elapsed)
         psnr_per_frame = {f"psnr_{frames[i]}": results["psnr"][i] for i in range(len(results["psnr"]))}
 
         # terminal print
-        print(f"\ntraining frames: {self.train_loader_gen.frames[0]}-{self.train_loader_gen.frames[-1]}")
-        print(f"test frames: {self.test_sampler_gen.frames[0]}-{self.test_sampler_gen.frames[-1]}")
+        print(f"\ntraining frames: {self.train_loader_gen.frames}")
+        print(f"test frames: {self.test_loader_gen.frames}")
         print(f"step {step}: \n{json.dumps(results_avg, indent=4)}")
         # tb print
-        if not self.train_frame_embed_only:
+        if not self.routine_mgr.freezed:
             self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
             self.writer.add_scalar("eval/ssim", results_avg['ssim'] , step)
         if self.cfg.tb_per_frame_psnr:
