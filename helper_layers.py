@@ -29,8 +29,8 @@ def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True):
         nn.Linear(in_dim if view_dependent else in_dim - 3,
                   hidden_dim),
         nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
+        # nn.Linear(hidden_dim, hidden_dim),
+        # nn.ReLU(),
         nn.Linear(hidden_dim, out_dim),
         out_act
     )
