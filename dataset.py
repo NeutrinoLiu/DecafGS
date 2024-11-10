@@ -317,12 +317,15 @@ class DataManager:
                                  "max_parallex"] = "sequential",
                  num_workers = 4,
                  use_torch_loader = False,
+                 img_proc_fn = None,
+                 mini_cache = False,
                  ):
         
         self.scene = scene
         self.policy = policy
         self.num_workers = num_workers
         self.use_torch_loader = use_torch_loader
+        self.img_proc_fn = img_proc_fn
 
         self.cams = cams_idx.copy()
         self.frames = frames_idx.copy()
@@ -331,6 +334,7 @@ class DataManager:
 
         self.cached_loader = None
         self.cached_cam_dist = None
+        self.cached_img = {} if mini_cache else None
     
     @property
     def cam_dist(self):
@@ -390,7 +394,32 @@ class DataManager:
         else:
             raise ValueError(f"unknown policy {policy}")
         
-        return DataIter(self.scene.get, seq)
+        if self.cached_img is not None:
+            raw_getter = self.cached_get
+        else:
+            raw_getter = self.scene.get
+
+        if self.img_proc_fn is not None:
+            getter = lambda c,f,s: self.img_proc_fn(raw_getter(c, f, s))
+        else:
+            getter = raw_getter
+
+        return DataIter(getter, seq)
+    
+    def cached_get(self, cam, frame, downscale):
+        """
+        load the image from disk,
+        for torch dataloader
+        """
+        if self.cached_img is not None:
+            img = self.cached_img.get(
+                (cam, frame, downscale), None)
+            if img is None:
+                img = self.scene.get(cam, frame, downscale)
+                self.cached_img[(cam, frame, downscale)] = img
+            return img
+        else:
+            return self.scene.get(cam, frame, downscale)
     
     # ------------------- unified api for training and testing ------------------- #
     def gen_loader(self, info, step):

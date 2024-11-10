@@ -37,13 +37,17 @@ class RoutineMgr:
                 with torch.no_grad():
                     self.model.deform.deform_params["frame_embed"][new_frame].data += \
                         self.model.deform.deform_params["frame_embed"][last_frame].data
+                    self.model.deform.anchor_params["anchor_frame_dxyz"][:, new_frame].data += \
+                        self.model.deform.anchor_params["anchor_frame_dxyz"][:, last_frame].data
                         
         def freeze_scaffold_and_anchor_deform():
             self.states["freeze"] = True
             unlock_one_frame()
             for p in self.model.scaffold.parameters():
                 p.requires_grad = False
-            for p in self.model.deform.anchor_params.values():
+            for name, p in self.model.deform.anchor_params.items():
+                if name == "anchor_frame_dxyz":
+                    continue
                 p.requires_grad = False
             for p in self.model.deform.deform_params["mlp_deform"]:
                 p.requires_grad = False

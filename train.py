@@ -37,7 +37,8 @@ from helper import (LogDirMgr,
                     opacity_analysis,
                     normalize,
                     ewma_update,
-                    cached_func)
+                    gaussian_blur,
+                    )
 from helper_viewer import ViewerMgr
 from helper_routine import RoutineMgr
 
@@ -68,21 +69,23 @@ class Runner:
             train_cfg.test_every)
         min_frame = model_cfg.frame_start
         max_frame = min(self.scene.frame_total, model_cfg.frame_end)
-        self.frames = list(range(min_frame, max_frame))
+        self.all_frames = list(range(min_frame, max_frame))
 
         self.train_loader_gen = DataManager(
             self.scene,                         # img reader
             train_cam_idx,                      # train cam only
-            self.frames,                        # full frame
+            self.all_frames,                        # full frame
             batch_size = train_cfg.batch_size,
             policy = "max_parallex",
             num_workers=data_cfg.num_workers,
             use_torch_loader=self.use_torch_loader,
+            img_proc_fn=self.img_proc_callback,
+            mini_cache=data_cfg.loader_mini_cache
             )
         self.test_loader_gen = DataManager(
             self.scene,                         # img reader
             test_cam_idx,                       # test cam only
-            self.frames,                        # full frame
+            self.all_frames,                        # full frame
             batch_size = 1,
             policy = "sequential",
             num_workers=data_cfg.num_workers,
@@ -102,17 +105,20 @@ class Runner:
 
         # ------------------------- other training schedulers ------------------------ #
 
-        self.routine_mgr = RoutineMgr(self.model, self.frames)
-        # self.routine = self.routine_mgr.frame_by_frame_routine(
-        #     init_phase      =   self.cfg.perframe_routine_init,
-        #     freeze_phase    =   self.cfg.perframe_routine_freeze,
-        #     mixing_phase    =   self.cfg.perframe_routine_mixing
-        # )
-        routine_schedule = self.routine_mgr.fence_by_fence_routine(
-            fence_interval = self.cfg.fenced_routine_interval,
-            iters_shift = self.cfg.fenced_routine_init,
-            iters_per_fence = self.cfg.fenced_routine_iters
-        )
+        self.routine_mgr = RoutineMgr(self.model, self.all_frames)
+        routine_schedule = None
+        if self.cfg.routine == "perframe":
+            routine_schedule = self.routine_mgr.frame_by_frame_routine(
+                init_phase      =   self.cfg.perframe_routine_init,
+                freeze_phase    =   self.cfg.perframe_routine_freeze,
+                mixing_phase    =   self.cfg.perframe_routine_mixing
+            )
+        elif self.cfg.routine == "fence":
+            routine_schedule = self.routine_mgr.fence_by_fence_routine(
+                fence_interval = self.cfg.fenced_routine_interval,
+                iters_shift = self.cfg.fenced_routine_init,
+                iters_per_fence = self.cfg.fenced_routine_iters
+            )
         def routine_(step):
             frame_range, fn = routine_schedule.get(step, (None, lambda: None))
             if frame_range is not None:
@@ -120,8 +126,7 @@ class Runner:
                 self.train_loader_gen.frames = frame_range
                 self.test_loader_gen.frames = frame_range
         
-        self.routine = routine_ if self.cfg.incremental_routine else \
-                        lambda x : None
+        self.routine = routine_ if routine_schedule is not None else lambda x: None
 
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
@@ -144,6 +149,19 @@ class Runner:
         # --------------------------------- visualize -------------------------------- #
         self.viewer_mgr = ViewerMgr(self, min_frame, max_frame)
         self.writer = SummaryWriter(log_dir=self.log.tb)
+
+    def img_proc_callback(self, img):
+        if self.cfg.gradual_opt:
+            init_r = 10
+            final_r = 1
+            final_step = self.cfg.gradual_opt_steps
+            if self.step > final_step:
+                return img
+            # expotentially decay 
+            r = init_r * (final_r / init_r) ** (self.step / final_step)
+            return gaussian_blur(img, r)
+        else:
+            return img
 
     def single_render( self,
                 pc: Gaussians,
@@ -199,7 +217,7 @@ class Runner:
         train_loader = iter([])
         for step in pbar:
             self.routine(step)
-
+            self.step = step
             tic = self.viewer_mgr.checkin()
 
             # ------------------------- read train data in batch ------------------------- #
@@ -304,7 +322,8 @@ class Runner:
             
             blame_start_mod = self.strategy.reloc_every - self.cfg.blame_prepare_iters # 10 iters earlier to prepare for blame
             compute_blame = (step < self.strategy.reloc_stop_iter
-                                and (step-1) % self.strategy.reloc_every > blame_start_mod) \
+                                and (step-1) % self.strategy.reloc_every > blame_start_mod
+                                and step > self.cfg.blame_start_iter) \
                                     or self.cfg.always_compute_blame
             anchor_blame = calculate_blames(batch_state, 
                                             N=N, K=K, 
@@ -336,11 +355,13 @@ class Runner:
             blame_fn = lambda x: normalize(x["anchor_blame"])
 
             # ---------------------------- different policies ---------------------------- #
-            self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))
+            # self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))
+            self.densify_dead_func = opacity_thres_fn
             if step < self.cfg.blame_start_iter:
                 self.densify_prefer_func = ops_fn
             else:
-                self.densify_prefer_func = blame_fn
+                alpha = self.cfg.blame_alpha
+                self.densify_prefer_func = lambda x: alpha * blame_fn(x) + (1 - alpha) * ops_fn(x)
             
             xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_xyz', None)
             xyz_lr = xyz_lr.get_last_lr()[0] \
@@ -436,7 +457,7 @@ class Runner:
                 step == self.cfg.max_step - 1 or \
                 ((step + 1) % self.cfg.save_eval_img_every == 0 and self.cfg.save_eval_img_every > 0)
                 ) and i in selected_idx:
-                save_tensor_images_threaded(img, gt, self.log.render(f"{step}_{i}"))
+                save_tensor_images_threaded(self.img_proc_callback(img), gt, self.log.render(f"{step}_{i}"))
 
         frames = self.test_loader_gen.frames
         results_avg = {k: sum(results[k]) / len(results[k]) for k in results.keys()}

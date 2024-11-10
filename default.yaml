@@ -5,6 +5,7 @@ data:
   frame_total: 300
   resolution: 2
   cache_device: "torch" # ["cpu", "gpu", "torch"]
+  loader_mini_cache: False
   # self implemented dataloader
   max_cached_img: 1000
   # torch based data loader
@@ -17,10 +18,10 @@ data:
 
 model:
   # anchor embedding
-  anchor_num: 60000
+  anchor_num: 40000
   anchor_embed_dim: 64    # trainable embedding
   anchor_feature_dim: 64  # intermidiate feature
-  anchor_child_num: 5
+  anchor_child_num: 10
   # frame embedding
   frame_start: 0
   frame_end: 300
@@ -32,10 +33,11 @@ model:
   deform_hidden_dim: 64
   deform_depth: 8
   deform_skip: 4
-  deform_decoupled_delta: False
+  deform_decoupled_delta: True
   deform_anchor_xyz: True
   deform_child_offsets: True # deform child offsets as well
   deform_child_scales: False
+  anchor_per_frame_dxyz: False
   # neural GS MLP
   spawn_hidden_dim: 64
   spawn_xyz_bypass: False
@@ -48,14 +50,6 @@ train:
   random_seed: 103
   root: "output/cook"
   # training
-  # train frame by frame
-  incremental_routine: True
-  perframe_routine_init: 3000
-  perframe_routine_freeze: 0
-  perframe_routine_mixing: 1000
-  fenced_routine_interval: 10
-  fenced_routine_init: 5000
-  fenced_routine_iters: 4000
   max_step: 30000
   batch_size: 4
   # [anchor] learning rate
@@ -66,12 +60,17 @@ train:
   lr_anchor_embed: 0.01
   lr_anchor_xyz: 
     - 1e-3
+    - 1e-5
+    - 0
+    - 20000
+  lr_anchor_frame_dxyz:
     - 1e-4
+    - 1e-6
     - 0
     - 20000
   lr_anchor_offsets: 
     - 2e-4
-    - 2e-5
+    - 2e-6
     - 0
     - 20000
   lr_anchor_offset_extend: 7e-3
@@ -92,20 +91,31 @@ train:
   reg_scale: 0
   reg_volume: 1e-1
   reg_offset: 1e-2
+  reg_continuity: 1e-5
+  # routines
+  routine: "none"
+  perframe_routine_init: 2000
+  perframe_routine_freeze: 100
+  perframe_routine_mixing: 400
+  fenced_routine_interval: 10
+  fenced_routine_init: 5000
+  fenced_routine_iters: 4000
   # densification with MCMC relocation
-  perturb_start_iter: 1000
-  perturb_intensity: 0
+  perturb_start_iter: 500
+  perturb_intensity: 0.1
+  gradual_opt: True
+  gradual_opt_steps: 5000
   grow_rate: 0.05
   grow_start_iter: 500
-  grow_every: 200
+  grow_every: 300
   reloc_start_iter: 1000
   reloc_stop_iter: 1000000
   reloc_every: 100
-  reloc_dead_thres: 0.01
-  reloc_dead_spawns: 0
+  reloc_dead_thres: 0.005
   grad2d_for_impact: 0.1
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
-  blame_start_iter: 2000
+  blame_start_iter: 3000
+  blame_alpha: 1
   blame_prepare_iters: 10
   blame_max_gs_per_tile: 1000
   always_compute_blame: True
@@ -117,7 +127,7 @@ train:
   save_eval_img_every: 1000
   save_model_onnx: False
   test_every: 25
-  test_steps_every: 100
+  test_steps_every: 200
   test_steps:
     - 100
     - 1000

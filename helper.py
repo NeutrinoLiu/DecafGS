@@ -5,7 +5,7 @@ from omegaconf import ListConfig
 import threading
 import os
 import shutil
-from PIL import Image
+from PIL import Image, ImageFilter
 import time
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -13,6 +13,8 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torch.optim.lr_scheduler import LambdaLR
 from typing import List, Dict, Any
 from interface import Gaussians
+import numpy as np
+
 
 def cached_func(func, *args, **kwargs):
     ret = func(*args, **kwargs)
@@ -411,3 +413,11 @@ def ewma_update(d, new_kv, alpha=0.9):
             d[k] = d[k] * alpha + v * (1 - alpha)
         else:
             d[k] = v
+
+def gaussian_blur(img, radius):
+    img = img.clamp(0, 1)  # Ensure tensor is within range
+    img_pil = T.ToPILImage()(img)
+    blurred_pil = img_pil.filter(ImageFilter.GaussianBlur(radius))
+    blurred_tensor = T.ToTensor()(blurred_pil)
+    return blurred_tensor.to(img.device)
+    

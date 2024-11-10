@@ -72,6 +72,11 @@ class Deformable(nn.Module):
             ("anchor_scale_extend", para_anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
             ("anchor_opacity_decay", para_anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
+        if model_cfg.anchor_per_frame_dxyz:
+            para_anchor_frame_dxyz = nn.Parameter(
+                torch.zeros(N, self.frame_length, 3, dtype=torch.float32, device=device))
+            anchor_params.append(
+                ("anchor_frame_dxyz", para_anchor_frame_dxyz, train_cfg.lr_anchor_frame_dxyz))
         self.anchor_params = {k: v for k, v, _ in anchor_params}
         self.anchor_opts, self.anchor_lr_sched = get_adam_and_lr_sched(
             anchor_params,
@@ -171,6 +176,9 @@ class Deformable(nn.Module):
          d_offsets, 
          d_offset_extend, 
          d_scale_extend) = self.deform_mlp(embeds)
+        
+        if self.cfg.anchor_per_frame_dxyz:
+            d_xyz = self.anchor_params["anchor_frame_dxyz"][:, frame] # [N, 3]
         
         # print(f"frame {frame} embed: {frame_embed}")
         # print(f"shape of embeds: {embeds.shape}")

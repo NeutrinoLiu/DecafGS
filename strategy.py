@@ -59,7 +59,6 @@ class DecafMCMCStrategy:
         self.noise_start_iter: int = train_cfg.perturb_start_iter
 
         self.min_opacity: float = train_cfg.reloc_dead_thres
-        self.min_childs: int = train_cfg.reloc_dead_spawns
         self.verbose: bool = verbose
 
     def initialize_state(self) -> Dict[str, Any]:
@@ -144,7 +143,7 @@ class DecafMCMCStrategy:
             self._inject_noise_to_position(
                 state=state,
                 aks_params=aks_params,
-                intensity=self.noise_intensity * anchor_xyz_lr,
+                intensity=self.noise_intensity,
                 idx=apply_noise_idx,
                 idx_ops=idx_ops, # always use opacity for noise adding
             )
@@ -259,7 +258,7 @@ class DecafMCMCStrategy:
         assert idx_ops.shape[0] == idx.shape[0], f"shape mismatch, {idx_ops.shape[0]} != {idx.shape[0]}"
         noise_resistance = op_sigmoid(1 - idx_ops).unsqueeze(1)
         noise = torch.randn_like(aks_params["anchor_xyz"][idx]) \
-                 * noise_resistance * intensity * aks_params["anchor_scale_extend"][idx]
+                 * noise_resistance * intensity * aks_params["anchor_offset_extend"][idx]
         
         aks_params["anchor_xyz"][idx] += noise
 
