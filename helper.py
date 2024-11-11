@@ -455,6 +455,9 @@ def calculate_grads(
 
 def normalize(v, eps=1e-6):
     return (v - v.min()) / (v.max() - v.min() + eps)
+def standardize(v, eps=1e-6):
+    ret = ((v - v.mean()) / (v.std() + eps) + 1) /2
+    return torch.clamp(ret, 0, 1)
 
 def ewma_update(d, new_kv, alpha=0.9):
     for k, v in new_kv.items():

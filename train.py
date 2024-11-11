@@ -28,7 +28,7 @@ from examples.utils import set_random_seed, rgb_to_sh
 from strategy import DecafMCMCStrategy
 from dataset import SceneReader, DataManager, dataset_split
 from interface import Gaussians, Camera
-from pipeline import DecafPipeline
+from pipeline_res import DecafPipeline
 
 from helper import (LogDirMgr, 
                     save_tensor_images_threaded,
@@ -36,6 +36,7 @@ from helper import (LogDirMgr,
                     calculate_blames,
                     opacity_analysis,
                     normalize,
+                    standardize,
                     ewma_update,
                     dict_update,
                     gaussian_blur,
@@ -101,7 +102,8 @@ class Runner:
             train_cfg=train_cfg,
             model_cfg=model_cfg,
             init_pts=torch.Tensor(self.scene.init_pts).float(),
-            device=self.device
+            device=self.device,
+            T_max=300
         )
 
         # ------------------------- other training schedulers ------------------------ #
@@ -348,17 +350,20 @@ class Runner:
             })
 
             # ------------------------ relocate and densification ------------------------ #
+
+            rescale = standardize
+
             opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
-            blame_thres_fn = lambda x: normalize(x["anchor_blame"]) < 0.1
+            blame_thres_fn = lambda x: rescale(x["anchor_blame"]) < 0.1
             mask_lowest_fn = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
                                             0, torch.topk(
-                                                normalize(x["anchor_opacity"]), 
+                                                rescale(x["anchor_opacity"]), 
                                                 N // 20, largest=False).indices, True
                                         )
-            grad_ops_mixing_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
-                                (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
-            ops_fn = lambda x: normalize(x["anchor_opacity"])
-            blame_fn = lambda x: normalize(x["anchor_blame"])
+            grad_ops_mixing_fn = lambda x: self.cfg.grad2d_for_impact * rescale(x["anchor_grad2d"]) + \
+                                (1 - self.cfg.grad2d_for_impact) * rescale(x["anchor_opacity"])
+            ops_fn = lambda x: rescale(x["anchor_opacity"])
+            blame_fn = lambda x: rescale(x["anchor_blame"])
 
             # ---------------------------- different policies ---------------------------- #
             # self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))

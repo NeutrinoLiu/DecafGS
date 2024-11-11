@@ -25,7 +25,7 @@ model:
   # frame embedding
   frame_start: 0
   frame_end: 300
-  frame_embed_dim: 200    # trainable embedding
+  frame_embed_dim: 0    # trainable embedding
   frame_embed_entangle_range: 0 # per frame embed is weighted avg of nearby frames 
   # accumulative embedding
   embed_accumulative: False # accumulate frame embedding
@@ -77,6 +77,7 @@ train:
   lr_anchor_scale_extend: 7e-3
   lr_anchor_opacity_decay: 1e-2
   # [neural GS] learning rate
+  lr_mlp_resfield: 8e-4
   lr_mlp_scales: 0.004
   lr_mlp_quats: 0.004
   lr_mlp_opacities:
@@ -114,9 +115,9 @@ train:
   reloc_dead_thres: 0.005
   grad2d_for_impact: 0.1
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
-  blame_enabled: False
+  blame_enabled: True
   blame_start_iter: 3000
-  blame_alpha: 1
+  blame_alpha: 0.5
   blame_max_gs_per_tile: 1000
   state_ewma_alpha: 0.9
   # evaluation
@@ -126,9 +127,8 @@ train:
   save_eval_img_every: 1000
   save_model_onnx: False
   test_every: 25
-  test_steps_every: 200
+  test_steps_every: 500
   test_steps:
-    - 100
     - 1000
     - 2500
     - 5000
