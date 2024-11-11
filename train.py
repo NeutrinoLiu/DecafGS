@@ -37,6 +37,7 @@ from helper import (LogDirMgr,
                     opacity_analysis,
                     normalize,
                     ewma_update,
+                    dict_update,
                     gaussian_blur,
                     )
 from helper_viewer import ViewerMgr
@@ -152,7 +153,7 @@ class Runner:
 
     def img_proc_callback(self, img):
         if self.cfg.gradual_opt:
-            init_r = 10
+            init_r = 5
             final_r = 1
             final_step = self.cfg.gradual_opt_steps
             if self.step > final_step:
@@ -258,6 +259,7 @@ class Runner:
                 "info": [],
                 "img": [],
                 "gt": [],
+                "frames": [],
             }
             K = self.model.deform.anchor_params['anchor_offsets'].shape[1]
             N = self.model.deform.anchor_params['anchor_offsets'].shape[0]
@@ -268,6 +270,10 @@ class Runner:
             gts = data[1].to(self.device, non_blocking=True)
 
             for cam, gt in zip(cams, gts):
+
+                # random save once gt
+                # if random.random() < 0.1:
+                #     save_tensor_images_threaded(gt, None, f"./blured_{step}.png")
 
                 pc, aks = self.model.produce(cam)
                 img, _, info = self.single_render(
@@ -290,6 +296,7 @@ class Runner:
                     metrics["offset"] += torch.mean(ak_radius)                                  # [1]
 
                 batch_state["ops"].append(pc.opacities)
+                batch_state["frames"].append(cam.frame)
                 batch_state["info"].append(info)
                 if self.cfg.grad2d_for_impact > 0:
                     info[key_for_gradient].retain_grad()
@@ -315,39 +322,38 @@ class Runner:
             
             # ------------------- use batch state update training state ------------------ #
 
-            (anchor_avg_childs,
-             anchor_opacity) = opacity_analysis(batch_state, K, self.cfg.reloc_dead_thres)
+            (anchor_childs,
+             anchor_opacity) = opacity_analysis(batch_state, K,
+                                                self.cfg.reloc_dead_thres,
+                                                per_frame=True)
             (anchor_grad2d, 
-             anchor_count) = calculate_grads(batch_state, N=N, K=K, device=self.device)
+             anchor_count) = calculate_grads(batch_state,
+                                             N=N, K=K,
+                                             device=self.device,
+                                             per_frame=True)
             
-            blame_start_mod = self.strategy.reloc_every - self.cfg.blame_prepare_iters # 10 iters earlier to prepare for blame
-            compute_blame = (step < self.strategy.reloc_stop_iter
-                                and (step-1) % self.strategy.reloc_every > blame_start_mod
-                                and step > self.cfg.blame_start_iter) \
-                                    or self.cfg.always_compute_blame
             anchor_blame = calculate_blames(batch_state, 
                                             N=N, K=K, 
                                             device=self.device,
-                                            max_gs_per_tile=self.cfg.blame_max_gs_per_tile) \
-                if compute_blame else None
+                                            max_gs_per_tile=self.cfg.blame_max_gs_per_tile,
+                                            per_frame=True) \
+                if self.cfg.blame_enabled else None
 
-            ewma_update(self.state, {
-                "anchor_opacity": anchor_opacity,
-                "anchor_childs": anchor_avg_childs,
+            snapshot = dict_update(self.state, {
+                "anchor_blame": anchor_blame,
                 "anchor_grad2d": anchor_grad2d,
                 "anchor_count": anchor_count,
-                "anchor_blame": anchor_blame
-            }, self.cfg.state_ewma_alpha)
+                "anchor_opacity": anchor_opacity,
+                "anchor_childs": anchor_childs,
+            })
 
             # ------------------------ relocate and densification ------------------------ #
             opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
             blame_thres_fn = lambda x: normalize(x["anchor_blame"]) < 0.1
             mask_lowest_fn = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
-                                            0, 
-                                            torch.topk(
-                                                normalize(x["anchor_opacity"]) + x["anchor_blame"], 
-                                                N // 20, largest=False).indices,
-                                            True
+                                            0, torch.topk(
+                                                normalize(x["anchor_opacity"]), 
+                                                N // 20, largest=False).indices, True
                                         )
             grad_ops_mixing_fn = lambda x: self.cfg.grad2d_for_impact * normalize(x["anchor_grad2d"]) + \
                                 (1 - self.cfg.grad2d_for_impact) * normalize(x["anchor_opacity"])
@@ -357,11 +363,11 @@ class Runner:
             # ---------------------------- different policies ---------------------------- #
             # self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))
             self.densify_dead_func = opacity_thres_fn
-            if step < self.cfg.blame_start_iter:
-                self.densify_prefer_func = ops_fn
-            else:
+            if self.cfg.blame_enabled and step > self.cfg.blame_start_iter:
                 alpha = self.cfg.blame_alpha
                 self.densify_prefer_func = lambda x: alpha * blame_fn(x) + (1 - alpha) * ops_fn(x)
+            else:
+                self.densify_prefer_func = ops_fn
             
             xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_xyz', None)
             xyz_lr = xyz_lr.get_last_lr()[0] \
@@ -384,8 +390,8 @@ class Runner:
             with torch.no_grad():
 
                 if step % 400 == 0 and self.cfg.tb_histogram > 0:
-                    self.writer.add_histogram("train/gs_opacities", anchor_opacity, step)
-                    self.writer.add_histogram("train/grads2d", anchor_grad2d, step)
+                    self.writer.add_histogram("train/gs_opacities", snapshot["anchor_opacity"], step)
+                    self.writer.add_histogram("train/grads2d", snapshot["anchor_grad2d"], step)
                     self.writer.add_histogram("train/childs_offsets", gs_offsets.flatten().clamp(-1,1), step) # last offsets in the batch
 
                 self.writer.add_scalar("loss/loss", loss.item(), step)
@@ -394,8 +400,8 @@ class Runner:
                         self.writer.add_scalar(f"loss/reg:{k}", v * weights[k], step)
 
                 self.writer.add_scalar("runtime/time", time.time() - tic, step)
-                self.writer.add_scalar("runtime/active_gs", torch.sum(anchor_avg_childs), step)
-                self.writer.add_scalar("runtime/average_child", torch.mean(anchor_avg_childs), step)
+                self.writer.add_scalar("runtime/active_gs", torch.sum(snapshot["anchor_childs"]), step)
+                self.writer.add_scalar("runtime/average_child", torch.mean(snapshot["anchor_childs"]), step)
 
                 if len(self.train_loader_gen.frames) > 1:
                     frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]

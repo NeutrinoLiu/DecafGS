@@ -33,7 +33,7 @@ model:
   deform_hidden_dim: 64
   deform_depth: 8
   deform_skip: 4
-  deform_decoupled_delta: True
+  deform_decoupled_delta: False
   deform_anchor_xyz: True
   deform_child_offsets: True # deform child offsets as well
   deform_child_scales: False
@@ -102,27 +102,26 @@ train:
   fenced_routine_iters: 4000
   # densification with MCMC relocation
   perturb_start_iter: 500
-  perturb_intensity: 0.1
-  gradual_opt: True
+  perturb_intensity: 0
+  gradual_opt: False
   gradual_opt_steps: 5000
   grow_rate: 0.05
   grow_start_iter: 500
-  grow_every: 300
-  reloc_start_iter: 1000
+  grow_every: 100
+  reloc_start_iter: 500
   reloc_stop_iter: 1000000
   reloc_every: 100
   reloc_dead_thres: 0.005
   grad2d_for_impact: 0.1
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
+  blame_enabled: False
   blame_start_iter: 3000
   blame_alpha: 1
-  blame_prepare_iters: 10
   blame_max_gs_per_tile: 1000
-  always_compute_blame: True
   state_ewma_alpha: 0.9
   # evaluation
   tb_histogram: False
-  tb_per_frame_psnr: True
+  tb_per_frame_psnr: False
   save_eval_img: False
   save_eval_img_every: 1000
   save_model_onnx: False

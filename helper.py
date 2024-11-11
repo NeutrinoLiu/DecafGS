@@ -101,12 +101,18 @@ def save_tensor_images(img_tensor, gt_tensor, save_path):
     if not os.path.exists(dir):
         os.makedirs(dir)
 
+    # Convert tensors to PIL images
+    to_pil = T.ToPILImage()
+
+    if gt_tensor==None:
+        # save the image tensor directly
+        img_pil = to_pil(img_tensor)
+        img_pil.save(save_path)
+        return
+
     # Ensure the tensors are in the correct format
     assert img_tensor.shape == gt_tensor.shape, "Tensors must have the same shape"
     assert len(img_tensor.shape) == 3 and img_tensor.shape[0] == 3, "Tensors must be [3,H,W]"
-    
-    # Convert tensors to PIL images
-    to_pil = T.ToPILImage()
 
     # If tensors are not in range [0,1], normalize them
     if img_tensor.max() > 1.0:
@@ -237,22 +243,34 @@ def timeit(func):
 
 # -------------------- per batch analysis helper functions ------------------- #
 
-def opacity_analysis(batch_state, K, dead_thres):
-    # pc_batched is a list of pc, each pc is a Gaussians instance
-    # we need to analyse the batched pc to get the average spawn and opacity
-    anchor_avg_spawn = []
-    anchor_opacity = []
-    ops = batch_state["ops"]
-    for op in ops:
-        ops_per_anchor = op.detach().reshape(-1, K)
-        spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
-        opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
-        anchor_avg_spawn.append(spawn_per_anchor)
-        anchor_opacity.append(opacity_per_anchor)
-    anchor_avg_spawn = sum(anchor_avg_spawn) / len(ops)
-    anchor_opacity = sum(anchor_opacity) / len(ops)
+def opacity_analysis(batch_state, K, dead_thres, per_frame=False):
+    if not per_frame:
+        # pc_batched is a list of pc, each pc is a Gaussians instance
+        # we need to analyse the batched pc to get the average spawn and opacity
+        anchor_spawn = []
+        anchor_opacity = []
+        ops = batch_state["ops"]
+        for op in ops:
+            ops_per_anchor = op.detach().reshape(-1, K)
+            spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
+            opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
+            anchor_spawn.append(spawn_per_anchor)
+            anchor_opacity.append(opacity_per_anchor)
+        anchor_spawn = sum(anchor_spawn) / len(ops)
+        anchor_opacity = sum(anchor_opacity) / len(ops)
+    else:
+        # retain frame info
+        anchor_spawn = {}
+        anchor_opacity = {}
+        ops = batch_state["ops"]
+        for (op, f) in zip(ops, batch_state["frames"]):
+            ops_per_anchor = op.detach().reshape(-1, K)
+            spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
+            opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
+            anchor_spawn[f] = spawn_per_anchor
+            anchor_opacity[f] = opacity_per_anchor
 
-    return anchor_avg_spawn, anchor_opacity
+    return anchor_spawn, anchor_opacity
 
 def tile_average(image, c):
     H, W = image.shape
@@ -300,6 +318,7 @@ def calculate_blames(
         K: int,
         device,
         max_gs_per_tile: int = 1000,
+        per_frame: bool = False,
         ):
     
     topk = 200
@@ -308,10 +327,18 @@ def calculate_blames(
     batched_info = batch_state["info"]
     batched_img =  batch_state["img"]
     batched_gt = batch_state["gt"]
-    ssim_fn = StructuralSimilarityIndexMeasure(data_range=1.0, return_full_image=True).to(device)
-    blame = torch.zeros(n_gaussian, device=device)
+    batched_frames = batch_state["frames"]
 
-    for (info, img, gt) in zip(batched_info, batched_img, batched_gt):
+    ssim_fn = StructuralSimilarityIndexMeasure(data_range=1.0, return_full_image=True).to(device)
+    if per_frame:
+        blame_per_frame = {f: torch.zeros(n_gaussian, device=device) for f in batched_frames}
+    else:
+        blame = torch.zeros(n_gaussian, device=device)
+
+    for (info, img, gt, frame) in zip(batched_info, batched_img, batched_gt, batched_frames):
+
+        if per_frame:
+            blame = blame_per_frame[frame]
 
         tile_size = info["tile_size"]
 
@@ -350,7 +377,10 @@ def calculate_blames(
             gs_idx_flatten = filter_idx[culling_idx[gs_idx]]
             blame[gs_idx_flatten] += score
     
-    blame_aks = blame.reshape(-1, K).sum(dim=-1)
+    if per_frame:
+        blame_aks = {f: blame_per_frame[f].reshape(-1, K).sum(dim=-1) for f in batched_frames}
+    else:
+        blame_aks = blame.reshape(-1, K).sum(dim=-1)
 
     return blame_aks
 
@@ -362,16 +392,29 @@ def calculate_grads(
         device,
         packed: bool = True,
         absgrad: bool = True,
+        per_frame: bool = False,
     ):
         batched_info = batch_state["info"]
+        batched_frames = batch_state["frames"]
         key_for_gradient = "means2d"
         n_gaussian = K * N
         # initialize state on the first run
-        grad2d = torch.zeros(n_gaussian, device=device)
-        count = torch.zeros(n_gaussian, device=device)
+        if per_frame:
+            grad2d_per_frame = {
+                f: torch.zeros(n_gaussian, device=device) for f in batched_frames
+            }
+            count_per_frame = {
+                f: torch.zeros(n_gaussian, device=device) for f in batched_frames
+            }
+        else:
+            grad2d = torch.zeros(n_gaussian, device=device)
+            count = torch.zeros(n_gaussian, device=device)
 
-        for info in batched_info:
+        for info, frame in zip(batched_info, batched_frames):
             filter_idx = info["filter_idx"]
+            if per_frame:
+                grad2d = grad2d_per_frame[frame]
+                count = count_per_frame[frame]
 
             # normalize grads to [-1, 1] screen space
             if absgrad:
@@ -399,8 +442,14 @@ def calculate_grads(
             )
 
         # mapper from child gs to anchors
-        grad2d_aks = grad2d.reshape(-1, K).sum(dim=-1)
-        count_aks = count.reshape(-1, K).sum(dim=-1)
+        if per_frame:
+            grad2d_aks = {
+                f: grad2d_per_frame[f].reshape(-1, K).sum(dim=-1) for f in batched_frames}
+            count_aks = {
+                f: count_per_frame[f].reshape(-1, K).sum(dim=-1) for f in batched_frames}
+        else:
+            grad2d_aks = grad2d.reshape(-1, K).sum(dim=-1)
+            count_aks = count.reshape(-1, K).sum(dim=-1)
 
         return grad2d_aks, count_aks
 
@@ -413,6 +462,21 @@ def ewma_update(d, new_kv, alpha=0.9):
             d[k] = d[k] * alpha + v * (1 - alpha)
         else:
             d[k] = v
+
+def dict_update(d, new_history):
+    ret = {}
+    if d.get("history", None) is None:
+        d["history"] = {}
+    for k, hist in new_history.items():
+        if hist is None:
+            continue
+        d["history"][k] = d["history"].get(k, {})
+        d["history"][k].update(hist)
+        full_hist = d["history"][k]
+        d[k] = sum(full_hist.values()) / len(full_hist)
+        ret[k] = d[k].clone()
+    return ret
+    
 
 def gaussian_blur(img, radius):
     img = img.clamp(0, 1)  # Ensure tensor is within range
