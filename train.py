@@ -333,13 +333,13 @@ class Runner:
                                              N=N, K=K,
                                              device=self.device,
                                              per_frame=True)
-            
+            compute_blame = self.cfg.blame_enabled
             anchor_blame = calculate_blames(batch_state, 
                                             N=N, K=K, 
                                             device=self.device,
                                             max_gs_per_tile=self.cfg.blame_max_gs_per_tile,
                                             per_frame=True) \
-                if self.cfg.blame_enabled else None
+                if compute_blame else None
 
             snapshot = dict_update(self.state, {
                 "anchor_blame": anchor_blame,

@@ -116,7 +116,7 @@ train:
   grad2d_for_impact: 0.1
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   blame_enabled: True
-  blame_start_iter: 3000
+  blame_start_iter: 1000
   blame_alpha: 0.5
   blame_max_gs_per_tile: 1000
   state_ewma_alpha: 0.9
