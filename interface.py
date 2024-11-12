@@ -165,3 +165,8 @@ class Gaussians:
             "sh0": gs.sh0[mask],
             "shN": gs.shN[mask]
         }), idx
+    
+    def retain_grad(self):
+        for k, v in self._params.items():
+            if v.requires_grad:
+                v.retain_grad()

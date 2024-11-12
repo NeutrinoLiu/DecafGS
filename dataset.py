@@ -126,7 +126,11 @@ class SceneReader:
         T1 = similarity_from_cameras(c2w_batch_np)
         c2w_batch_np = transform_cameras(T1, c2w_batch_np)
         if cfg.init_type == "sfm":
-            points, points_rgb = read_ply(os.path.join(self.path, "init.ply"))
+            try:
+                pts_path = cfg.init_points
+            except:
+                pts_path = os.path.join(self.path, "init.ply")
+            points, points_rgb = read_ply(pts_path)
             points = transform_points(T1, points)
             T2 = align_principle_axes(points)
             c2w_batch_np = transform_cameras(T2, c2w_batch_np)

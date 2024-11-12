@@ -143,6 +143,23 @@ class ViewerMgr:
                 colors[mask, 2] = 0.0
                 vis_ops[mask] = 0.5
 
+            center = {
+                "means" : torch.tensor([[0,0,0]]).to(self.runner.device),
+                "quats" : torch.tensor([[1,0,0,0]]).to(self.runner.device),
+                "scales" : torch.tensor([[init_scale * 3] * 3]).to(self.runner.device),
+                "opacities" : torch.tensor([1.0]).to(self.runner.device),
+                "sh0": rgb_to_sh(torch.tensor([[1,0,0]])).to(self.runner.device).unsqueeze(1),
+                "shN": torch.zeros(1, 0, 3).to(self.runner.device),
+            }
+            box = {
+                "means" : torch.tensor([[-1,-1,-1], [-1, 1,-1], [ 1, 1,-1], [ 1,-1,-1],
+                                        [-1,-1, 1], [-1, 1, 1], [ 1, 1, 1], [ 1,-1, 1]]).to(self.runner.device),
+                "quats" : torch.tensor([[1,0,0,0]]).repeat(8, 1).to(self.runner.device),
+                "scales" : torch.tensor([[init_scale * 2] * 3]).repeat(8, 1).to(self.runner.device),
+                "opacities" : torch.tensor([1.0]).repeat(8).to(self.runner.device),
+                "sh0": rgb_to_sh(torch.tensor([[0,0,1]])).repeat(8, 1).to(self.runner.device).unsqueeze(1),
+                "shN": torch.zeros(8, 0, 3).to(self.runner.device),
+            }
             pc_dict = {
                 "means" : aks.anchor_xyz,
                 "quats" : quats,
@@ -150,6 +167,15 @@ class ViewerMgr:
                 "opacities" : vis_ops,
                 "sh0": rgb_to_sh(colors).unsqueeze(1),
                 "shN": torch.zeros(aks.anchor_xyz.shape[0], 0, 3, device=self.runner.device)
+            }
+
+            pc_dict = {
+                "means" : torch.cat([center["means"], box["means"], pc_dict["means"]], dim=0),
+                "quats" : torch.cat([center["quats"], box["quats"], pc_dict["quats"]], dim=0),
+                "scales" : torch.cat([center["scales"], box["scales"], pc_dict["scales"]], dim=0),
+                "opacities" : torch.cat([center["opacities"], box["opacities"], pc_dict["opacities"]], dim=0),
+                "sh0": torch.cat([center["sh0"], box["sh0"], pc_dict["sh0"]], dim=0),
+                "shN": torch.cat([center["shN"], box["shN"], pc_dict["shN"]], dim=0)
             }
             pc = Gaussians(pc_dict)
 

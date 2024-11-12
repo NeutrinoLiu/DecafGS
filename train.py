@@ -28,7 +28,6 @@ from examples.utils import set_random_seed, rgb_to_sh
 from strategy import DecafMCMCStrategy
 from dataset import SceneReader, DataManager, dataset_split
 from interface import Gaussians, Camera
-from pipeline_res import DecafPipeline
 
 from helper import (LogDirMgr, 
                     save_tensor_images_threaded,
@@ -99,13 +98,23 @@ class Runner:
         print(f"training frame {min_frame} ~ {max_frame}\n")
 
         # ----------------------------- model & opt init ----------------------------- #
-        self.model = DecafPipeline(
-            train_cfg=train_cfg,
-            model_cfg=model_cfg,
-            init_pts=torch.Tensor(self.scene.init_pts).float(),
-            device=self.device,
-            T_max=300
-        )
+        if model_cfg.resfield:
+            from pipeline_res import DecafPipeline
+            self.model = DecafPipeline(
+                train_cfg=train_cfg,
+                model_cfg=model_cfg,
+                init_pts=torch.Tensor(self.scene.init_pts).float(),
+                device=self.device,
+                T_max=300
+            )
+        else:
+            from pipeline import DecafPipeline
+            self.model = DecafPipeline(
+                train_cfg=train_cfg,
+                model_cfg=model_cfg,
+                init_pts=torch.Tensor(self.scene.init_pts).float(),
+                device=self.device,
+            )
 
         # ------------------------- other training schedulers ------------------------ #
 
@@ -319,7 +328,19 @@ class Runner:
                 info=info,
             )
 
+            # pc.retain_grad()
             loss.backward()
+            if False:
+                grads = {
+                    "means": pc.means.grad.norm(dim=-1).mean(),
+                    "sh0": pc.sh0.grad.norm(dim=-1).mean(),
+                    "scales": pc.scales.grad.norm(dim=-1).mean(),
+                    "quats": pc.quats.grad.norm(dim=-1).mean(),
+                    "opacities": pc.opacities.grad.abs().mean(),
+                }
+                self.writer.add_scalars("grads/grads", grads, step)
+
+
             desc = f"loss={loss.item():.3f}| anchor#={aks.anchor_xyz.shape[0]}"
             pbar.set_description(desc)
             
