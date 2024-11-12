@@ -30,7 +30,7 @@ model:
   # accumulative embedding
   embed_accumulative: False # accumulate frame embedding
   # deform MLP
-  deform_hidden_dim: 64
+  deform_hidden_dim: 128
   deform_depth: 8
   deform_skip: 4
   deform_decoupled_delta: False
@@ -39,7 +39,8 @@ model:
   deform_child_scales: False
   anchor_per_frame_dxyz: False
   # neural GS MLP
-  spawn_hidden_dim: 64
+  spawn_hidden_dim: 128
+  spawn_mlp_deeper: False
   spawn_xyz_bypass: False
   filter_by_ops: True
   view_dependent: False
@@ -57,6 +58,8 @@ train:
   lr_mlp_deform: 
     - 1e-3
     - 1e-5
+    - 0
+    - 5000
   lr_anchor_embed: 0.01
   lr_anchor_xyz: 
     - 1e-3
@@ -102,7 +105,8 @@ train:
   fenced_routine_init: 5000
   fenced_routine_iters: 4000
   # densification with MCMC relocation
-  perturb_start_iter: 500
+  perturb_all: False
+  perturb_start_iter: 1000
   perturb_intensity: 0
   gradual_opt: False
   gradual_opt_steps: 5000
@@ -117,7 +121,7 @@ train:
   scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   blame_enabled: True
   blame_start_iter: 1000
-  blame_alpha: 0.5
+  blame_alpha: 0.8
   blame_max_gs_per_tile: 1000
   state_ewma_alpha: 0.9
   # evaluation

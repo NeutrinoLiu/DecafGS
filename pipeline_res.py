@@ -245,10 +245,22 @@ class Scaffold(nn.Module):
         hidden_dim = model_cfg.spawn_hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  model_cfg.view_dependent, T_max).to(device), # scale of offset
-            "quats":     MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(), model_cfg.view_dependent, T_max).to(device),
-            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Sigmoid(),    model_cfg.view_dependent, T_max).to(device),
-            "colors":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  True, T_max).to(device)     # color must be view dependent
+            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), 
+                                     model_cfg.view_dependent,
+                                     T_max,
+                                     model_cfg.spawn_mlp_deeper).to(device), # scale of offset
+            "quats":     MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(),
+                                     model_cfg.view_dependent,
+                                     T_max,
+                                     model_cfg.spawn_mlp_deeper).to(device),
+            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Sigmoid(),
+                                     model_cfg.view_dependent,
+                                     T_max,
+                                     model_cfg.spawn_mlp_deeper).to(device),
+            "colors":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),
+                                     True,
+                                     T_max,
+                                     model_cfg.spawn_mlp_deeper).to(device)     # color must be view dependent
         })
 
         # --------------------------------- optimizer -------------------------------- #

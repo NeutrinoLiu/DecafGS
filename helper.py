@@ -83,6 +83,11 @@ class LogDirMgr:
     def _dir_builder(self, dir, fmt):
         return lambda x: os.path.join(self.root, dir, fmt(x))
 
+def threaded(fn, *args, **kwargs):
+    thread = threading.Thread(target=fn, args=args, kwargs=kwargs)
+    thread.start()
+    return thread
+
 def save_tensor_images_threaded(img_tensor, gt_tensor, save_path):
     thread = threading.Thread(target=save_tensor_images, args=(img_tensor, gt_tensor, save_path))
     thread.start()

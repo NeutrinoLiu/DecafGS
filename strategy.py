@@ -55,6 +55,7 @@ class DecafMCMCStrategy:
         self.growing_rate: float = train_cfg.grow_rate
         self.cap_max: int = max_cap
 
+        self.noise_all: bool = train_cfg.perturb_all
         self.noise_intensity: float = train_cfg.perturb_intensity
         self.noise_start_iter: int = train_cfg.perturb_start_iter
 
@@ -80,6 +81,7 @@ class DecafMCMCStrategy:
         report = {}
         dead_idx = None
         appended_idx = None
+        idx_mapping = torch.arange(aks_params["anchor_offsets"].shape[0], device=aks_params["anchor_offsets"].device)
 
         # ---------------------------------- relocate gs -------------------------------- #
         if (step < self.reloc_stop_iter
@@ -93,7 +95,7 @@ class DecafMCMCStrategy:
                 impact_func=impact_func
             )
             if n_reloacted_aks > 0:
-                # state["anchor_blame"][dead_idx] = state["anchor_blame"][target_idx]
+                idx_mapping[dead_idx] = target_idx
                 if self.verbose:
                     print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
@@ -109,10 +111,7 @@ class DecafMCMCStrategy:
                 impact_func=impact_func
             )
             if n_new_aks > 0:
-                # state["anchor_blame"] = torch.cat([
-                #     state["anchor_blame"],
-                #     state["anchor_blame"][growed_idx]
-                # ])
+                idx_mapping = torch.cat([idx_mapping, growed_idx])
                 if self.verbose:
                     print(
                         f"Step {step}: Added {n_new_aks} Anchors. "
@@ -122,28 +121,28 @@ class DecafMCMCStrategy:
             report["grew"] = n_new_aks if n_new_aks > 0 else None
 
         # --------------------------------- add noise -------------------------------- #
+
+        if self.noise_all:
+            apply_noise_idx = torch.arange(aks_params["anchor_offsets"].shape[0], device=aks_params["anchor_offsets"].device)
         if dead_idx is not None and appended_idx is None:
             apply_noise_idx = dead_idx
-            idx_ops = state["anchor_opacity"][target_idx]
         elif dead_idx is None and appended_idx is not None:
             apply_noise_idx = appended_idx
-            idx_ops = state["anchor_opacity"][growed_idx]
         elif dead_idx is not None and appended_idx is not None:
             apply_noise_idx = torch.cat([dead_idx, appended_idx])
-            idx_ops = torch.cat([
-                state["anchor_opacity"][target_idx],
-                state["anchor_opacity"][growed_idx]
-            ])
         else:
             apply_noise_idx = None
+
 
         if self.noise_intensity > 0 \
             and step >= self.noise_start_iter \
             and apply_noise_idx is not None:
+            post_opacity = state["anchor_opacity"][idx_mapping]
+            idx_ops = post_opacity[apply_noise_idx]
             self._inject_noise_to_position(
                 state=state,
                 aks_params=aks_params,
-                intensity=self.noise_intensity,
+                intensity=self.noise_intensity * anchor_xyz_lr,
                 idx=apply_noise_idx,
                 idx_ops=idx_ops, # always use opacity for noise adding
             )

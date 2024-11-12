@@ -21,18 +21,29 @@ class IngoreCam(nn.Module):
     def forward(self, x):
         return x[:, :-3]
 
-def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True, T_max=None):
+def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True, T_max=None, deeper=False):
     """
     build a 2 layer mlp module, refer to scaffold-gs
     """
     if T_max is not None:
-        return ResSequential(
-            nn.Identity() if view_dependent else IngoreCam(),
-            ResLinear(in_dim if view_dependent else in_dim - 3, hidden_dim, T_max),
-            nn.ReLU(),
-            ResLinear(hidden_dim, out_dim, T_max),
-            out_act
-        )
+        if deeper:
+            return ResSequential(
+                nn.Identity() if view_dependent else IngoreCam(),
+                ResLinear(in_dim if view_dependent else in_dim - 3, hidden_dim, T_max),
+                nn.ReLU(),
+                ResLinear(hidden_dim, hidden_dim, T_max),
+                nn.ReLU(),
+                ResLinear(hidden_dim, out_dim, T_max),
+                out_act
+            )
+        else:
+            return ResSequential(
+                nn.Identity() if view_dependent else IngoreCam(),
+                ResLinear(in_dim if view_dependent else in_dim - 3, hidden_dim, T_max),
+                nn.ReLU(),
+                ResLinear(hidden_dim, out_dim, T_max),
+                out_act
+            )
     else:
         return nn.Sequential(
             nn.Identity() if view_dependent else IngoreCam(),
