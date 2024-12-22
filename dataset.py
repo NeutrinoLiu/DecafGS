@@ -29,6 +29,7 @@ expected cams.json structure:
     axis direction follows colmap's convention
 """
 
+import functools
 import os 
 from typing import Literal, Tuple
 from plyfile import PlyData
@@ -88,13 +89,11 @@ def read_ply(ply_path):
     return points, colors
 
 class SceneReader:
-    def __init__(self, cfg, cache=None):
-        if cache == "gpu":
+    def __init__(self, cfg, loader_cache):
+        if loader_cache:
             self.cache_device = torch.device("cuda")
-        elif cache == "cpu":
-            self.cache_device = torch.device("cpu")
+            print(f"image will be cached in cuda, with max {cfg.max_cached_img} images")
         else:
-            print("no cache device set, cache disabled")
             self.cache_device = None
         self.path = cfg.data_dir
 
@@ -127,9 +126,10 @@ class SceneReader:
         c2w_batch_np = transform_cameras(T1, c2w_batch_np)
         if cfg.init_type == "sfm":
             try:
-                pts_path = cfg.init_points
+                pts_file = cfg.init_points
             except:
-                pts_path = os.path.join(self.path, "init.ply")
+                pts_file = "init.ply"
+            pts_path = os.path.join(self.path, pts_file)
             points, points_rgb = read_ply(pts_path)
             points = transform_points(T1, points)
             T2 = align_principle_axes(points)
@@ -181,15 +181,7 @@ init type: {cfg.init_type}
         assert triad[1] < self.frame_total, f"frame index {triad[1]} out of range"
         return self.cams[triad[0]][triad[1]].thumbnail(triad[2])
 
-    def get(self, cam, frame, downscale):
-        """
-        load the image from disk,
-        for torch dataloader
-        """
-        cam_obj = self.get_cam((cam, frame, downscale))
-        return self._get(cam_obj)
-
-    def _get(self, cam_obj):
+    def _get_img(self, cam_obj):
         """
         load the image from disk using OpenCV
         """
@@ -203,29 +195,26 @@ init type: {cfg.init_type}
         img = torch.from_numpy(img).permute(2, 0, 1)
         return img
 
-    # _cached_get and cached_get_batch are self-designed interface to
-    # load images from disk and cache them, yet using torch dataloader should 
-    # be more convenient
-    def _cached_get(self, 
+    def get(self, 
             cam: int, 
             frame: int,
             downscale): # -> Camera, GT image
         """
-        storage blind loader, not expected to be used directly
-        cam attr and image are loaded separately
-        since image is lazy loaded
+        cached loader
         """
-        assert self.cache_device is not None, "cache_device is not set"
         cam_obj = self.get_cam((cam, frame, downscale))
+        if self.cache_device is None:
+            return self._get_img(cam_obj)
+
         img = self.cached.get(
             (cam, frame, downscale), None)
         if img is None: # cache miss
-            img = self._get(cam_obj=cam_obj)
+            img = self._get_img(cam_obj=cam_obj)
             img = img.to(self.cache_device)
             self.cached[(cam, frame, downscale)] = img
         return img
     
-    def cached_get_batch(self, triplets: list):
+    def get_batch(self, triplets: list):
         """
         get a batch of images
         storage awared loader
@@ -247,12 +236,179 @@ init type: {cfg.init_type}
         ret_y = []
         for tri in want:
             ret_x.append(tri)
-            ret_y.append(self._cached_get(*tri))
+            ret_y.append(self.get(*tri))
         
         # a formatter for gsplat compatibility
         return ret_x, ret_y
+
+# ---------- manager who generate iters fed to training and testing ---------- #
+class DataManager:
+
+    class IterWrapper(Dataset):
+        def __init__(self,
+                    getter,
+                    sample_sequence: list,):
+            # sample_sequence: [(cam, frame, downscale), ...]
+            self.getter = getter
+            self.sequence = sample_sequence
+        def __getitem__(self, idx):
+            cam = torch.tensor(self.sequence[idx], dtype=torch.int32)
+            gt = self.getter(*self.sequence[idx])
+            return cam, gt
+        def __len__(self):
+            return len(self.sequence)
+
+    def __init__(self, 
+                 # context
+                 scene: SceneReader,
+                 # range
+                 cams_idx, 
+                 frames_idx,
+                 further_downscale=1,
+                 # options
+                 batch_size = 1,
+                 policy: Literal["random", 
+                                 "sequential",
+                                 "max_parallex"] = "sequential",
+                 num_workers = 4,
+                 use_torch_loader = False,
+                 img_proc_fn = None,
+                 ):
+        
+        self.scene = scene
+        self.policy = policy
+        self.num_workers = num_workers
+        self.use_torch_loader = use_torch_loader
+        self.img_proc_fn = img_proc_fn
+
+        self.cams = cams_idx.copy()
+        self.frames = frames_idx.copy()
+        self.downscale_base = further_downscale
+        self.batch_size_base = batch_size
+
+        self.cached_cam_dist = None
     
-class BatchLoader:
+    @property
+    def cam_dist(self):
+        if self.cached_cam_dist is None:
+            self.cached_cam_dist = np.zeros((len(self.cams), len(self.cams)))
+            for i in range(len(self.cams)):
+                for j in range(len(self.cams)):
+                    t1 = self.scene.cams[i].c2w_t
+                    t2 = self.scene.cams[j].c2w_t
+                    self.cached_cam_dist[i, j] = np.linalg.norm(t1 - t2)
+        return self.cached_cam_dist
+    
+    # ------------------------- for torch dataloader only ------------------------ #
+    # torch dataloader need an iterator to fetch data
+    # in this case, simple [get] is used to fetch single image
+    def _get_torch_iter(self, policy, info, step, downscale, batch_size, sample_nums):
+        frame_range = self.frames
+        if isinstance(policy, list):
+            p = random.choice(policy)
+            return self._get_torch_iter(p, info, step, downscale, batch_size)
+        if policy == "random":
+            frams = uniform_frame_sampler(frame_range, sample_nums)
+            cams = uniform_camera_sampler(self.cams, sample_nums)
+            seq = [(c, f, downscale) for c,f in zip(cams, frams)]
+        elif policy == "sequential":
+            seq = sequential_sampler(
+                    self.cams,
+                    frame_range,
+                    downscale)
+        elif policy == "max_parallex":
+            frames = uniform_frame_sampler(frame_range, sample_nums)
+            cams = max_parallex_sampler(self.cams, sample_nums,
+                    self.cam_dist,
+                    batch_size)
+            seq = [(c, f, downscale) for c,f in zip(cams, frames)]
+        elif policy == "screening":
+            cams = max_parallex_sampler(self.cams, sample_nums,
+                    self.cam_dist,
+                    batch_size)
+            # copy frames for twice
+            frames = np.array(frame_range.copy()).repeat(batch_size)
+            seq = [(c, f, downscale) for c,f in zip(cams, frames)]
+        else:
+            raise ValueError(f"unknown policy {policy}")
+        
+        raw_getter = self.scene.get
+
+        if self.img_proc_fn is not None:
+            getter = lambda c,f,s: self.img_proc_fn(raw_getter(c, f, s))
+        else:
+            getter = raw_getter
+
+        return DataManager.IterWrapper(getter, seq)
+    
+    # ------------------- unified api for training and testing ------------------- #
+    def gen_loader(self, info, step):
+        # we rebuild the loader every time after exhausted
+        # because we want to adjust the sampling order according to (info, step)
+        if self.use_torch_loader:
+            num_iters = max(len(self.frames), 100)
+            if isinstance(self.policy, str):
+                sample_nums = num_iters * self.batch_size_base
+                torch_iter = self._get_torch_iter(
+                    self.policy, 
+                    info,
+                    step,
+                    self.downscale_base,
+                    self.batch_size_base,
+                    sample_nums)
+                batch_size = self.batch_size_base
+            else:
+                torch_iter = None
+                for s, p in self.policy.items():
+                    if step < s:
+                        if p.startswith("downsample"):
+                            ratio = int(p.split("_")[1])
+                            batch_size = self.batch_size_base * ratio
+                            downscale = self.downscale_base * ratio
+                            sample_nums = num_iters * batch_size
+                            torch_iter = self._get_torch_iter(
+                                ["max_parallex"],
+                                info,
+                                step,
+                                downscale,
+                                batch_size,
+                                sample_nums)
+                        else:
+                            sample_nums = num_iters * self.batch_size_base
+                            torch_iter = self._get_torch_iter(
+                                p,
+                                info,
+                                step,
+                                self.downscale_base,
+                                self.batch_size_base)
+                            batch_size = self.batch_size_base
+                        break
+                assert torch_iter is not None, f"no specified policy for step {step}"
+
+            loader = DataLoader(
+                        torch_iter,
+                        batch_size=batch_size,
+                        shuffle=False,                  # follow our own sampling order
+                        num_workers=self.num_workers,
+                        pin_memory=True,
+                    )
+        else:
+            policy_mapping = {
+                "random": "random",
+                "sequential": "sequential",
+                "max_parallex": "random"
+            }
+            loader = PlainLoader(
+                self.scene.get_batch,
+                self.cams,
+                self.frames,
+                self.downscale_base,
+                self.batch_size_base,
+                policy_mapping[self.policy]
+            )
+        return loader
+
+class PlainLoader:
     def __init__(self, 
                  getter,
                  # range
@@ -291,191 +447,3 @@ class BatchLoader:
         batch = self._pool[:self.batch_size]
         self._pool = self._pool[self.batch_size:]
         return self.getter(batch)
-
-class DataIter(Dataset):
-    def __init__(self,
-                 getter,
-                 sample_sequence: list,):
-        # sample_sequence: [(cam, frame, downscale), ...]
-        self.getter = getter
-        self.sequence = sample_sequence
-    def __getitem__(self, idx):
-        cam = torch.tensor(self.sequence[idx], dtype=torch.int32)
-        gt = self.getter(*self.sequence[idx])
-        return cam, gt
-    def __len__(self):
-        return len(self.sequence)
-
-class DataManager:
-    def __init__(self, 
-                 # context
-                 scene: SceneReader,
-                 # range
-                 cams_idx, 
-                 frames_idx,
-                 further_downscale=1,
-                 # options
-                 batch_size = 1,
-                 policy: Literal["random", 
-                                 "sequential",
-                                 "max_parallex"] = "sequential",
-                 num_workers = 4,
-                 use_torch_loader = False,
-                 img_proc_fn = None,
-                 mini_cache = False,
-                 ):
-        
-        self.scene = scene
-        self.policy = policy
-        self.num_workers = num_workers
-        self.use_torch_loader = use_torch_loader
-        self.img_proc_fn = img_proc_fn
-
-        self.cams = cams_idx.copy()
-        self.frames = frames_idx.copy()
-        self.downscale_base = further_downscale
-        self.batch_size_base = batch_size
-
-        self.cached_loader = None
-        self.cached_cam_dist = None
-        self.cached_img = {} if mini_cache else None
-    
-    @property
-    def cam_dist(self):
-        if self.cached_cam_dist is None:
-            self.cached_cam_dist = np.zeros((len(self.cams), len(self.cams)))
-            for i in range(len(self.cams)):
-                for j in range(len(self.cams)):
-                    t1 = self.scene.cams[i].c2w_t
-                    t2 = self.scene.cams[j].c2w_t
-                    self.cached_cam_dist[i, j] = np.linalg.norm(t1 - t2)
-        return self.cached_cam_dist
-    
-    # -------------------------- for our own loader only ------------------------- #
-    # our own loader use [cached_get_batch] to load images
-    def _get_batch_loader(self):
-        if self.cached_loader is None:
-            self.cached_loader = BatchLoader(
-                self.scene.cached_get_batch,
-                self.cams,
-                self.frames,
-                self.downscale_base,
-                self.batch_size_base,
-                self.policy
-            )
-        return self.cached_loader
-
-    # ------------------------- for torch dataloader only ------------------------ #
-    # torch dataloader need an iterator to fetch data
-    # in this case, simple [get] is used to fetch single image
-    def _get_torch_iter(self, policy, info, step, downscale, batch_size, sample_nums):
-        frame_range = self.frames
-        if isinstance(policy, list):
-            p = random.choice(policy)
-            return self._get_torch_iter(p, info, step, downscale, batch_size)
-        if policy == "random":
-            frams = uniform_frame_sampler(frame_range, sample_nums)
-            cams = uniform_camera_sampler(self.cams, sample_nums)
-            seq = [(c, f, downscale) for c,f in zip(cams, frams)]
-        elif policy == "sequential":
-            seq = sequential_sampler(
-                    self.cams,
-                    frame_range,
-                    downscale)
-        elif policy == "max_parallex":
-            frames = uniform_frame_sampler(frame_range, sample_nums)
-            cams = max_parallex_sampler(self.cams, sample_nums,
-                    self.cam_dist,
-                    batch_size)
-            seq = [(c, f, downscale) for c,f in zip(cams, frames)]
-        elif policy == "screening":
-            cams = max_parallex_sampler(self.cams, sample_nums,
-                    self.cam_dist,
-                    batch_size)
-            # copy frames for twice
-            frames = np.array(frame_range.copy()).repeat(batch_size)
-            seq = [(c, f, downscale) for c,f in zip(cams, frames)]
-        else:
-            raise ValueError(f"unknown policy {policy}")
-        
-        if self.cached_img is not None:
-            raw_getter = self.cached_get
-        else:
-            raw_getter = self.scene.get
-
-        if self.img_proc_fn is not None:
-            getter = lambda c,f,s: self.img_proc_fn(raw_getter(c, f, s))
-        else:
-            getter = raw_getter
-
-        return DataIter(getter, seq)
-    
-    def cached_get(self, cam, frame, downscale):
-        """
-        load the image from disk,
-        for torch dataloader
-        """
-        if self.cached_img is not None:
-            img = self.cached_img.get(
-                (cam, frame, downscale), None)
-            if img is None:
-                img = self.scene.get(cam, frame, downscale)
-                self.cached_img[(cam, frame, downscale)] = img
-            return img
-        else:
-            return self.scene.get(cam, frame, downscale)
-    
-    # ------------------- unified api for training and testing ------------------- #
-    def gen_loader(self, info, step):
-        # we rebuild the loader every time after exhausted
-        # because we want to adjust the sampling order according to (info, step)
-        min_iters = max(len(self.frames), 100)
-        if self.use_torch_loader:
-            if isinstance(self.policy, str):
-                sample_nums = min_iters * self.batch_size_base
-                data_iter = self._get_torch_iter(
-                    self.policy, 
-                    info,
-                    step,
-                    self.downscale_base,
-                    self.batch_size_base,
-                    sample_nums)
-                batch_size = self.batch_size_base
-            else:
-                data_iter = None
-                for s, p in self.policy.items():
-                    if step < s:
-                        if p.startswith("downsample"):
-                            ratio = int(p.split("_")[1])
-                            batch_size = self.batch_size_base * ratio
-                            downscale = self.downscale_base * ratio
-                            sample_nums = min_iters * batch_size
-                            data_iter = self._get_torch_iter(
-                                ["max_parallex"],
-                                info,
-                                step,
-                                downscale,
-                                batch_size,
-                                sample_nums)
-                        else:
-                            sample_nums = min_iters * self.batch_size_base
-                            data_iter = self._get_torch_iter(
-                                p,
-                                info,
-                                step,
-                                self.downscale_base,
-                                self.batch_size_base)
-                            batch_size = self.batch_size_base
-                        break
-                assert data_iter is not None, f"no specified policy for step {step}"
-
-            loader = DataLoader(
-                        data_iter,
-                        batch_size=batch_size,
-                        shuffle=False,                  # follow our own sampling order
-                        num_workers=self.num_workers,
-                        pin_memory=True,
-                    )
-        else:
-            loader = self._get_batch_loader()
-        return loader

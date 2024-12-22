@@ -9,7 +9,7 @@ from helper import normalize
 class ViewerMgr:
     def __init__(self, runner, min_frame=0, max_frame=1):
         self.runner = runner
-        self.vis_modes = ["RGB", "childs", "densify", "ops", "avg-spawn", "avg-ops", "avg-grad", "avg-blame"]
+        self.vis_modes = ["RGB", "density", "childs", "relocate", "ops", "avg-spawn", "avg-ops", "avg-grad", "avg-blame"]
 
         self.server = viser.ViserServer(port=8080, verbose=False)
         self.viewer = nerfview.Viewer(
@@ -70,6 +70,10 @@ class ViewerMgr:
         # --------------------------- pure image rendering --------------------------- #
         if mode == "RGB":
             pc, _ = self.runner.model.produce(cam)
+        elif mode == "density":
+            pc, _ = self.runner.model.produce(cam)
+            white_color = torch.ones(pc.means.shape[0], 3, device=self.runner.device)
+            pc._params["sh0"] = rgb_to_sh(white_color).unsqueeze(1)
         # ---------------------------- childs gs rendering --------------------------- #
         elif mode == "childs":
             gs, aks = self.runner.model.produce(cam)
@@ -125,7 +129,7 @@ class ViewerMgr:
                 vis_ops = self.runner.state.get("anchor_grad2d", None)
             elif mode == "avg-blame":
                 vis_ops = self.runner.state.get("anchor_blame", None)
-            elif mode == "densify":
+            elif mode == "relocate":
                 try:
                     vis_ops = self.runner.densify_prefer_func(self.runner.state)
                     mask = self.runner.densify_dead_func(self.runner.state)

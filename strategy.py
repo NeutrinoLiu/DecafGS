@@ -44,7 +44,7 @@ class DecafMCMCStrategy:
     """
 
     def __init__(self, train_cfg, max_cap, verbose = True):
-        self.scale_decay: float = train_cfg.scale_decay
+        self.scale_decay: float = train_cfg.reloc_scale_decay
         
         self.reloc_start_iter: int = train_cfg.reloc_start_iter
         self.reloc_stop_iter: int = train_cfg.reloc_stop_iter

@@ -12,7 +12,7 @@ import hydra
 from omegaconf import OmegaConf
 import torch
 import torch.nn.functional as F
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, MultiScaleStructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torch.utils.tensorboard import SummaryWriter
 
@@ -38,7 +38,7 @@ from helper import (LogDirMgr,
                     normalize,
                     standardize,
                     ewma_update,
-                    dict_update,
+                    update_state,
                     gaussian_blur,
                     )
 from helper_viewer import ViewerMgr
@@ -61,10 +61,11 @@ class Runner:
         # ------------------------------- data loading ------------------------------- #
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        assert data_cfg.cache_device in ["torch", "cpu", "gpu"], \
-            "only support cpu/gpu cache or torch dataloader"
-        self.scene = SceneReader(data_cfg, data_cfg.cache_device)
-        self.use_torch_loader = data_cfg.cache_device == "torch"
+        assert data_cfg.loader in ["torch", "plain"], \
+            "only support torch or plain"
+        loader_cache = data_cfg.loader == "plain"
+        use_torch_loader = data_cfg.loader == "torch"
+        self.scene = SceneReader(data_cfg, loader_cache)
 
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
@@ -80,9 +81,8 @@ class Runner:
             batch_size = train_cfg.batch_size,
             policy = "max_parallex",
             num_workers=data_cfg.num_workers,
-            use_torch_loader=self.use_torch_loader,
+            use_torch_loader=use_torch_loader,
             img_proc_fn=self.img_proc_callback,
-            mini_cache=data_cfg.loader_mini_cache
             )
         self.test_loader_gen = DataManager(
             self.scene,                         # img reader
@@ -91,15 +91,15 @@ class Runner:
             batch_size = 1,
             policy = "sequential",
             num_workers=data_cfg.num_workers,
-            use_torch_loader=self.use_torch_loader
+            use_torch_loader=use_torch_loader,
             )
         
         print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
         print(f"training frame {min_frame} ~ {max_frame}\n")
 
         # ----------------------------- model & opt init ----------------------------- #
+        from pipeline import DecafPipeline
         if model_cfg.resfield:
-            from pipeline_res import DecafPipeline
             self.model = DecafPipeline(
                 train_cfg=train_cfg,
                 model_cfg=model_cfg,
@@ -108,7 +108,6 @@ class Runner:
                 T_max=300
             )
         else:
-            from pipeline import DecafPipeline
             self.model = DecafPipeline(
                 train_cfg=train_cfg,
                 model_cfg=model_cfg,
@@ -144,8 +143,7 @@ class Runner:
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
             train_cfg=train_cfg,
-            max_cap=model_cfg.anchor_num,
-            verbose=False)
+            max_cap=model_cfg.anchor_num)
         
         self.state = {}         # running state, not only for strategy
         self.state.update(
@@ -155,6 +153,7 @@ class Runner:
         self.eval_funcs = {
             "psnr": PeakSignalNoiseRatio(data_range=1.0).to(self.device),
             "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
+            "msssim": MultiScaleStructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
             "lpips": LearnedPerceptualImagePatchSimilarity(
                 net_type="alex", normalize=True).to(self.device),
         }
@@ -276,10 +275,14 @@ class Runner:
             K = self.model.deform.anchor_params['anchor_offsets'].shape[1]
             N = self.model.deform.anchor_params['anchor_offsets'].shape[0]
 
-
             cams = [self.scene.get_cam(cam).to(self.device, non_blocking=True) \
                     for cam in data[0]]
-            gts = data[1].to(self.device, non_blocking=True)
+            if isinstance(data[1], list):
+                gts = [gt.to(self.device, non_blocking=True) for gt in data[1]]
+            elif isinstance(data[1], torch.Tensor):
+                gts = data[1].to(self.device, non_blocking=True)
+            else:
+                raise ValueError(f"unexpected data[1] type {type(data[1])}")
 
             for cam, gt in zip(cams, gts):
 
@@ -310,7 +313,7 @@ class Runner:
                 batch_state["ops"].append(pc.opacities)
                 batch_state["frames"].append(cam.frame)
                 batch_state["info"].append(info)
-                if self.cfg.grad2d_for_impact > 0:
+                if self.cfg.grad2d_alpha > 0:
                     info[key_for_gradient].retain_grad()
 
                 batch_state["img"].append(img.detach())
@@ -355,7 +358,7 @@ class Runner:
                                              N=N, K=K,
                                              device=self.device,
                                              per_frame=True)
-            compute_blame = self.cfg.blame_enabled
+            compute_blame = self.cfg.blame_alpha > 0
             anchor_blame = calculate_blames(batch_state, 
                                             N=N, K=K, 
                                             device=self.device,
@@ -363,7 +366,7 @@ class Runner:
                                             per_frame=True) \
                 if compute_blame else None
 
-            snapshot = dict_update(self.state, {
+            snapshot = update_state(self.state, {
                 "anchor_blame": anchor_blame,
                 "anchor_grad2d": anchor_grad2d,
                 "anchor_count": anchor_count,
@@ -374,25 +377,26 @@ class Runner:
             # ------------------------ relocate and densification ------------------------ #
 
             rescale = standardize
-
             opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
+            opacity_count_thres_fn = lambda x: x["anchor_count"] < 0.05
             blame_thres_fn = lambda x: rescale(x["anchor_blame"]) < 0.1
             mask_lowest_fn = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
                                             0, torch.topk(
                                                 rescale(x["anchor_opacity"]), 
                                                 N // 20, largest=False).indices, True
                                         )
-            grad_ops_mixing_fn = lambda x: self.cfg.grad2d_for_impact * rescale(x["anchor_grad2d"]) + \
-                                (1 - self.cfg.grad2d_for_impact) * rescale(x["anchor_opacity"])
+            grad2d_fn = lambda x: rescale(x["anchor_grad2d"])
             ops_fn = lambda x: rescale(x["anchor_opacity"])
             blame_fn = lambda x: rescale(x["anchor_blame"])
 
-            # ---------------------------- different policies ---------------------------- #
-            # self.densify_dead_func = lambda x: torch.logical_and(opacity_thres_fn(x), blame_thres_fn(x))
+            grad2d_mixing = lambda x: self.cfg.grad2d_alpha * grad2d_fn(x) + \
+                                (1 - self.cfg.grad2d_alpha) * ops_fn(x)
+            blame_mixing = lambda x: self.cfg.blame_alpha * blame_fn(x) + \
+                                (1 - self.cfg.blame_alpha) * ops_fn(x)
+
             self.densify_dead_func = opacity_thres_fn
-            if self.cfg.blame_enabled and step > self.cfg.blame_start_iter:
-                alpha = self.cfg.blame_alpha
-                self.densify_prefer_func = lambda x: alpha * blame_fn(x) + (1 - alpha) * ops_fn(x)
+            if self.cfg.blame_alpha > 0 and step > self.cfg.blame_start_iter:
+                self.densify_prefer_func = blame_mixing
             else:
                 self.densify_prefer_func = ops_fn
             
@@ -468,7 +472,12 @@ class Runner:
         sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
 
         for i, data in enumerate(sub_bar):
-            assert data[0].shape[0] == 1, "batch size should be 1"
+            if isinstance(data[0], list):
+                assert len(data[0]) == 1, "batch size should be 1"
+            elif isinstance(data[0], torch.Tensor):
+                assert data[0].shape[0] == 1, "batch size should be 1"
+            else:
+                raise ValueError(f"unexpected data[0] type {type(data[0])}")
 
             cam = self.scene.get_cam(data[0][0]).to(
                 self.device, non_blocking=True)
@@ -498,19 +507,21 @@ class Runner:
         psnr_per_frame = {f"psnr_{frames[i]}": results["psnr"][i] for i in range(len(results["psnr"]))}
 
         # terminal print
-        print(f"\ntraining frames: {self.train_loader_gen.frames}")
-        print(f"test frames: {self.test_loader_gen.frames}")
+        # print(f"\ntraining frames: {self.train_loader_gen.frames}")
+        # print(f"test frames: {self.test_loader_gen.frames}")
         print(f"step {step}: \n{json.dumps(results_avg, indent=4)}")
         # tb print
         if not self.routine_mgr.freezed:
             self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
-            self.writer.add_scalar("eval/ssim", results_avg['ssim'] , step)
+            self.writer.add_scalar("eval/msssim", results_avg['msssim'] , step)
         if self.cfg.tb_per_frame_psnr:
             self.writer.add_scalars("eval/perframe", psnr_per_frame, step)
 
         # log print
         results.update(
-            {"step": step, "fps": results_avg['fps']}
+            {"step": step, 
+             "avg": results_avg,
+            }
         )
         with open(self.log.stat, 'a') as f:
             f.write(json.dumps(results) + '\n')

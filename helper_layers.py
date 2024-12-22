@@ -47,8 +47,7 @@ def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True, T_max
     else:
         return nn.Sequential(
             nn.Identity() if view_dependent else IngoreCam(),
-            nn.Linear(in_dim if view_dependent else in_dim - 3,
-                    hidden_dim),
+            nn.Linear(in_dim if view_dependent else in_dim - 3, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, out_dim),
             out_act

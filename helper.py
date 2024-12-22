@@ -471,7 +471,7 @@ def ewma_update(d, new_kv, alpha=0.9):
         else:
             d[k] = v
 
-def dict_update(d, new_history):
+def update_state(d, new_history):
     ret = {}
     if d.get("history", None) is None:
         d["history"] = {}

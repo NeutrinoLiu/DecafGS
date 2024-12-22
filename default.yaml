@@ -1,19 +1,18 @@
 # default config
 data:
   format: "volumetric_video"
-  data_dir: "scenes/cook"
+  data_dir: "scenes/cook_spinach"
   frame_total: 300
   resolution: 2
-  cache_device: "torch" # ["cpu", "gpu", "torch"]
-  loader_mini_cache: False
-  # self implemented dataloader
-  max_cached_img: 1000
+  loader: "torch" # "plain" if your GPU memory is large enough to load all frames
+                  # else use "torch" to load frames on the fly
+  max_cached_img: 1000 # max number of images in GPU when use plain loader
   # torch based data loader
   num_workers: 4
   min_iter_per_loader: 100
   # point cloud init
   init_type: "sfm"
-  init_points: "scenes/cook/sfm/colmap_0_points3D.ply"
+  init_points: "init.ply"
   init_random_num: 10000
   init_random_extend: 3
 
@@ -27,21 +26,21 @@ model:
   # frame embedding
   frame_start: 0
   frame_end: 300
-  frame_embed_dim: 0    # trainable embedding
+  frame_embed_dim: 200    # trainable embedding
   frame_embed_entangle_range: 0 # per frame embed is weighted avg of nearby frames 
   # accumulative embedding
   embed_accumulative: False # accumulate frame embedding
   # deform MLP
-  deform_hidden_dim: 128
+  deform_hidden_dim: 64
   deform_depth: 8
   deform_skip: 4
-  deform_decoupled_delta: False
+  deform_decoupled_delta: False     # dxyz use different embedding with feature
   deform_anchor_xyz: True
   deform_child_offsets: True # deform child offsets as well
   deform_child_scales: False
   anchor_per_frame_dxyz: False
   # neural GS MLP
-  spawn_hidden_dim: 128
+  spawn_hidden_dim: 64
   spawn_mlp_deeper: False
   spawn_xyz_bypass: False
   filter_by_ops: True
@@ -51,7 +50,7 @@ model:
 train:
   # logging
   random_seed: 103
-  root: "output/cook"
+  root: "output/cook_spinach"
   # training
   max_step: 30000
   batch_size: 4
@@ -61,7 +60,7 @@ train:
     - 1e-3
     - 1e-5
     - 0
-    - 5000
+    - 20000
   lr_anchor_embed: 0.01
   lr_anchor_xyz: 
     - 1e-3
@@ -105,7 +104,7 @@ train:
   perframe_routine_mixing: 400
   fenced_routine_interval: 10
   fenced_routine_init: 5000
-  fenced_routine_iters: 4000
+  fenced_routine_iters: 2000
   # densification with MCMC relocation
   perturb_all: False
   perturb_start_iter: 1000
@@ -118,14 +117,12 @@ train:
   reloc_start_iter: 500
   reloc_stop_iter: 1000000
   reloc_every: 100
-  reloc_dead_thres: 0.005
-  grad2d_for_impact: 0.1
-  scale_decay: 0.9 # an approximate of MCMC rescale after relocation
-  blame_enabled: True
-  blame_start_iter: 1000
-  blame_alpha: 0.8
+  reloc_dead_thres: 0.01
+  reloc_scale_decay: 0.9 # an approximate of MCMC rescale after relocation
+  grad2d_alpha: .0
+  blame_alpha: .0
+  blame_start_iter: 2000
   blame_max_gs_per_tile: 1000
-  state_ewma_alpha: 0.9
   # evaluation
   tb_histogram: False
   tb_per_frame_psnr: False

@@ -39,12 +39,11 @@ class Deformable(nn.Module):
                  train_cfg,
                  model_cfg,
                  init_pts,
-                 device,
-                 T_max=None):
+                 device):
         super(Deformable, self).__init__()
 
         self.cfg = model_cfg
-        self.resfield = True if T_max is not None else False
+        self.frame_base = model_cfg.frame_start
         self.frame_length = model_cfg.frame_end - model_cfg.frame_start
         
         # ------------------------------- anchor params ------------------------------ #
@@ -101,8 +100,7 @@ class Deformable(nn.Module):
                 further_dims=   delta_dims, 
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,
-                decoupled   =   model_cfg.deform_decoupled_delta,
-                T_max       =   T_max
+                decoupled   =   model_cfg.deform_decoupled_delta
             ).to(device)
             deform_params = [
                 ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),
@@ -150,6 +148,7 @@ class Deformable(nn.Module):
         """
         forward pass
         """
+        frame = frame - self.frame_base
         assert frame < self.frame_length, "frame out of range"
 
         # -------------------------- if none deform allowed -------------------------- #
@@ -176,8 +175,7 @@ class Deformable(nn.Module):
          d_xyz, 
          d_offsets, 
          d_offset_extend, 
-         d_scale_extend) = self.deform_mlp(embeds, frame) \
-            if self.resfield else self.deform_mlp(embeds)
+         d_scale_extend) = self.deform_mlp(embeds)
         
         if self.cfg.anchor_per_frame_dxyz:
             d_xyz = self.anchor_params["anchor_frame_dxyz"][:, frame] # [N, 3]
@@ -231,12 +229,10 @@ class Scaffold(nn.Module):
     def __init__(self, 
                  train_cfg, 
                  model_cfg,
-                 device,
-                 T_max=None):
+                 device):
         super(Scaffold, self).__init__()
 
         self.cfg = model_cfg
-        self.resfield= True if T_max is not None else False
         # ----------------------------------- mlps ----------------------------------- #
         in_dim = (model_cfg.anchor_feature_dim if model_cfg.deform_depth > 0 else 0 ) \
                 + (3 if model_cfg.spawn_xyz_bypass else 0) \
@@ -245,22 +241,10 @@ class Scaffold(nn.Module):
         hidden_dim = model_cfg.spawn_hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), 
-                                     model_cfg.view_dependent,
-                                     T_max,
-                                     model_cfg.spawn_mlp_deeper).to(device), # scale of offset
-            "quats":     MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(),
-                                     model_cfg.view_dependent,
-                                     T_max,
-                                     model_cfg.spawn_mlp_deeper).to(device),
-            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Sigmoid(),
-                                     model_cfg.view_dependent,
-                                     T_max,
-                                     model_cfg.spawn_mlp_deeper).to(device),
-            "colors":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),
-                                     True,
-                                     T_max,
-                                     model_cfg.spawn_mlp_deeper).to(device)     # color must be view dependent
+            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  model_cfg.view_dependent).to(device), # scale of offset
+            "quats":     MLP_builder(in_dim, hidden_dim, 4 * k, nn.Identity(), model_cfg.view_dependent).to(device),
+            "opacities": MLP_builder(in_dim, hidden_dim, 1 * k, nn.Sigmoid(),    model_cfg.view_dependent).to(device),
+            "colors":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),  True).to(device)     # color must be view dependent
         })
 
         # --------------------------------- optimizer -------------------------------- #
@@ -271,12 +255,10 @@ class Scaffold(nn.Module):
         ]
         self.opts, self.lr_sched = get_adam_and_lr_sched(to_be_optimized, opt_cali, train_cfg.max_step)
 
-    def forward(self, aks: Anchors, cam: Camera, t=None) -> Gaussians:
+    def forward(self, aks: Anchors, cam: Camera) -> Gaussians:
         """
         forward pass
         """
-        assert self.resfield == (t is not None), "t should be provided if resfield is True"
-
         # --------------------------- read value of anchor --------------------------- #
         means = aks.childs_xyz                                  # [N, K, 3]
         N = means.shape[0]
@@ -297,24 +279,15 @@ class Scaffold(nn.Module):
 
         # attrs
         means = means.reshape(-1, 3)                            # [N * K, 3]
-        
-        if self.resfield:
-            scales = self.mlp["scales"](fea_ob, t).reshape(N, -1, 3)
-            scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
-            scales = scales.reshape(-1, 3)                          # [N * K, 3]
-            quats = self.mlp["quats"](fea_ob, t).reshape(-1, 4)        # [N * K, 4]
-            opacities = self.mlp["opacities"](fea_ob, t).reshape(-1)   # [N * K]
-            opacities = decay(opacities, opacity_decay)
-            colors = self.mlp["colors"](fea_ob, t).reshape(-1, 3)      # [N * K, 3]
-        else:
-            scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
-            scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
-            scales = scales.reshape(-1, 3)                          # [N * K, 3]
-            quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
-            opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
-            opacities = decay(opacities, opacity_decay)
-            colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
+        scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
+        scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
+        scales = scales.reshape(-1, 3)                          # [N * K, 3]
+        quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
+        opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
+        opacities = decay(opacities, opacity_decay)
+        colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
 
+        sh_degree = 0
         # since gs_dict is simply an interface
         # dont have to wrap it with torch.nn.ParameterDict
         gs_dict = {
@@ -324,7 +297,8 @@ class Scaffold(nn.Module):
             "opacities": opacities,
             "sh0": rgb_to_sh(colors).unsqueeze(1),
             "shN": torch.zeros(means.shape[0], 
-                               0, 3,
+                               (sh_degree + 1) ** 2 - 1,
+                               3,
                                device=means.device)
         }
         return Gaussians(gs_dict)
@@ -349,27 +323,23 @@ class DecafPipeline(nn.Module):
     a wrapper of system pipeline
     parameterless nn module
     """
-    def __init__(self, train_cfg, model_cfg, init_pts, device, T_max=None):
+    def __init__(self, train_cfg, model_cfg, init_pts, device):
         super(DecafPipeline, self).__init__()
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.deform = Deformable(train_cfg,
                                  model_cfg,
                                  init_pts,
-                                 device,
-                                 T_max)
+                                 device)
         self.scaffold = Scaffold(train_cfg,
                                  model_cfg,
-                                 device, 
-                                 T_max)
+                                 device)
         self.produce = self.forward
-        self.resfield = True if T_max is not None else False
     
     def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
-        frame_idx = cam.frame - self.model_cfg.frame_start
-        aks: Anchors = self.deform(frame_idx)
-        gs: Gaussians = self.scaffold(aks, cam, frame_idx) \
-            if self.resfield else self.scaffold(aks, cam)
+        frame = cam.frame
+        aks: Anchors = self.deform(frame)
+        gs: Gaussians = self.scaffold(aks, cam)
         return gs, aks
     
     def optimize(self):
