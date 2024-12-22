@@ -291,7 +291,7 @@ class Scaffold(nn.Module):
         ob_view = cam.c2w_t.float().to(aks.device) - anchor_xyz         # [N, 3]
         ob_view = ob_view / torch.norm(ob_view, dim=-1, keepdim=True)
         if self.cfg.spawn_xyz_bypass:
-            fea_ob = torch.cat([feature, ob_view, anchor_xyz], dim=-1)
+            fea_ob = torch.cat([feature, anchor_xyz, ob_view], dim=-1)
         else:
             fea_ob = torch.cat([feature, ob_view], dim=-1)          # [N, D + 3]
 

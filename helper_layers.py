@@ -73,8 +73,8 @@ class TempoMixture(nn.Module):
         self.skip = skip
         self.decoupled = decoupled
 
-        self.mlp_w_skip = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max)
-        self.pre_delta_mlps = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max) if decoupled else None
+        self.embed_mixing_mlp = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max)
+        self.embed_mixing_mlp_2 = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max) if decoupled else None
         self.delta_mlps = nn.ModuleList(
             [ MLP_builder(
                 in_dim=out_dim,
@@ -86,8 +86,8 @@ class TempoMixture(nn.Module):
         )
     def forward(self, x, t=None):
         assert self.resfield == (t is not None), "t should be provided if and only if resfield is True"
-        feature = self.mlp_w_skip(x, t)
-        delta_input = self.pre_delta_mlps(x, t) if self.decoupled else feature
+        feature = self.embed_mixing_mlp(x, t)
+        delta_input = self.embed_mixing_mlp_2(x, t) if self.decoupled else feature
 
         delta_outputs = []
         for mlp in self.delta_mlps:
