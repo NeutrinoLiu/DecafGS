@@ -28,13 +28,16 @@ model:
   frame_end: 300
   frame_embed_dim: 200    # trainable embedding
   frame_embed_entangle_range: 0 # per frame embed is weighted avg of nearby frames 
+  # decoupled delta embedding
+  deform_delta_decoupled: False
+  anchor_delta_embed_dim: 32     # dxyz use different embedding with feature
+  frame_delta_embed_dim: 32
   # accumulative embedding
   embed_accumulative: False # accumulate frame embedding
   # deform MLP
   deform_hidden_dim: 64
   deform_depth: 8
   deform_skip: 4
-  deform_decoupled_delta: False     # dxyz use different embedding with feature
   deform_anchor_xyz: True
   deform_child_offsets: True # deform child offsets as well
   deform_child_scales: False
@@ -96,21 +99,16 @@ train:
   reg_scale: 0
   reg_volume: 1e-1
   reg_offset: 1e-2
-  reg_continuity: 1e-5
-  # routines
-  routine: "none"
-  perframe_routine_init: 2000
-  perframe_routine_freeze: 100
-  perframe_routine_mixing: 400
-  fenced_routine_interval: 10
-  fenced_routine_init: 5000
-  fenced_routine_iters: 2000
+  # routine
+  routine_first_frame_iters: 1000
+  routine_per_frame_iters: 500
+  routine_per_frame_means_iters: 200
   # densification with MCMC relocation
   perturb_all: False
   perturb_start_iter: 1000
   perturb_intensity: 0
-  gradual_opt: False
-  gradual_opt_steps: 5000
+  blur_gradual_opt: False
+  blur_gradual_opt_steps: 5000
   grow_rate: 0.05
   grow_start_iter: 500
   grow_every: 100

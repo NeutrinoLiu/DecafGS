@@ -61,7 +61,7 @@ class TempoMixture(nn.Module):
                     further_dims,
                     skip,
                     depth,
-                    decoupled=False,
+                    delta_embed_dim=0,
                     T_max=None):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
         """
@@ -71,10 +71,10 @@ class TempoMixture(nn.Module):
         assert skip < depth, "skip should be less than depth"
         self.resfield = True if T_max is not None else False
         self.skip = skip
-        self.decoupled = decoupled
+        self.decoupled_delta_embed = delta_embed_dim > 0
 
         self.embed_mixing_mlp = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max)
-        self.embed_mixing_mlp_2 = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max) if decoupled else None
+        self.embed_deform_mlp = SkippableMLP(delta_embed_dim, hidden_dim, out_dim, skip, depth, T_max) if delta_embed_dim else None
         self.delta_mlps = nn.ModuleList(
             [ MLP_builder(
                 in_dim=out_dim,
@@ -84,11 +84,15 @@ class TempoMixture(nn.Module):
                 T_max=T_max
                 ) for further_dim in further_dims ]
         )
-    def forward(self, x, t=None):
-        assert self.resfield == (t is not None), "t should be provided if and only if resfield is True"
-        feature = self.embed_mixing_mlp(x, t)
-        delta_input = self.embed_mixing_mlp_2(x, t) if self.decoupled else feature
+    def forward(self, temporal_aks_embed, delta_embed=None, t=None):
+        assert self.resfield == (t is not None), \
+            "t should be provided if and only if resfield is True"
+        assert self.decoupled_delta_embed == (delta_embed is not None), \
+            "delta_embed should be provided if and only if decoupled_delta_embed is True"
+        
+        feature = self.embed_mixing_mlp(temporal_aks_embed, t)
 
+        delta_input = self.embed_deform_mlp(delta_embed, t) if self.decoupled_delta_embed else feature
         delta_outputs = []
         for mlp in self.delta_mlps:
             delta_outputs.append(

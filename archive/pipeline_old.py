@@ -100,7 +100,7 @@ class Deformable(nn.Module):
                 further_dims=   delta_dims, 
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,
-                decoupled   =   model_cfg.deform_decoupled_delta
+                delta_embed_dim   =   model_cfg.deform_decoupled_delta
             ).to(device)
             deform_params = [
                 ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),

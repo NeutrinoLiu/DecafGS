@@ -45,6 +45,7 @@ class Deformable(nn.Module):
 
         self.cfg = model_cfg
         self.resfield = True if T_max is not None else False
+        self.delta_decoupled = True if model_cfg.deform_delta_decoupled > 0 else False
         self.frame_length = model_cfg.frame_end - model_cfg.frame_start
         
         # ------------------------------- anchor params ------------------------------ #
@@ -73,11 +74,19 @@ class Deformable(nn.Module):
             ("anchor_scale_extend", para_anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
             ("anchor_opacity_decay", para_anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
+        # -------------------------- and anchor delta embed -------------------------- #
+        if self.delta_decoupled:
+            para_anchor_delta_embed = nn.Parameter(
+                torch.zeros(N, model_cfg.anchor_delta_embed_dim, dtype=torch.float32, device=device))
+            anchor_params.append(
+                ("anchor_delta_embed", para_anchor_delta_embed, train_cfg.lr_anchor_embed))
+
         if model_cfg.anchor_per_frame_dxyz:
             para_anchor_frame_dxyz = nn.Parameter(
                 torch.zeros(N, self.frame_length, 3, dtype=torch.float32, device=device))
             anchor_params.append(
                 ("anchor_frame_dxyz", para_anchor_frame_dxyz, train_cfg.lr_anchor_frame_dxyz))
+        
         self.anchor_params = {k: v for k, v, _ in anchor_params}
         self.anchor_opts, self.anchor_lr_sched = get_adam_and_lr_sched(
             anchor_params,
@@ -90,10 +99,17 @@ class Deformable(nn.Module):
             nn.Parameter(torch.zeros(model_cfg.frame_embed_dim, dtype=torch.float32, device=device))
             for _ in range(self.frame_length)
         ]) 
-        
+        para_frame_delta_embed = nn.ParameterList([
+            nn.Parameter(torch.zeros(model_cfg.frame_delta_embed_dim, dtype=torch.float32, device=device))
+            for _ in range(self.frame_length)
+        ]) if self.delta_decoupled else None
+
         if model_cfg.deform_depth > 0:
             delta_dims = [3, 3 * K, 3, 3]
                 # d_xyz, d_offsets, d_offset_extend, d_scale_extend
+            delta_embed_dim = model_cfg.anchor_delta_embed_dim + model_cfg.frame_delta_embed_dim \
+                if self.delta_decoupled else 0
+            
             self.deform_mlp = TempoMixture(
                 in_dim      =   model_cfg.anchor_embed_dim + model_cfg.frame_embed_dim,
                 hidden_dim  =   model_cfg.deform_hidden_dim, 
@@ -101,13 +117,18 @@ class Deformable(nn.Module):
                 further_dims=   delta_dims, 
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,
-                decoupled   =   model_cfg.deform_decoupled_delta,
+                delta_embed_dim   =   delta_embed_dim,
                 T_max       =   T_max
             ).to(device)
             deform_params = [
                 ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),
                 ("mlp_deform", list(self.deform_mlp.parameters()), train_cfg.lr_mlp_deform)
             ]
+            if self.delta_decoupled:
+                deform_params.append(
+                    ("frame_delta_embed", list(para_frame_delta_embed.parameters()), train_cfg.lr_frame_embed)
+                )
+
             self.deform_params = {k: v for k, v, _ in deform_params} # list the para to keep a reference
 
             self.deform_opts, self.deform_lr_sched = get_adam_and_lr_sched(
@@ -119,6 +140,17 @@ class Deformable(nn.Module):
             self.deform_mlp = None
             self.deform_opts = {}
             self.deform_lr_sched = {}
+
+    def copy_frame_embed(self, src_frame, dst_frame):
+        """
+        copy frame embed from src to dst
+        """
+        with torch.no_grad():
+            self.deform_params["frame_embed"][dst_frame].data\
+                .copy_(self.deform_params["frame_embed"][src_frame].data)
+            if self.delta_decoupled:
+                self.deform_params["frame_delta_embed"][dst_frame].data\
+                    .copy_(self.deform_params["frame_delta_embed"][src_frame].data)
 
     def get_frame_embed(self, frame):
         """
@@ -172,12 +204,19 @@ class Deformable(nn.Module):
         embeds = torch.cat([self.anchor_params["anchor_embed"],
                             frame_embed.expand(N, -1)],
                             dim=-1)
+        
+        delta_embed = torch.cat([self.anchor_params["anchor_delta_embed"],
+                                    self.deform_params["frame_delta_embed"][frame].expand(N, -1)],
+                                    dim=-1) \
+            if self.delta_decoupled else None
+        
+        t = frame if self.resfield else None
+
         (features, 
          d_xyz, 
          d_offsets, 
          d_offset_extend, 
-         d_scale_extend) = self.deform_mlp(embeds, frame) \
-            if self.resfield else self.deform_mlp(embeds)
+         d_scale_extend) = self.deform_mlp(embeds, delta_embed, t)
         
         if self.cfg.anchor_per_frame_dxyz:
             d_xyz = self.anchor_params["anchor_frame_dxyz"][:, frame] # [N, 3]

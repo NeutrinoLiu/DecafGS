@@ -170,3 +170,13 @@ class Gaussians:
         for k, v in self._params.items():
             if v.requires_grad:
                 v.retain_grad()
+
+    def means_opt_only(self):
+        return Gaussians({
+            "means": self.means,
+            "scales": self.scales.detach(),
+            "quats": self.quats.detach(),
+            "opacities": self.opacities.detach(),
+            "sh0": self.sh0.detach(),
+            "shN": self.shN.detach()
+        })

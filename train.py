@@ -93,6 +93,9 @@ class Runner:
             num_workers=data_cfg.num_workers,
             use_torch_loader=use_torch_loader,
             )
+        self.train_loader = iter([])
+        self.test_loader = iter([])
+        
         
         print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
         print(f"training frame {min_frame} ~ {max_frame}\n")
@@ -117,28 +120,12 @@ class Runner:
 
         # ------------------------- other training schedulers ------------------------ #
 
-        self.routine_mgr = RoutineMgr(self.model, self.all_frames)
-        routine_schedule = None
-        if self.cfg.routine == "perframe":
-            routine_schedule = self.routine_mgr.frame_by_frame_routine(
-                init_phase      =   self.cfg.perframe_routine_init,
-                freeze_phase    =   self.cfg.perframe_routine_freeze,
-                mixing_phase    =   self.cfg.perframe_routine_mixing
-            )
-        elif self.cfg.routine == "fence":
-            routine_schedule = self.routine_mgr.fence_by_fence_routine(
-                fence_interval = self.cfg.fenced_routine_interval,
-                iters_shift = self.cfg.fenced_routine_init,
-                iters_per_fence = self.cfg.fenced_routine_iters
-            )
-        def routine_(step):
-            frame_range, fn = routine_schedule.get(step, (None, lambda: None))
-            if frame_range is not None:
-                fn()
-                self.train_loader_gen.frames = frame_range
-                self.test_loader_gen.frames = frame_range
-        
-        self.routine = routine_ if routine_schedule is not None else lambda x: None
+        self.routine_mgr = RoutineMgr(
+            first_frame_iters=self.cfg.routine_first_frame_iters,
+            per_frame_means_iters=self.cfg.routine_per_frame_means_iters,
+            per_frame_iters=self.cfg.routine_per_frame_iters,
+            runner=self
+        )
 
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
@@ -163,10 +150,10 @@ class Runner:
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
     def img_proc_callback(self, img):
-        if self.cfg.gradual_opt:
+        if self.cfg.blur_gradual_opt:
             init_r = 5
             final_r = 1
-            final_step = self.cfg.gradual_opt_steps
+            final_step = self.cfg.blur_gradual_opt_steps
             if self.step > final_step:
                 return img
             # expotentially decay 
@@ -226,19 +213,19 @@ class Runner:
         max_step = self.cfg.max_step
         pbar = tqdm(range(init_step, max_step))
 
-        train_loader = iter([])
+        self.train_loader = iter([])
         for step in pbar:
-            self.routine(step)
             self.step = step
             tic = self.viewer_mgr.checkin()
+            self.routine_mgr.checkin(step)
 
             # ------------------------- read train data in batch ------------------------- #
             try:
-                data = next(train_loader)
+                data = next(self.train_loader)
             except StopIteration:
-                train_loader = iter(
+                self.train_loader = iter(
                     self.train_loader_gen.gen_loader(self.state, step))
-                data = next(train_loader)
+                data = next(self.train_loader)
             
             # ------------------------------ forward pass ------------------------------ #
             # for batched, yet cam might lead to different gaussian pc
@@ -291,6 +278,8 @@ class Runner:
                 #     save_tensor_images_threaded(gt, None, f"./blured_{step}.png")
 
                 pc, aks = self.model.produce(cam)
+                if self.routine_mgr.means_opt_only():
+                    pc = pc.means_opt_only()
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
@@ -411,7 +400,7 @@ class Runner:
                 anchor_xyz_lr=xyz_lr,
                 dead_func= self.densify_dead_func,
                 impact_func= self.densify_prefer_func,
-            ) if not self.routine_mgr.freezed else {}
+            ) if not self.routine_mgr.means_opt_only() else {}
             
             self.model.optimize()
             self.model.zero_grad()
@@ -466,10 +455,10 @@ class Runner:
     def eval(self, step):
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
-        test_loader = iter(self.test_loader_gen.gen_loader({}, 0))
-        n = len(test_loader)
+        self.test_loader = iter(self.test_loader_gen.gen_loader({}, 0))
+        n = len(self.test_loader)
         selected_idx = random.sample(range(n), min(n, 10))
-        sub_bar = tqdm(test_loader, desc="evaluating", leave=False)
+        sub_bar = tqdm(self.test_loader, desc="evaluating", leave=False)
 
         for i, data in enumerate(sub_bar):
             if isinstance(data[0], list):
@@ -507,13 +496,11 @@ class Runner:
         psnr_per_frame = {f"psnr_{frames[i]}": results["psnr"][i] for i in range(len(results["psnr"]))}
 
         # terminal print
-        # print(f"\ntraining frames: {self.train_loader_gen.frames}")
-        # print(f"test frames: {self.test_loader_gen.frames}")
+        print()
         print(f"step {step}: \n{json.dumps(results_avg, indent=4)}")
         # tb print
-        if not self.routine_mgr.freezed:
-            self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
-            self.writer.add_scalar("eval/msssim", results_avg['msssim'] , step)
+        self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
+        self.writer.add_scalar("eval/msssim", results_avg['msssim'] , step)
         if self.cfg.tb_per_frame_psnr:
             self.writer.add_scalars("eval/perframe", psnr_per_frame, step)
 
