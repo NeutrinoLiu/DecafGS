@@ -18,6 +18,7 @@ data:
 
 model:
   resfield: False
+  temporal_opacity: False
   # anchor embedding
   anchor_num: 40000
   anchor_embed_dim: 64    # trainable embedding
@@ -29,9 +30,9 @@ model:
   frame_embed_dim: 200    # trainable embedding
   frame_embed_entangle_range: 0 # per frame embed is weighted avg of nearby frames 
   # decoupled delta embedding
-  deform_delta_decoupled: False
-  anchor_delta_embed_dim: 32     # dxyz use different embedding with feature
-  frame_delta_embed_dim: 32
+  deform_delta_decoupled: True
+  anchor_delta_embed_dim: 64     # dxyz use different embedding with feature
+  frame_delta_embed_dim: 200
   # accumulative embedding
   embed_accumulative: False # accumulate frame embedding
   # deform MLP
@@ -83,6 +84,9 @@ train:
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
   lr_anchor_opacity_decay: 1e-2
+  lr_anchor_opacity_mean: 1e-3
+  lr_anchor_opacity_std: 1e-3
+  lr_anchor_opacity_steepness: 1e-3
   # [neural GS] learning rate
   lr_mlp_resfield: 8e-4
   lr_mlp_scales: 0.004
@@ -100,9 +104,10 @@ train:
   reg_volume: 1e-1
   reg_offset: 1e-2
   # routine
-  routine_first_frame_iters: 1000
-  routine_per_frame_iters: 500
-  routine_per_frame_means_iters: 200
+  routine: "fence"
+  routine_first_frame_iters: 2000
+  routine_stage_1_iters: 200
+  routine_stage_2_iters: 300
   # densification with MCMC relocation
   perturb_all: False
   perturb_start_iter: 1000
@@ -118,9 +123,9 @@ train:
   reloc_dead_thres: 0.01
   reloc_scale_decay: 0.9 # an approximate of MCMC rescale after relocation
   grad2d_alpha: .0
-  blame_alpha: .0
-  blame_start_iter: 2000
-  blame_max_gs_per_tile: 1000
+  blame_alpha: .8
+  blame_start_iter: 500
+  blame_max_gs_per_tile: 500
   # evaluation
   tb_histogram: False
   tb_per_frame_psnr: False
@@ -131,19 +136,3 @@ train:
   test_steps_every: 500
   test_steps:
     - 1000
-    - 2500
-    - 5000
-    - 7500
-    - 10000
-    - 12500
-    - 15000
-    - 17500
-    - 20000
-    - 22500
-    - 25000
-    - 27500
-    - 30000
-    - 35000
-    - 40000
-    - 45000
-    - 50000

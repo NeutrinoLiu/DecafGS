@@ -34,6 +34,7 @@ from helper import (LogDirMgr,
                     threaded,
                     calculate_grads,
                     calculate_blames,
+                    calculate_ratio,
                     opacity_analysis,
                     normalize,
                     standardize,
@@ -42,7 +43,7 @@ from helper import (LogDirMgr,
                     gaussian_blur,
                     )
 from helper_viewer import ViewerMgr
-from helper_routine import RoutineMgr
+from helper_routine import RoutineMgrIncremental, RoutineMgrNull, RoutineMgrFence
 
 class Runner:
     def __init__(self, data_cfg, model_cfg, train_cfg):
@@ -70,9 +71,9 @@ class Runner:
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
             train_cfg.test_every)
-        min_frame = model_cfg.frame_start
-        max_frame = min(self.scene.frame_total, model_cfg.frame_end)
-        self.all_frames = list(range(min_frame, max_frame))
+        self.min_frame = model_cfg.frame_start
+        self.max_frame = min(self.scene.frame_total, model_cfg.frame_end)
+        self.all_frames = list(range(self.min_frame, self.max_frame))
 
         self.train_loader_gen = DataManager(
             self.scene,                         # img reader
@@ -98,15 +99,26 @@ class Runner:
         
         
         print(f"totally {len(train_cam_idx)}+{len(test_cam_idx)} cams")
-        print(f"training frame {min_frame} ~ {max_frame}\n")
+        print(f"training frame [{self.min_frame} ~ {self.max_frame})\n")
 
         # ----------------------------- model & opt init ----------------------------- #
+
+        N = self.scene.init_pts.shape[0]
+        frame_length = self.max_frame - self.min_frame
+        init_pts_timestamp = ((self.scene.init_pts_frame - self.min_frame) / frame_length) \
+            if self.scene.init_pts_frame is not None else (0.5 * np.ones(N))
+        
+        init_pts_timespan = ((self.scene.init_pts_frame_span - self.min_frame) / frame_length) \
+            if self.scene.init_pts_frame_span is not None else (1.0 * np.ones(N))
+
         from pipeline import DecafPipeline
         if model_cfg.resfield:
             self.model = DecafPipeline(
                 train_cfg=train_cfg,
                 model_cfg=model_cfg,
                 init_pts=torch.Tensor(self.scene.init_pts).float(),
+                init_pts_time=torch.Tensor(init_pts_timestamp).float(),
+                init_pts_time_span=torch.Tensor(init_pts_timespan).float(),
                 device=self.device,
                 T_max=300
             )
@@ -115,18 +127,34 @@ class Runner:
                 train_cfg=train_cfg,
                 model_cfg=model_cfg,
                 init_pts=torch.Tensor(self.scene.init_pts).float(),
+                init_pts_time=torch.Tensor(init_pts_timestamp).float(),
+                init_pts_time_span=torch.Tensor(init_pts_timespan).float(),
                 device=self.device,
             )
 
         # ------------------------- other training schedulers ------------------------ #
 
-        self.routine_mgr = RoutineMgr(
-            first_frame_iters=self.cfg.routine_first_frame_iters,
-            per_frame_means_iters=self.cfg.routine_per_frame_means_iters,
-            per_frame_iters=self.cfg.routine_per_frame_iters,
-            runner=self
-        )
-
+        if self.cfg.routine == "incremental" or self.cfg.routine == "fence":
+            assert self.model_cfg.deform_delta_decoupled, "train.deform_delta_decoupled must be True"
+            unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
+            if self.cfg.routine == "incremental":
+                self.routine_mgr = RoutineMgrIncremental(
+                    first_frame_iters=self.cfg.routine_first_frame_iters,
+                    stage_1_iters=self.cfg.routine_stage_1_iters,
+                    stage_2_iters=self.cfg.routine_stage_2_iters,
+                    runner=self
+                )
+            elif self.cfg.routine == "fence":
+                self.routine_mgr = RoutineMgrFence(
+                    first_frame_iters=self.cfg.routine_first_frame_iters,
+                    stage_1_iters=self.cfg.routine_stage_1_iters,
+                    stage_2_iters=self.cfg.routine_stage_2_iters,
+                    init_frames=unique_frames,
+                    runner=self
+                )
+        else:
+            self.routine_mgr = RoutineMgrNull()
+            
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
             train_cfg=train_cfg,
@@ -136,7 +164,7 @@ class Runner:
         self.state.update(
             self.strategy.initialize_state())
 
-        # ----------------------------------- eval ----------------------------------- #å
+        # ----------------------------------- eval ----------------------------------- #
         self.eval_funcs = {
             "psnr": PeakSignalNoiseRatio(data_range=1.0).to(self.device),
             "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
@@ -146,7 +174,7 @@ class Runner:
         }
 
         # --------------------------------- visualize -------------------------------- #
-        self.viewer_mgr = ViewerMgr(self, min_frame, max_frame)
+        self.viewer_mgr = ViewerMgr(self, self.min_frame, self.max_frame)
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
     def img_proc_callback(self, img):
@@ -206,6 +234,12 @@ class Runner:
         info["filter_idx"] = filter_idx
 
         return img[0], alpha[0], info
+
+    def setup_loader(self, frames):
+        self.train_loader_gen.frames = frames
+        self.test_loader_gen.frames = frames
+        self.train_loader = iter([])
+        self.test_loader = iter([])
 
     @profile
     def train(self):
@@ -363,6 +397,18 @@ class Runner:
                 "anchor_childs": anchor_childs,
             })
 
+            if self.model_cfg.temporal_opacity:
+                total_frames = self.max_frame - self.min_frame
+                active_frames_bin = [1 if (f+self.min_frame) in self.train_loader_gen.frames else 0 for f in range(total_frames)]
+                active_frames_bin = torch.Tensor(active_frames_bin).to(self.device)
+                opacity_means = self.model.deform.anchor_params["anchor_opacity_mean"]
+                opacity_stds = torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_std"])
+                opacity_span_left = ((opacity_means - opacity_stds).clamp(0, 1) * total_frames).round()
+                opacity_span_right = ((opacity_means + opacity_stds).clamp(0, 1) * total_frames).round()
+                contribute_ratio = calculate_ratio(
+                    opacity_span_left, opacity_span_right, active_frames_bin)
+                assert contribute_ratio.shape[0] == N
+                self.state["anchor_opacity"] /= contribute_ratio
             # ------------------------ relocate and densification ------------------------ #
 
             rescale = standardize
@@ -408,8 +454,11 @@ class Runner:
 
             # tensorboard >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
             with torch.no_grad():
+                if step % 500 == 0:
+                    self.writer.add_histogram("train/tempo_ops_mean", self.model.deform.anchor_params["anchor_opacity_mean"], step)
+                    self.writer.add_histogram("train/tempo_ops_std", torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_std"]), step)
 
-                if step % 400 == 0 and self.cfg.tb_histogram > 0:
+                if step % 500 == 0 and self.cfg.tb_histogram > 0:
                     self.writer.add_histogram("train/gs_opacities", snapshot["anchor_opacity"], step)
                     self.writer.add_histogram("train/grads2d", snapshot["anchor_grad2d"], step)
                     self.writer.add_histogram("train/childs_offsets", gs_offsets.flatten().clamp(-1,1), step) # last offsets in the batch

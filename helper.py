@@ -78,7 +78,7 @@ class LogDirMgr:
         self.log = os.path.join(root, "log.json")
         self.stat = os.path.join(root, "stat.json")
         self.summary = os.path.join(root, "summary.json")
-        self.ckpt = self._dir_builder("ckpt", lambda x: f"ckpt_{x}.pth")
+        self.chkpt = self._dir_builder("chkpt", lambda x: f"chkpt_{x}.pth")
         self.render = self._dir_builder("render", lambda x: f"render_{x}.png")
     def _dir_builder(self, dir, fmt):
         return lambda x: os.path.join(self.root, dir, fmt(x))
@@ -265,6 +265,7 @@ def opacity_analysis(batch_state, K, dead_thres, per_frame=False):
         anchor_opacity = sum(anchor_opacity) / len(ops)
     else:
         # retain frame info
+        # opacity is camera invariant
         anchor_spawn = {}
         anchor_opacity = {}
         ops = batch_state["ops"]
@@ -493,3 +494,44 @@ def gaussian_blur(img, radius):
     blurred_tensor = T.ToTensor()(blurred_pil)
     return blurred_tensor.to(img.device)
     
+def calc_tempo_decay(x, mean, std, steepness, wider=1.):
+    # no activation for mean
+    std_wider = torch.sigmoid(std) * wider  # 0-1 to slightly wider range
+    beta = torch.sigmoid(steepness) * 10 + 1 # 1-infinity
+    exponent = - (
+        ( (x - mean) / (std_wider + 1e-6)
+        ) ** 2
+        ) ** beta
+    decay  = torch.exp(exponent)
+    # print(f"at {x}: {mean.data}, {std_wider.data}")
+    # print(f"decay is {decay.data}")
+    return decay
+
+def calculate_ratio(left, right, valid):
+    """
+    Computes the length of overlap for each data point in [left, right] with the `valid` binary tensor.
+
+    Args:
+        left (torch.Tensor): Tensor of shape (N,) representing the left bounds of the intervals.
+        right (torch.Tensor): Tensor of shape (N,) representing the right bounds of the intervals.
+        valid (torch.Tensor): Binary tensor of shape (T,) indicating valid positions (1 for valid, 0 otherwise).
+
+    Returns:
+        torch.Tensor: Tensor of shape (N,) representing the length of overlap for each interval in [left, right] with valid.
+    """
+    # Ensure left and right bounds are within the range of T
+    T = valid.size(0)
+    left_clamped = torch.clamp(left, 0, T - 1)
+    right_clamped = torch.clamp(right, 0, T - 1)
+
+    # Create a mask for all intervals
+    N = left.size(0)
+    range_tensor = torch.arange(T, device=valid.device).unsqueeze(0).expand(N, -1)
+
+    # Generate masks for each interval
+    interval_masks = (range_tensor >= left_clamped.unsqueeze(1)) & (range_tensor <= right_clamped.unsqueeze(1))
+
+    # Compute overlaps using batch matrix multiplication
+    overlaps = torch.matmul(interval_masks.float(), valid.float().unsqueeze(1)).squeeze(1).long()
+
+    return overlaps / valid.sum()

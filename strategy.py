@@ -6,7 +6,8 @@ import torch
 from gsplat.strategy.ops import _update_param_with_optimizer
 
 def compute_decay_after_split(
-        decays: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+        decays: torch.Tensor, counts: torch.Tensor,
+        naive=False) -> torch.Tensor:
     """Compute the new decay after relocating the anchor.
 
     decay_new = decay_old + log(C)
@@ -21,6 +22,8 @@ def compute_decay_after_split(
                     = exp(-precursor/decay_old) ^ C
                     = (1 - opacity_old) ^ C
     """
+    if naive:
+        return decays + math.log(0.8)
     return decays + torch.log(counts.float())
 
 class DecafMCMCStrategy:

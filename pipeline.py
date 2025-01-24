@@ -8,12 +8,17 @@ from torch import nn
 import math
 
 from examples.utils import rgb_to_sh
-from helper import get_adam_and_lr_sched, count_opt_params
+from helper import get_adam_and_lr_sched, count_opt_params, calc_tempo_decay
 from interface import Camera, Gaussians, Anchors
 from helper_layers import MLP_builder, TempoMixture
 
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
+
+def inverse_sigmoid(x, eps=1e-6):
+    """Safe inverse sigmoid with numerical stability."""
+    x = x.clamp(eps, 1-eps)
+    return torch.log(x / (1 - x))
 
 class DummyPipeline(nn.Module):
     """
@@ -39,6 +44,8 @@ class Deformable(nn.Module):
                  train_cfg,
                  model_cfg,
                  init_pts,
+                 init_pts_time,
+                 init_pts_time_span,
                  device,
                  T_max=None):
         super(Deformable, self).__init__()
@@ -50,6 +57,9 @@ class Deformable(nn.Module):
         
         # ------------------------------- anchor params ------------------------------ #
         assert init_pts.shape[-1] == 3, "init_pts should be [N, 3]"
+        assert init_pts_time.shape[0] == init_pts.shape[0], "init_pts_frame should have the same length as init_pts"
+        assert init_pts_time_span.shape[0] == init_pts_time.shape[0], "init_pts_frame_span should have the same length as init_pts_frame"
+        unique_frame = torch.unique(init_pts_time)
         anchor_xyz = init_pts
         N = anchor_xyz.shape[0]
         anchor_xyz += random_init(N, 3, 0.001) # add noise
@@ -74,6 +84,24 @@ class Deformable(nn.Module):
             ("anchor_scale_extend", para_anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
             ("anchor_opacity_decay", para_anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
+        if model_cfg.temporal_opacity:
+            # para_anchor_opacity_mean = nn.Parameter(
+            #     torch.zeros(N, dtype=torch.float32, device=device)) 
+            # para_anchor_opacity_std = nn.Parameter(
+            #     torch.zeros(N, dtype=torch.float32, device=device))
+            para_anchor_opacity_mean = nn.Parameter(
+                init_pts_time.to(device)
+                )
+            para_anchor_opacity_std = nn.Parameter(
+                inverse_sigmoid(init_pts_time_span.to(device) / 2)
+                ) # half span is the std
+            para_anchor_opacity_steepness = nn.Parameter(
+                torch.zeros(N, dtype=torch.float32, device=device))
+            anchor_params.extend([
+                ("anchor_opacity_mean", para_anchor_opacity_mean, train_cfg.lr_anchor_opacity_mean),
+                ("anchor_opacity_std", para_anchor_opacity_std, train_cfg.lr_anchor_opacity_std),
+                ("anchor_opacity_steepness", para_anchor_opacity_steepness, train_cfg.lr_anchor_opacity_steepness)])
+
         # -------------------------- and anchor delta embed -------------------------- #
         if self.delta_decoupled:
             para_anchor_delta_embed = nn.Parameter(
@@ -184,18 +212,6 @@ class Deformable(nn.Module):
         """
         assert frame < self.frame_length, "frame out of range"
 
-        # -------------------------- if none deform allowed -------------------------- #
-        if self.cfg.deform_depth == 0:
-            aks_dict = {
-                "feature": self.anchor_params["anchor_embed"],
-                "xyz": self.anchor_params["anchor_xyz"],
-                "offsets": self.anchor_params["anchor_offsets"],
-                "offset_extend": self.anchor_params["anchor_offset_extend"],
-                "scale_extend": self.anchor_params["anchor_scale_extend"],
-                "opacity_decay": self.anchor_params["anchor_opacity_decay"]
-            }
-            return Anchors(aks_dict)
-
         # ------------------------------ deform by frame ----------------------------- #
         frame_embed = self.get_frame_embed(frame)
 
@@ -237,6 +253,17 @@ class Deformable(nn.Module):
             (d_offset_extend if self.cfg.deform_child_offsets else 0)
         scale_extend = self.anchor_params["anchor_scale_extend"] + \
             (d_scale_extend if self.cfg.deform_child_scales else 0)
+        if self.cfg.temporal_opacity:
+            tt  = frame / self.frame_length
+            opacity_tempo_decay = calc_tempo_decay(
+                tt, 
+                self.anchor_params["anchor_opacity_mean"],
+                self.anchor_params["anchor_opacity_std"],
+                self.anchor_params["anchor_opacity_steepness"],
+                wider=1.2
+            )
+        else:
+            opacity_tempo_decay = torch.ones(N, dtype=torch.float32, device=xyz.device)
 
         aks_dict = {
             "feature"       : torch.cat([features, self.anchor_params["anchor_embed"]], dim=-1),
@@ -244,11 +271,12 @@ class Deformable(nn.Module):
             "offsets"       : offsets,
             "offset_extend" : offset_extend, 
             "scale_extend"  : scale_extend,
-            "opacity_decay" : self.anchor_params["anchor_opacity_decay"]        # opacity decay is general
+            "opacity_decay" : torch.exp(self.anchor_params["anchor_opacity_decay"]),
+            "opacity_tempo_decay": opacity_tempo_decay,
         }
         return Anchors(aks_dict)
 
-def decay(precursor, exp_decay):
+def decay(precursor, exp_decay, skip=False):
     """
     decay opacities
     to facilitize opacity split during densification
@@ -256,6 +284,8 @@ def decay(precursor, exp_decay):
     https://arxiv.org/abs/2404.06109
     https://arxiv.org/abs/2404.09591
     """
+    if skip:
+        return torch.clamp(precursor, 0., 1.)
     eps = 1e-6
     header = precursor / (exp_decay + eps)
     return 1 - torch.exp(-header)
@@ -322,8 +352,8 @@ class Scaffold(nn.Module):
         K = means.shape[1]
         anchor_xyz = aks.anchor_xyz                             # [N, 3]
         scales_extend = aks.scale_extend                        # [N, 3]
-        opacity_decay = aks.opacity_decay                       # [N,]
-        opacity_decay = opacity_decay.unsqueeze(1).expand(-1, K).flatten()
+        opacity_decay = aks.opacity_decay.unsqueeze(1).expand(-1, K).flatten()
+        opacity_tempo_decay = aks.opacity_tempo_decay.unsqueeze(1).expand(-1, K).flatten()
 
         # --------------------------- neural gaussian spawn -------------------------- #
         feature = aks.feature                                   # [N, D]
@@ -343,7 +373,7 @@ class Scaffold(nn.Module):
             scales = scales.reshape(-1, 3)                          # [N * K, 3]
             quats = self.mlp["quats"](fea_ob, t).reshape(-1, 4)        # [N * K, 4]
             opacities = self.mlp["opacities"](fea_ob, t).reshape(-1)   # [N * K]
-            opacities = decay(opacities, opacity_decay)
+            opacities = decay(opacities, opacity_decay) * opacity_tempo_decay
             colors = self.mlp["colors"](fea_ob, t).reshape(-1, 3)      # [N * K, 3]
         else:
             scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
@@ -351,7 +381,7 @@ class Scaffold(nn.Module):
             scales = scales.reshape(-1, 3)                          # [N * K, 3]
             quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
             opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
-            opacities = decay(opacities, opacity_decay)
+            opacities = decay(opacities,  opacity_decay) * opacity_tempo_decay
             colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
 
         # since gs_dict is simply an interface
@@ -388,13 +418,20 @@ class DecafPipeline(nn.Module):
     a wrapper of system pipeline
     parameterless nn module
     """
-    def __init__(self, train_cfg, model_cfg, init_pts, device, T_max=None):
+    def __init__(self, train_cfg, model_cfg,
+                 init_pts,
+                 init_pts_time,
+                 init_pts_time_span,
+                 device,
+                 T_max=None, chkpt=None):
         super(DecafPipeline, self).__init__()
-        self.model_cfg = model_cfg
+        self.cfg = model_cfg
         self.train_cfg = train_cfg
         self.deform = Deformable(train_cfg,
                                  model_cfg,
                                  init_pts,
+                                 init_pts_time,
+                                 init_pts_time_span,
                                  device,
                                  T_max)
         self.scaffold = Scaffold(train_cfg,
@@ -403,9 +440,11 @@ class DecafPipeline(nn.Module):
                                  T_max)
         self.produce = self.forward
         self.resfield = True if T_max is not None else False
+        if chkpt is not None:
+            self.load_chkpt(chkpt)
     
     def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
-        frame_idx = cam.frame - self.model_cfg.frame_start
+        frame_idx = cam.frame - self.cfg.frame_start
         aks: Anchors = self.deform(frame_idx)
         gs: Gaussians = self.scaffold(aks, cam, frame_idx) \
             if self.resfield else self.scaffold(aks, cam)
@@ -454,3 +493,61 @@ class DecafPipeline(nn.Module):
         ret["total"] = total
         ret["total_mem"] = total * 4 / 1024 / 1024
         return ret
+
+    def save_chkpt(self, step, path, save_opt=True, save_lr_sched=True):
+        """
+        save checkpoint
+        """
+        chkpt = {
+            "step": step,
+            "deform": self.deform.state_dict(),
+            "scaffold": self.scaffold.state_dict()
+        }
+        if save_opt:
+            chkpt["scaffold_opt"] = {}
+            for k, v in self.scaffold.opts.items():
+                chkpt["scaffold_opt"][k] = v.state_dict()
+            chkpt["deform_anchor_opt"] = {}
+            for k, v in self.deform.anchor_opts.items():
+                chkpt["deform_anchor_opt"][k] = v.state_dict()
+            chkpt["deform_deform_opt"] = {}
+            for k, v in self.deform.deform_opts.items():
+                chkpt["deform_deform_opt"][k] = v.state_dict()
+        if save_lr_sched:
+            chkpt["scaffold_lr_sched"] = {}
+            for k, v in self.scaffold.lr_sched.items():
+                chkpt["scaffold_lr_sched"][k] = v.state_dict()
+            chkpt["deform_anchor_lr_sched"] = {}
+            for k, v in self.deform.anchor_lr_sched.items():
+                chkpt["deform_anchor_lr_sched"][k] = v.state_dict()
+            chkpt["deform_deform_lr_sched"] = {}
+            for k, v in self.deform.deform_lr_sched.items():
+                chkpt["deform_deform_lr_sched"][k] = v.state_dict()
+        torch.save(chkpt, path)
+
+    def load_chkpt(self, path, load_opt=True, load_lr_sched=True):
+        """
+        load checkpoint
+        """
+        chkpt = torch.load(path)
+        self.deform.load_state_dict(chkpt["deform"])
+        self.scaffold.load_state_dict(chkpt["scaffold"])
+        if load_opt:
+            for k, v in self.scaffold.opts.items():
+                v.load_state_dict(chkpt["scaffold_opt"][k])
+            for k, v in self.deform.anchor_opts.items():
+                v.load_state_dict(chkpt["deform_anchor_opt"][k])
+            for k, v in self.deform.deform_opts.items():
+                v.load_state_dict(chkpt["deform_deform_opt"][k])
+            # todo binding the optimizer to the model
+            
+        if load_lr_sched:
+            for k, v in self.scaffold.lr_sched.items():
+                v.load_state_dict(chkpt["scaffold_lr_sched"][k])
+            for k, v in self.deform.anchor_lr_sched.items():
+                v.load_state_dict(chkpt["deform_anchor_lr_sched"][k])
+            for k, v in self.deform.deform_lr_sched.items():
+                v.load_state_dict(chkpt["deform_deform_lr_sched"][k])
+            # todo binding the lr_sched to the optimizer
+            
+        return chkpt["step"]

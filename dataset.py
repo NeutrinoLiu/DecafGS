@@ -74,7 +74,7 @@ def random_init(n, extend):
     colors = torch.rand(n, 3)
     return points, colors
 
-def read_ply(ply_path):
+def read_ply(ply_path, skip_frame_parse=False):
     """
     read point cloud from .ply file
     return two tensors: points and colors
@@ -86,7 +86,16 @@ def read_ply(ply_path):
     colors = np.stack((np.asarray(plydata.elements[0]["red"]),
                         np.asarray(plydata.elements[0]["green"]),
                         np.asarray(plydata.elements[0]["blue"])), axis=1) / 255.
-    return points, colors
+    if skip_frame_parse:
+        return points, colors, None, None
+    try:
+        frame = np.asarray(plydata.elements[0]["frame"])
+        span = np.asarray(plydata.elements[0]["span"])
+    except:
+        print(f"frame not found in {ply_path}")
+        frame = None
+        span = None
+    return points, colors, frame, span
 
 class SceneReader:
     def __init__(self, cfg, loader_cache):
@@ -130,7 +139,7 @@ class SceneReader:
             except:
                 pts_file = "init.ply"
             pts_path = os.path.join(self.path, pts_file)
-            points, points_rgb = read_ply(pts_path)
+            points, points_rgb, frame_of_pts, span_of_pts = read_ply(pts_path)
             points = transform_points(T1, points)
             T2 = align_principle_axes(points)
             c2w_batch_np = transform_cameras(T2, c2w_batch_np)
@@ -155,6 +164,10 @@ class SceneReader:
         # 3) dataset's meta data
         self.init_pts = points
         self.init_pts_rgb = points_rgb
+        self.init_pts_frame = frame_of_pts
+        self.init_pts_frame_span = span_of_pts
+        print(f"unique frames in init points: {np.unique(frame_of_pts)}")
+        print(f"unique spans in init points: {np.unique(span_of_pts)}")
         self.scene_name = os.path.basename(self.path)
         self.cam_num = len(self.cams)
         self.frame_total = cfg.frame_total

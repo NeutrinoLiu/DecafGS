@@ -65,7 +65,7 @@ class Anchors:
     """
     Higher layer wrapper of anchor dict
     """
-    required = ["feature", "xyz", "offsets", "offset_extend", "scale_extend", "opacity_decay"]
+    required = ["feature", "xyz", "offsets", "offset_extend", "scale_extend", "opacity_decay", "opacity_tempo_decay"]
     def __init__(self, params):
         assert all([k in params for k in self.required]), f"missing key in Anchors: {self.required}"
         self._params = params
@@ -106,7 +106,11 @@ class Anchors:
     @property
     def opacity_decay(self):
         # [N,]
-        return torch.exp(self._params["opacity_decay"])
+        return self._params["opacity_decay"]
+    @property
+    def opacity_tempo_decay(self):
+        # [N,]
+        return self._params["opacity_tempo_decay"]
 
 
 class Gaussians:
