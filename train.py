@@ -31,6 +31,7 @@ from interface import Gaussians, Camera
 
 from helper import (LogDirMgr, 
                     save_tensor_images_threaded,
+                    save_video,
                     threaded,
                     calculate_grads,
                     calculate_blames,
@@ -108,8 +109,12 @@ class Runner:
         init_pts_timestamp = ((self.scene.init_pts_frame - self.min_frame) / frame_length) \
             if self.scene.init_pts_frame is not None else (0.5 * np.ones(N))
         
-        init_pts_timespan = ((self.scene.init_pts_frame_span - self.min_frame) / frame_length) \
-            if self.scene.init_pts_frame_span is not None else (1.0 * np.ones(N))
+        if train_cfg.routine == "fence" and train_cfg.routine_fence_std_grow:
+            # incremental setup for the opacity span std, init span size is 2 (std=1 frame)
+            init_pts_timespan = (2 / frame_length) * np.ones(N)
+        else:
+            init_pts_timespan = (self.scene.init_pts_frame_span / frame_length) \
+                if self.scene.init_pts_frame_span is not None else (1.0 * np.ones(N))
 
         from pipeline import DecafPipeline
         if model_cfg.resfield:
@@ -136,7 +141,6 @@ class Runner:
 
         if self.cfg.routine == "incremental" or self.cfg.routine == "fence":
             assert self.model_cfg.deform_delta_decoupled, "train.deform_delta_decoupled must be True"
-            unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
             if self.cfg.routine == "incremental":
                 self.routine_mgr = RoutineMgrIncremental(
                     first_frame_iters=self.cfg.routine_first_frame_iters,
@@ -145,12 +149,14 @@ class Runner:
                     runner=self
                 )
             elif self.cfg.routine == "fence":
+                unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
                 self.routine_mgr = RoutineMgrFence(
                     first_frame_iters=self.cfg.routine_first_frame_iters,
                     stage_1_iters=self.cfg.routine_stage_1_iters,
                     stage_2_iters=self.cfg.routine_stage_2_iters,
                     init_frames=unique_frames,
-                    runner=self
+                    runner=self,
+                    std_grow=self.cfg.routine_fence_std_grow
                 )
         else:
             self.routine_mgr = RoutineMgrNull()
@@ -194,6 +200,7 @@ class Runner:
                 pc: Gaussians,
                 cam: Camera,
                 permute: bool = True,
+                purturb_means: float = 0.0,
                 **kwargs): # sh_degree is expected to be provided
 
         # gsplat rasterization requires batched cams
@@ -208,9 +215,12 @@ class Runner:
         else:
             filter_idx = torch.arange(pc.means.shape[0], device=pc.device)
 
+        means = (pc.means + torch.randn_like(pc.means) * purturb_means) \
+            if purturb_means > 0 else pc.means
+
         img, alpha, info = rasterization(
             # gaussian attrs
-            means       =   pc.means,
+            means       =   means,
             quats       =   pc.quats,
             scales      =   pc.scales,
             opacities   =   pc.opacities,
@@ -314,9 +324,12 @@ class Runner:
                 pc, aks = self.model.produce(cam)
                 if self.routine_mgr.means_opt_only():
                     pc = pc.means_opt_only()
+                
+                means_noise = self.cfg.perturb_first_frame_intensity if step <= self.cfg.perturb_first_frame_end else 0.0
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
+                    purturb_means=means_noise,
                 ) # img and info are batched actually, but batch size = 1
 
                 metrics["l1loss"] += F.l1_loss(img[None], gt[None])
@@ -477,6 +490,12 @@ class Runner:
                     frame_embeds = torch.stack([frame_embeds[i] for i in range(len(self.train_loader_gen.frames))])
                     frame_embeds_std = torch.std(frame_embeds, dim=0)
                     self.writer.add_scalar("runtime/frame_embeds_std", frame_embeds_std.mean(), step)
+
+                    frame_delta_embeds = self.model.deform.deform_params["frame_delta_embed"] # [F, N]
+                    frame_delta_embeds = torch.stack([frame_delta_embeds[i] for i in range(len(self.train_loader_gen.frames))])
+                    frame_delta_embeds_std = torch.std(frame_delta_embeds, dim=0)
+                    self.writer.add_scalar("runtime/frame_delta_embeds_std", frame_delta_embeds_std.mean(), step)
+
                 anchor_lr = self.model.deform.anchor_lr_sched['anchor_xyz'].get_last_lr()[0]
                 self.writer.add_scalar("runtime/anchor_lr", anchor_lr, step)
                 offset_lr = self.model.deform.anchor_lr_sched['anchor_offsets'].get_last_lr()[0]
@@ -502,13 +521,17 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step):
+        last_step = step == self.cfg.max_step - 1
+
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
         self.test_loader = iter(self.test_loader_gen.gen_loader({}, 0))
         n = len(self.test_loader)
-        selected_idx = random.sample(range(n), min(n, 10))
+        selected_idx = random.sample(range(n), min(n, 10)) \
+            if not last_step else range(n)
         sub_bar = tqdm(self.test_loader, desc="evaluating", leave=False)
 
+        video_buffer = []
         for i, data in enumerate(sub_bar):
             if isinstance(data[0], list):
                 assert len(data[0]) == 1, "batch size should be 1"
@@ -534,10 +557,14 @@ class Runner:
                 results[k].append(func(img[None], gt[None]).item())  # metrics func expect batches
             if  (
                 self.cfg.save_eval_img or \
-                step == self.cfg.max_step - 1 or \
+                last_step or \
                 ((step + 1) % self.cfg.save_eval_img_every == 0 and self.cfg.save_eval_img_every > 0)
                 ) and i in selected_idx:
                 save_tensor_images_threaded(self.img_proc_callback(img), gt, self.log.render(f"{step}_{i}"))
+            if last_step or step == 9:
+                video_buffer.append(self.img_proc_callback(img))
+        if last_step or step == 9:
+            save_video(video_buffer, os.path.join(self.log.root, f"{step}.mp4"), fps=30)
 
         frames = self.test_loader_gen.frames
         results_avg = {k: sum(results[k]) / len(results[k]) for k in results.keys()}

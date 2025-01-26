@@ -59,7 +59,6 @@ class Deformable(nn.Module):
         assert init_pts.shape[-1] == 3, "init_pts should be [N, 3]"
         assert init_pts_time.shape[0] == init_pts.shape[0], "init_pts_frame should have the same length as init_pts"
         assert init_pts_time_span.shape[0] == init_pts_time.shape[0], "init_pts_frame_span should have the same length as init_pts_frame"
-        unique_frame = torch.unique(init_pts_time)
         anchor_xyz = init_pts
         N = anchor_xyz.shape[0]
         anchor_xyz += random_init(N, 3, 0.001) # add noise
@@ -141,11 +140,12 @@ class Deformable(nn.Module):
             self.deform_mlp = TempoMixture(
                 in_dim      =   model_cfg.anchor_embed_dim + model_cfg.frame_embed_dim,
                 hidden_dim  =   model_cfg.deform_hidden_dim, 
-                out_dim     =   model_cfg.anchor_feature_dim, 
+                feature_dim =   model_cfg.anchor_feature_dim, 
                 further_dims=   delta_dims, 
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,
-                delta_embed_dim   =   delta_embed_dim,
+                delta_embed_dim   = delta_embed_dim,
+                delta_deform_skip = model_cfg.deform_delta_skip,
                 T_max       =   T_max
             ).to(device)
             deform_params = [
@@ -179,6 +179,15 @@ class Deformable(nn.Module):
             if self.delta_decoupled:
                 self.deform_params["frame_delta_embed"][dst_frame].data\
                     .copy_(self.deform_params["frame_delta_embed"][src_frame].data)
+    
+    def increase_all_std(self, value):
+        """
+        grow all std
+        """
+        with torch.no_grad():
+            cur_std = torch.sigmoid(self.anchor_params["anchor_opacity_std"])
+            new_std = cur_std + value
+            self.anchor_params["anchor_opacity_std"].data = inverse_sigmoid(new_std)
 
     def get_frame_embed(self, frame):
         """

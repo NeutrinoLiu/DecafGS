@@ -6,6 +6,8 @@ import threading
 import os
 import shutil
 from PIL import Image, ImageFilter
+import cv2
+import imageio
 import time
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -65,10 +67,17 @@ class LogDirMgr:
             # overwrite = input(f"Log directory {root} already exists. Press <y> to overwrite: ")
             # workaround = overwrite.lower() != "y"
             if True:
+                soft_link = f"{root}_latest"
+                if os.path.exists(soft_link):
+                    os.remove(soft_link)
                 root = f"{root}_{cur_time()}"
+                os.makedirs(root)
+                # using shell
+                abs_root = os.path.abspath(root)
+                os.system(f"ln -s {abs_root} {soft_link}")
             else:
                 shutil.rmtree(root)
-        os.makedirs(root)
+        os.makedirs(root, exist_ok=True)
         print(f"Log directory: {root}")
 
         self.root = root
@@ -92,6 +101,32 @@ def save_tensor_images_threaded(img_tensor, gt_tensor, save_path):
     thread = threading.Thread(target=save_tensor_images, args=(img_tensor, gt_tensor, save_path))
     thread.start()
     return 
+
+def save_video(img_list, save_path, fps=30):
+    """
+    Save a list of [3,H,W] tensors as a mp4 video.
+    
+    Args:
+        img_list (List[torch.Tensor]): List of image tensors [3,H,W]
+        save_path (str): Path to save the video
+        fps (int): Frames per second
+    """
+    dir = os.path.dirname(save_path)
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+
+    height, width = img_list[0].shape[1:]
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    video = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+
+    for img in img_list:
+        img_np = img.permute(1, 2, 0).cpu().numpy() * 255
+        img_np = img_np.astype(np.uint8)
+        video.write(cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+
+    video.release()
+    print(f"Video saved to {save_path}")
+
 
 def save_tensor_images(img_tensor, gt_tensor, save_path):
     """
@@ -521,6 +556,7 @@ def calculate_ratio(left, right, valid):
     """
     # Ensure left and right bounds are within the range of T
     T = valid.size(0)
+    V = valid.sum()
     left_clamped = torch.clamp(left, 0, T - 1)
     right_clamped = torch.clamp(right, 0, T - 1)
 
@@ -533,5 +569,6 @@ def calculate_ratio(left, right, valid):
 
     # Compute overlaps using batch matrix multiplication
     overlaps = torch.matmul(interval_masks.float(), valid.float().unsqueeze(1)).squeeze(1).long()
+    overlaps = torch.clamp(overlaps, 1, V)
 
-    return overlaps / valid.sum()
+    return overlaps / V

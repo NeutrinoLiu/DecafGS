@@ -96,7 +96,7 @@ class Deformable(nn.Module):
             self.deform_mlp = TempoMixture(
                 in_dim      =   model_cfg.anchor_embed_dim + model_cfg.frame_embed_dim,
                 hidden_dim  =   model_cfg.deform_hidden_dim, 
-                out_dim     =   model_cfg.anchor_feature_dim, 
+                feature_dim     =   model_cfg.anchor_feature_dim, 
                 further_dims=   delta_dims, 
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,

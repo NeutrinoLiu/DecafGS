@@ -9,6 +9,11 @@ class RoutineMgrNull:
         return False
 
 class RoutineMgrDensify:
+    """
+    first stage train new frame only
+    second stage train all frames
+    both are no freezing
+    """
     def __init__(self,
                  first_frame_iters,
                  stage_1_iters,
@@ -65,6 +70,11 @@ class RoutineMgrDensify:
         return False
 
 class RoutineMgrIncremental:
+    """
+    first stage train position only
+    second stage train all attributes
+    both trains on current full unlocked frames
+    """
     def __init__(self,
                  first_frame_iters,
                  stage_1_iters,
@@ -117,16 +127,24 @@ class RoutineMgrIncremental:
         return False
 
 class RoutineMgrFence:
+    """
+    first stage train position only
+    second stage train all attributes
+    both trains on current full unlocked frames
+    yet expand frames as a fence
+    """
     def __init__(self,
                  first_frame_iters,
                  stage_1_iters,
                  stage_2_iters,
                  runner,
-                 init_frames):
+                 init_frames,
+                 std_grow=False):
         self.first_frame_iters = first_frame_iters
         self.stage_total_iters = stage_1_iters + stage_2_iters
         self.stage_1_iters = stage_1_iters
         self.stage_2_iters = stage_2_iters
+        self.std_grow = std_grow
         self.runner = runner
         # runtime
         self.step = None
@@ -174,6 +192,9 @@ class RoutineMgrFence:
             print(f"RoutineMgr: unlocked #{sorted(list(new_frames))}, init frame embeds")
             self.copy_embeds(
                 after_extended - new_frames, new_frames)
+            if self.std_grow:
+                total_lengths = len(self.runner.all_frames)
+                self.runner.model.deform.increase_all_std(1/total_lengths)
             print(f"RoutineMgr: flush data loaders. current training frames: {sorted(list(after_extended))}")
             self.runner.setup_loader(list(after_extended))
             

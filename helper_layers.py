@@ -21,6 +21,15 @@ class IngoreCam(nn.Module):
     def forward(self, x):
         return x[:, :-3]
 
+class TempoIdentity(nn.Module):
+    """
+    a nn module wapper for torch.identity
+    """
+    def __init__(self):
+        super(TempoIdentity, self).__init__()
+    def forward(self, x, t):
+        return x
+
 def MLP_builder(in_dim, hidden_dim, out_dim, out_act, view_dependent=True, T_max=None, deeper=False):
     """
     build a 2 layer mlp module, refer to scaffold-gs
@@ -57,12 +66,14 @@ class TempoMixture(nn.Module):
     def __init__(self,
                     in_dim,
                     hidden_dim,
-                    out_dim,
+                    feature_dim,
                     further_dims,
                     skip,
                     depth,
                     delta_embed_dim=0,
-                    T_max=None):       # insert skip connection at the input of skip-th layer
+                    delta_deform_skip=False,
+                    T_max=None,
+                    ):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
         """
         build a 2 layer mlp module, refer to scaffold-gs
@@ -73,17 +84,27 @@ class TempoMixture(nn.Module):
         self.skip = skip
         self.decoupled_delta_embed = delta_embed_dim > 0
 
-        self.embed_mixing_mlp = SkippableMLP(in_dim, hidden_dim, out_dim, skip, depth, T_max)
-        self.embed_deform_mlp = SkippableMLP(delta_embed_dim, hidden_dim, out_dim, skip, depth, T_max) if delta_embed_dim else None
+        self.embed_mixing_mlp = SkippableMLP(in_dim, hidden_dim, feature_dim, skip, depth, T_max)
+
+        # two step delta deform:
+        # - first mixing to get delta feature
+        # - then delta feature to get attribute delta
+
+        # single step delta deform:
+        # - directly get attribute delta, embed_deform_mlp is identity
+        self.embed_deform_mlp = SkippableMLP(delta_embed_dim, hidden_dim, feature_dim, skip, depth, T_max) if delta_embed_dim else None
+        if delta_deform_skip:
+            self.embed_deform_mlp = TempoIdentity()
         self.delta_mlps = nn.ModuleList(
             [ MLP_builder(
-                in_dim=out_dim,
-                hidden_dim=hidden_dim,
-                out_dim=further_dim,
-                out_act=nn.Identity(),
-                T_max=T_max
-                ) for further_dim in further_dims ]
+                in_dim      =delta_embed_dim if delta_deform_skip else feature_dim,
+                hidden_dim  =hidden_dim,
+                out_dim     =delta_dims,
+                out_act     =nn.Identity(),
+                T_max       =T_max
+                ) for delta_dims in further_dims ]
         )
+
     def forward(self, temporal_aks_embed, delta_embed=None, t=None):
         assert self.resfield == (t is not None), \
             "t should be provided if and only if resfield is True"

@@ -82,6 +82,8 @@ class DecafMCMCStrategy:
         impact_func,
     ):
         report = {}
+
+        # index tracking
         dead_idx = None
         appended_idx = None
         idx_mapping = torch.arange(aks_params["anchor_offsets"].shape[0], device=aks_params["anchor_offsets"].device)
@@ -179,13 +181,22 @@ class DecafMCMCStrategy:
         dead_idx = dead_mask.nonzero(as_tuple=True)[0]
         alive_idx = (~dead_mask).nonzero(as_tuple=True)[0]
         probs = aks_impacts[alive_idx]
+        if probs.sum() == 0 or probs.isnan().any():
+            print(state["anchor_opacity"])
+            print(f"number of nan in opacity: {state['anchor_opacity'].isnan().sum().item()}")
+            print(state["anchor_blame"])
+            print(f"number of nan in blame: {state['anchor_blame'].isnan().sum().item()}")
+            assert False, "NaN in probs"
 
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         sampled_idx = alive_idx[sampled_idx]
 
+        decays = aks_params["anchor_opacity_decay"][sampled_idx]
+        counts = torch.bincount(sampled_idx)[sampled_idx] + 1
+        # counts = torch.ones_like(decays) * 2
         new_opacity_decay = compute_decay_after_split(
-            decays = aks_params["anchor_opacity_decay"][sampled_idx],
-            counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
+            decays = decays,
+            counts = counts,
         )
         new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
         
@@ -219,6 +230,9 @@ class DecafMCMCStrategy:
         if n == 0: return 0, None, None
 
         probs = impact_func(state)
+        if probs.sum() == 0 or probs.isnan().any():
+            assert False, "NaN in probs"
+
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         new_opacity_decay = compute_decay_after_split(
             decays = aks_params["anchor_opacity_decay"][sampled_idx],
