@@ -112,14 +112,7 @@ train:
   routine_stage_1_iters: 500
   routine_stage_2_iters: 1000
   routine_fence_std_grow: False
-  perturb_intensity: 1e5
-  # useless =====
-  perturb_all: True
-  perturb_start_iter: 0
-  perturb_first_frame_intensity: 0
-  perturb_first_frame: False
-  perturb_first_frame_end: 0
-  # eof =========
+  perturb_intensity: 0
   blur_gradual_opt: False
   blur_gradual_opt_steps: 5000
   # grow and relocate
