@@ -651,7 +651,6 @@ class Runner:
 
 @hydra.main(config_path='.', config_name='default', version_base=None)
 def main(cfg):
-    print(f"Overrides: {cfg.hydra.overrides}") 
     set_random_seed(cfg.train.random_seed)
     assert True, 'sanity check'
     torch.autograd.set_detect_anomaly(True)
