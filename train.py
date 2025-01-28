@@ -7,6 +7,7 @@ from line_profiler import profile
 import os
 import math
 from tqdm import tqdm
+from functools import reduce
 import numpy as np
 import hydra
 from omegaconf import OmegaConf
@@ -36,6 +37,7 @@ from helper import (LogDirMgr,
                     calculate_grads,
                     calculate_blames,
                     calculate_ratio,
+                    calculate_perturb,
                     opacity_analysis,
                     normalize,
                     standardize,
@@ -47,12 +49,23 @@ from helper_viewer import ViewerMgr
 from helper_routine import RoutineMgrIncremental, RoutineMgrNull, RoutineMgrFence
 
 class Runner:
-    def __init__(self, data_cfg, model_cfg, train_cfg):
+    def __init__(self, cfg, chkpt=None):
 
-        self.cfg = train_cfg
+        data_cfg = cfg.data
+        model_cfg = cfg.model
+        train_cfg = cfg.train
+
+        self.cfg = cfg
+        self.train_cfg = train_cfg
         self.model_cfg = model_cfg
+        if chkpt is not None:
+            print(f"▶ checkpoint saved at step {chkpt['step']}, will resume from step {chkpt['step']+1}")
+            self.init_step = chkpt['step'] + 1
+        else:
+            self.init_step = 0
+
         # --------------------------------- setup log -------------------------------- #
-        self.log = LogDirMgr(self.cfg.root)
+        self.log = LogDirMgr(self.train_cfg.root)
         with open(self.log.config, 'w') as f:
             f.write(json.dumps({
                 "data": OmegaConf.to_container(data_cfg),
@@ -71,7 +84,7 @@ class Runner:
 
         train_cam_idx, test_cam_idx = dataset_split(
             list(range(self.scene.cam_num)),
-            train_cfg.test_every)
+            train_cfg.test_dataset_split)
         self.min_frame = model_cfg.frame_start
         self.max_frame = min(self.scene.frame_total, model_cfg.frame_end)
         self.all_frames = list(range(self.min_frame, self.max_frame))
@@ -125,7 +138,8 @@ class Runner:
                 init_pts_time=torch.Tensor(init_pts_timestamp).float(),
                 init_pts_time_span=torch.Tensor(init_pts_timespan).float(),
                 device=self.device,
-                T_max=300
+                T_max=300,
+                chkpt=chkpt["model"] if chkpt is not None else None
             )
         else:
             self.model = DecafPipeline(
@@ -135,28 +149,31 @@ class Runner:
                 init_pts_time=torch.Tensor(init_pts_timestamp).float(),
                 init_pts_time_span=torch.Tensor(init_pts_timespan).float(),
                 device=self.device,
+                chkpt=chkpt["model"] if chkpt is not None else None
             )
 
         # ------------------------- other training schedulers ------------------------ #
 
-        if self.cfg.routine == "incremental" or self.cfg.routine == "fence":
+        if self.train_cfg.routine == "incremental" or self.train_cfg.routine == "fence":
             assert self.model_cfg.deform_delta_decoupled, "train.deform_delta_decoupled must be True"
-            if self.cfg.routine == "incremental":
+            if self.train_cfg.routine == "incremental":
                 self.routine_mgr = RoutineMgrIncremental(
-                    first_frame_iters=self.cfg.routine_first_frame_iters,
-                    stage_1_iters=self.cfg.routine_stage_1_iters,
-                    stage_2_iters=self.cfg.routine_stage_2_iters,
-                    runner=self
+                    first_frame_iters=self.train_cfg.routine_first_frame_iters,
+                    stage_1_iters=self.train_cfg.routine_stage_1_iters,
+                    stage_2_iters=self.train_cfg.routine_stage_2_iters,
+                    runner=self,
+                    chkpt=chkpt["routine"] if chkpt is not None else None
                 )
-            elif self.cfg.routine == "fence":
+            elif self.train_cfg.routine == "fence":
                 unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
                 self.routine_mgr = RoutineMgrFence(
-                    first_frame_iters=self.cfg.routine_first_frame_iters,
-                    stage_1_iters=self.cfg.routine_stage_1_iters,
-                    stage_2_iters=self.cfg.routine_stage_2_iters,
+                    first_frame_iters=self.train_cfg.routine_first_frame_iters,
+                    stage_1_iters=self.train_cfg.routine_stage_1_iters,
+                    stage_2_iters=self.train_cfg.routine_stage_2_iters,
                     init_frames=unique_frames,
                     runner=self,
-                    std_grow=self.cfg.routine_fence_std_grow
+                    std_grow=self.train_cfg.routine_fence_std_grow,
+                    chkpt=chkpt["routine"] if chkpt is not None else None
                 )
         else:
             self.routine_mgr = RoutineMgrNull()
@@ -184,10 +201,10 @@ class Runner:
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
     def img_proc_callback(self, img):
-        if self.cfg.blur_gradual_opt:
+        if self.train_cfg.blur_gradual_opt:
             init_r = 5
             final_r = 1
-            final_step = self.cfg.blur_gradual_opt_steps
+            final_step = self.train_cfg.blur_gradual_opt_steps
             if self.step > final_step:
                 return img
             # expotentially decay 
@@ -200,7 +217,8 @@ class Runner:
                 pc: Gaussians,
                 cam: Camera,
                 permute: bool = True,
-                purturb_means: float = 0.0,
+                perturb_intensity: float = 0.0,
+                prior_filter_idx = None,
                 **kwargs): # sh_degree is expected to be provided
 
         # gsplat rasterization requires batched cams
@@ -210,13 +228,18 @@ class Runner:
         height = cam.height
 
         if self.model_cfg.filter_by_ops:
-            pc, filter_idx = Gaussians.filter_by_ops(pc, self.cfg.reloc_dead_thres)
+            assert prior_filter_idx is None, "filter_by_ops and prior_filter_mask cannot be both True"
+            pc, filter_idx = Gaussians.filter_by_ops(pc, self.train_cfg.reloc_dead_thres)
             # idx[i] = j means, the i-th filtered gaussian is the j-th gaussian in the original pc
+        elif prior_filter_idx is not None:
+            filter_idx = prior_filter_idx
         else:
             filter_idx = torch.arange(pc.means.shape[0], device=pc.device)
 
-        means = (pc.means + torch.randn_like(pc.means) * purturb_means) \
-            if purturb_means > 0 else pc.means
+        means = pc.means
+        if perturb_intensity > 0:
+            noise_per_gs = calculate_perturb(pc, perturb_intensity)
+            means += torch.randn_like(pc.means) * noise_per_gs
 
         img, alpha, info = rasterization(
             # gaussian attrs
@@ -253,9 +276,9 @@ class Runner:
 
     @profile
     def train(self):
-        init_step = 0
-        max_step = self.cfg.max_step
-        pbar = tqdm(range(init_step, max_step))
+        init_step = self.init_step
+        max_step = self.train_cfg.max_step
+        pbar = tqdm(range(init_step, max_step+1), initial=init_step, total=max_step, desc="training")
 
         self.train_loader = iter([])
         for step in pbar:
@@ -285,12 +308,12 @@ class Runner:
                 "offset": 0.0
             }
             weights = {
-                "l1loss": self.cfg.ssim_lambda,
-                "ssimloss": 1 - self.cfg.ssim_lambda,
-                "l1opacity": self.cfg.reg_opacity,
-                "l1scale": self.cfg.reg_scale,
-                "volume": self.cfg.reg_volume,
-                "offset": self.cfg.reg_offset
+                "l1loss": self.train_cfg.ssim_lambda,
+                "ssimloss": 1 - self.train_cfg.ssim_lambda,
+                "l1opacity": self.train_cfg.reg_opacity,
+                "l1scale": self.train_cfg.reg_scale,
+                "volume": self.train_cfg.reg_volume,
+                "offset": self.train_cfg.reg_offset
             }
 
             # running state per batch,
@@ -317,30 +340,35 @@ class Runner:
 
             for cam, gt in zip(cams, gts):
 
-                # random save once gt
-                # if random.random() < 0.1:
-                #     save_tensor_images_threaded(gt, None, f"./blured_{step}.png")
-
                 pc, aks = self.model.produce(cam)
+                aks_tempo_mask = aks.opacity_tempo_decay > 0.1
+                gs_tempo_mask = aks_tempo_mask.unsqueeze(1).expand(-1, K).reshape(-1)
+                gs_tempo_mask_idx = torch.nonzero(gs_tempo_mask).flatten()
+
                 if self.routine_mgr.means_opt_only():
                     pc = pc.means_opt_only()
                 
-                means_noise = self.cfg.perturb_first_frame_intensity if step <= self.cfg.perturb_first_frame_end else 0.0
+
+                xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_offsets', None)
+                xyz_lr = xyz_lr.get_last_lr()[0] \
+                    if xyz_lr is not None else self.train_cfg.lr_anchor_offsets
+                
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
-                    purturb_means=means_noise,
+                    perturb_intensity=self.train_cfg.perturb_intensity * xyz_lr,
+                    prior_filter_idx=gs_tempo_mask_idx if self.model_cfg.filter_by_tempo else None
                 ) # img and info are batched actually, but batch size = 1
 
                 metrics["l1loss"] += F.l1_loss(img[None], gt[None])
                 metrics["ssimloss"] += 1 - fused_ssim(img[None], gt[None], padding="valid")
-                if self.cfg.reg_opacity > 0:
+                if self.train_cfg.reg_opacity > 0:
                     metrics["l1opacity"] += torch.abs(pc.opacities).mean()
-                if self.cfg.reg_scale > 0:
+                if self.train_cfg.reg_scale > 0:
                     metrics["l1scale"] += torch.abs(pc.scales).mean()
-                if self.cfg.reg_volume > 0:
+                if self.train_cfg.reg_volume > 0:
                     metrics["volume"] += torch.prod(pc.scales, dim=1).mean()
-                if self.cfg.reg_offset > 0:
+                if self.train_cfg.reg_offset > 0:
                     offsets = aks.childs_xyz - aks.anchor_xyz.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
                     gs_offsets = torch.norm(offsets, dim=-1)                                    # [N, K]
                     ak_radius = torch.norm(gs_offsets, dim=-1) / K ** 0.5                       # [N]
@@ -349,7 +377,7 @@ class Runner:
                 batch_state["ops"].append(pc.opacities)
                 batch_state["frames"].append(cam.frame)
                 batch_state["info"].append(info)
-                if self.cfg.grad2d_alpha > 0:
+                if self.train_cfg.grad2d_alpha > 0:
                     info[key_for_gradient].retain_grad()
 
                 batch_state["img"].append(img.detach())
@@ -387,45 +415,67 @@ class Runner:
 
             (anchor_childs,
              anchor_opacity) = opacity_analysis(batch_state, K,
-                                                self.cfg.reloc_dead_thres,
+                                                self.train_cfg.reloc_dead_thres,
                                                 per_frame=True)
             (anchor_grad2d, 
              anchor_count) = calculate_grads(batch_state,
                                              N=N, K=K,
                                              device=self.device,
                                              per_frame=True)
-            compute_blame = self.cfg.blame_alpha > 0
+            compute_blame = self.train_cfg.blame_alpha > 0
             anchor_blame = calculate_blames(batch_state, 
                                             N=N, K=K, 
                                             device=self.device,
-                                            max_gs_per_tile=self.cfg.blame_max_gs_per_tile,
+                                            max_gs_per_tile=self.train_cfg.blame_max_gs_per_tile,
                                             per_frame=True) \
                 if compute_blame else None
 
-            snapshot = update_state(self.state, {
-                "anchor_blame": anchor_blame,
-                "anchor_grad2d": anchor_grad2d,
-                "anchor_count": anchor_count,
-                "anchor_opacity": anchor_opacity,
-                "anchor_childs": anchor_childs,
-            })
 
-            if self.model_cfg.temporal_opacity:
-                total_frames = self.max_frame - self.min_frame
-                active_frames_bin = [1 if (f+self.min_frame) in self.train_loader_gen.frames else 0 for f in range(total_frames)]
-                active_frames_bin = torch.Tensor(active_frames_bin).to(self.device)
-                opacity_means = self.model.deform.anchor_params["anchor_opacity_mean"]
-                opacity_stds = torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_std"])
-                opacity_span_left = ((opacity_means - opacity_stds).clamp(0, 1) * total_frames).round()
-                opacity_span_right = ((opacity_means + opacity_stds).clamp(0, 1) * total_frames).round()
-                contribute_ratio = calculate_ratio(
-                    opacity_span_left, opacity_span_right, active_frames_bin)
-                assert contribute_ratio.shape[0] == N
-                self.state["anchor_opacity"] /= contribute_ratio
+            def ele_wise_max(tensor_list):
+                res = tensor_list[0].clone()
+                for t in tensor_list[1:]:
+                    res = torch.maximum(res, t, out=res)
+                return res
+            
+            if step >= min(self.train_cfg.grow_start_iter, self.train_cfg.reloc_start_iter):
+                snapshot = update_state(
+                    self.state, 
+                    new_history = {
+                        "anchor_blame": anchor_blame,
+                        "anchor_grad2d": anchor_grad2d,
+                        "anchor_count": anchor_count,
+                        "anchor_opacity": anchor_opacity,
+                        "anchor_childs": anchor_childs,
+                    }, 
+                    special_aggr = {
+                        "anchor_opacity": lambda d: ele_wise_max(list(d.values())),
+                    })
+
+                # compensation by frame contribution
+                # if self.model_cfg.temporal_opacity:
+                #     total_frames = self.max_frame - self.min_frame
+                #     active_frames_bin = [1 if (f+self.min_frame) in self.train_loader_gen.frames else 0 for f in range(total_frames)]
+                #     active_frames_bin = torch.Tensor(active_frames_bin).to(self.device)
+                #     opacity_means = self.model.deform.anchor_params["anchor_opacity_mean"]
+                #     opacity_stds = torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_std"])
+                #     opacity_span_left = ((opacity_means - opacity_stds).clamp(0, 1) * total_frames).round()
+                #     opacity_span_right = ((opacity_means + opacity_stds).clamp(0, 1) * total_frames).round()
+                #     contribute_ratio = calculate_ratio(
+                #         opacity_span_left, opacity_span_right, active_frames_bin)
+                #     assert contribute_ratio.shape[0] == N
+                #     self.state["anchor_opacity"] /= contribute_ratio
+            else:
+                snapshot = update_state({}, {
+                    "anchor_blame": anchor_blame,
+                    "anchor_grad2d": anchor_grad2d,
+                    "anchor_count": anchor_count,
+                    "anchor_opacity": anchor_opacity,
+                    "anchor_childs": anchor_childs,
+                })
             # ------------------------ relocate and densification ------------------------ #
 
             rescale = standardize
-            opacity_thres_fn = lambda x: x["anchor_opacity"] < self.cfg.reloc_dead_thres
+            opacity_thres_fn = lambda x: x["anchor_opacity"] < self.train_cfg.reloc_dead_thres
             opacity_count_thres_fn = lambda x: x["anchor_count"] < 0.05
             blame_thres_fn = lambda x: rescale(x["anchor_blame"]) < 0.1
             mask_lowest_fn = lambda x: torch.zeros(N, dtype=torch.bool).to(self.device).scatter(
@@ -437,26 +487,22 @@ class Runner:
             ops_fn = lambda x: rescale(x["anchor_opacity"])
             blame_fn = lambda x: rescale(x["anchor_blame"])
 
-            grad2d_mixing = lambda x: self.cfg.grad2d_alpha * grad2d_fn(x) + \
-                                (1 - self.cfg.grad2d_alpha) * ops_fn(x)
-            blame_mixing = lambda x: self.cfg.blame_alpha * blame_fn(x) + \
-                                (1 - self.cfg.blame_alpha) * ops_fn(x)
+            grad2d_mixing = lambda x: self.train_cfg.grad2d_alpha * grad2d_fn(x) + \
+                                (1 - self.train_cfg.grad2d_alpha) * ops_fn(x)
+            blame_mixing = lambda x: self.train_cfg.blame_alpha * blame_fn(x) + \
+                                (1 - self.train_cfg.blame_alpha) * ops_fn(x)
 
             self.densify_dead_func = opacity_thres_fn
-            if self.cfg.blame_alpha > 0 and step > self.cfg.blame_start_iter:
+            if self.train_cfg.blame_alpha > 0 and step > self.train_cfg.blame_start_iter:
                 self.densify_prefer_func = blame_mixing
             else:
                 self.densify_prefer_func = ops_fn
             
-            xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_xyz', None)
-            xyz_lr = xyz_lr.get_last_lr()[0] \
-                if xyz_lr is not None else self.cfg.lr_anchor_xyz
             report = self.strategy.step_post_backward(
                 state=self.state,
                 aks_params=self.model.deform.anchor_params,
                 aks_opts=self.model.deform.anchor_opts,
                 step=step,
-                anchor_xyz_lr=xyz_lr,
                 dead_func= self.densify_dead_func,
                 impact_func= self.densify_prefer_func,
             ) if not self.routine_mgr.means_opt_only() else {}
@@ -471,7 +517,7 @@ class Runner:
                     self.writer.add_histogram("train/tempo_ops_mean", self.model.deform.anchor_params["anchor_opacity_mean"], step)
                     self.writer.add_histogram("train/tempo_ops_std", torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_std"]), step)
 
-                if step % 500 == 0 and self.cfg.tb_histogram > 0:
+                if step % 500 == 0 and self.train_cfg.tb_histogram > 0:
                     self.writer.add_histogram("train/gs_opacities", snapshot["anchor_opacity"], step)
                     self.writer.add_histogram("train/grads2d", snapshot["anchor_grad2d"], step)
                     self.writer.add_histogram("train/childs_offsets", gs_offsets.flatten().clamp(-1,1), step) # last offsets in the batch
@@ -506,13 +552,27 @@ class Runner:
                 self.writer.add_scalar("runtime/opacity_decay", opacity_decay, step)
             
             # ----------------------------------- eval ----------------------------------- #
-            if step in [i - 1 for i in self.cfg.test_steps] or \
-                (self.cfg.test_steps_every > 0 and (step+1) % self.cfg.test_steps_every == 0):
+            if step + 1 in self.train_cfg.test_steps or \
+                (self.train_cfg.test_steps_every > 0 and (step+1) % self.train_cfg.test_steps_every == 0):
                 self.eval(step)
 
             # ---------------------------- viser viewer update --------------------------- #
             num_rays = gt.shape[0] * gt.shape[1] * gt.shape[2]
             self.viewer_mgr.checkout(num_rays, step)
+
+            # -------------------------------- save chkpt -------------------------------- #
+            if step + 1 in self.train_cfg.chkpt_steps:
+                print(f"save checkpoint of step {step} ...")
+                target = self.log.chkpt(step)
+                dir = os.path.dirname(target)
+                if not os.path.exists(dir):
+                    os.makedirs(dir)
+                torch.save({
+                    "step": step,
+                    "model": self.model.dump_chkpt(step),
+                    "routine": self.routine_mgr.dump_chkpt(),
+                    "config": OmegaConf.to_container(self.cfg)
+                }, target)
         
         with open(self.log.summary, 'a') as f:
             f.write(json.dumps(self.model.count_params(), indent=4))
@@ -521,7 +581,7 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step):
-        last_step = step == self.cfg.max_step - 1
+        last_step = step == self.train_cfg.max_step - 1
 
         results = {k:[] for k in self.eval_funcs.keys()}    # frame-wise results
         elapsed = []
@@ -556,14 +616,14 @@ class Runner:
             for k, func in self.eval_funcs.items():
                 results[k].append(func(img[None], gt[None]).item())  # metrics func expect batches
             if  (
-                self.cfg.save_eval_img or \
+                self.train_cfg.save_eval_img or \
                 last_step or \
-                ((step + 1) % self.cfg.save_eval_img_every == 0 and self.cfg.save_eval_img_every > 0)
+                ((step + 1) % self.train_cfg.save_eval_img_every == 0 and self.train_cfg.save_eval_img_every > 0)
                 ) and i in selected_idx:
                 save_tensor_images_threaded(self.img_proc_callback(img), gt, self.log.render(f"{step}_{i}"))
-            if last_step or step == 9:
+            if last_step:
                 video_buffer.append(self.img_proc_callback(img))
-        if last_step or step == 9:
+        if last_step:
             save_video(video_buffer, os.path.join(self.log.root, f"{step}.mp4"), fps=30)
 
         frames = self.test_loader_gen.frames
@@ -577,7 +637,7 @@ class Runner:
         # tb print
         self.writer.add_scalar("eval/psnr", results_avg['psnr'] , step)
         self.writer.add_scalar("eval/msssim", results_avg['msssim'] , step)
-        if self.cfg.tb_per_frame_psnr:
+        if self.train_cfg.tb_per_frame_psnr:
             self.writer.add_scalars("eval/perframe", psnr_per_frame, step)
 
         # log print
@@ -591,10 +651,33 @@ class Runner:
 
 @hydra.main(config_path='.', config_name='default', version_base=None)
 def main(cfg):
+    print(f"Overrides: {cfg.hydra.overrides}") 
     set_random_seed(cfg.train.random_seed)
     assert True, 'sanity check'
     torch.autograd.set_detect_anomaly(True)
-    runner = Runner(cfg.data, cfg.model, cfg.train)
+
+    try:
+        if cfg.chkpt is not None:
+            chkpt = torch.load(cfg.chkpt, weights_only=True)
+        else:
+            chkpt = None
+    except:
+        chkpt = None
+    
+    # override config than the default
+    if chkpt is not None:
+        print(f"▶ Loading checkpoint from {cfg.chkpt}, default config overwritten")
+        new_cfg = OmegaConf.create(chkpt['config'])
+        cfg = OmegaConf.merge(cfg, new_cfg)
+    
+    # override config than the checkpoint
+    override_cfg = "./override.yaml"
+    if os.path.exists(override_cfg):
+        override = OmegaConf.load(override_cfg)
+        print(f"▶ Loading override config from {override_cfg}: {override}")
+        cfg = OmegaConf.merge(cfg, override)
+
+    runner = Runner(cfg, chkpt)
     runner.train()
 
 

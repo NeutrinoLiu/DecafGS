@@ -114,11 +114,13 @@ class Deformable(nn.Module):
             anchor_params.append(
                 ("anchor_frame_dxyz", para_anchor_frame_dxyz, train_cfg.lr_anchor_frame_dxyz))
         
-        self.anchor_params = {k: v for k, v, _ in anchor_params}
         self.anchor_opts, self.anchor_lr_sched = get_adam_and_lr_sched(
             anchor_params,
             train_cfg.batch_size, 
             train_cfg.max_step)
+
+        self.anchor_params = {k: v for k, v, _ in anchor_params}
+
 
         # ------------------------------- deform params ------------------------------ #
         K = model_cfg.anchor_child_num
@@ -149,7 +151,7 @@ class Deformable(nn.Module):
                 T_max       =   T_max
             ).to(device)
             deform_params = [
-                ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),
+                ("frame_embed", list(para_frame_embed.parameters()), train_cfg.lr_frame_embed),  # list the para to keep a reference
                 ("mlp_deform", list(self.deform_mlp.parameters()), train_cfg.lr_mlp_deform)
             ]
             if self.delta_decoupled:
@@ -157,12 +159,12 @@ class Deformable(nn.Module):
                     ("frame_delta_embed", list(para_frame_delta_embed.parameters()), train_cfg.lr_frame_embed)
                 )
 
-            self.deform_params = {k: v for k, v, _ in deform_params} # list the para to keep a reference
-
             self.deform_opts, self.deform_lr_sched = get_adam_and_lr_sched(
                 deform_params,
                 train_cfg.batch_size,
                 train_cfg.max_step)
+
+            self.deform_params = {k: v for k, v, _ in deform_params if k!="mlp_deform"} # no need to explicit stores deform mlp
 
         else:
             self.deform_mlp = None
@@ -323,7 +325,7 @@ class Scaffold(nn.Module):
         hidden_dim = model_cfg.spawn_hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(), 
+            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),
                                      model_cfg.view_dependent,
                                      T_max,
                                      model_cfg.spawn_mlp_deeper).to(device), # scale of offset
@@ -450,7 +452,7 @@ class DecafPipeline(nn.Module):
         self.produce = self.forward
         self.resfield = True if T_max is not None else False
         if chkpt is not None:
-            self.load_chkpt(chkpt)
+            self.parse_chkpt(chkpt)
     
     def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
         frame_idx = cam.frame - self.cfg.frame_start
@@ -503,13 +505,23 @@ class DecafPipeline(nn.Module):
         ret["total_mem"] = total * 4 / 1024 / 1024
         return ret
 
-    def save_chkpt(self, step, path, save_opt=True, save_lr_sched=True):
+    def dump_chkpt(self, step, save_opt=True, save_lr_sched=True):
         """
         save checkpoint
+        {
+            "step": step,
+            "deform": deform model state_dict,
+            "scaffold": scaffold model state_dict,
+            "scaffold_opt": scaffold optimizer state_dict,
+            "deform_anchor_opt": deform anchor optimizer state_dict,
+            "deform_deform_opt": deform mlp optimizer state_dict,
+        }
         """
         chkpt = {
             "step": step,
             "deform": self.deform.state_dict(),
+            "deform_anchor_params": self.deform.anchor_params,
+            "deform_deform_params": self.deform.deform_params,
             "scaffold": self.scaffold.state_dict()
         }
         if save_opt:
@@ -532,15 +544,24 @@ class DecafPipeline(nn.Module):
             chkpt["deform_deform_lr_sched"] = {}
             for k, v in self.deform.deform_lr_sched.items():
                 chkpt["deform_deform_lr_sched"][k] = v.state_dict()
-        torch.save(chkpt, path)
+        return chkpt
 
-    def load_chkpt(self, path, load_opt=True, load_lr_sched=True):
+    def parse_chkpt(self, chkpt, load_opt=True, load_lr_sched=True):
         """
         load checkpoint
         """
-        chkpt = torch.load(path)
         self.deform.load_state_dict(chkpt["deform"])
         self.scaffold.load_state_dict(chkpt["scaffold"])
+
+        chkpt_anchor_params = chkpt["deform_anchor_params"]
+        chkpt_defrom_params = chkpt["deform_deform_params"]
+        for k, v in self.deform.anchor_params.items():
+            v.data = chkpt_anchor_params[k].data
+        for k, model_para_list in self.deform.deform_params.items():
+            chkpt_para_list = chkpt_defrom_params[k]
+            for p, c in zip(model_para_list, chkpt_para_list):
+                p.data = c.data
+
         if load_opt:
             for k, v in self.scaffold.opts.items():
                 v.load_state_dict(chkpt["scaffold_opt"][k])
@@ -548,7 +569,6 @@ class DecafPipeline(nn.Module):
                 v.load_state_dict(chkpt["deform_anchor_opt"][k])
             for k, v in self.deform.deform_opts.items():
                 v.load_state_dict(chkpt["deform_deform_opt"][k])
-            # todo binding the optimizer to the model
             
         if load_lr_sched:
             for k, v in self.scaffold.lr_sched.items():
@@ -557,6 +577,5 @@ class DecafPipeline(nn.Module):
                 v.load_state_dict(chkpt["deform_anchor_lr_sched"][k])
             for k, v in self.deform.deform_lr_sched.items():
                 v.load_state_dict(chkpt["deform_deform_lr_sched"][k])
-            # todo binding the lr_sched to the optimizer
             
         return chkpt["step"]

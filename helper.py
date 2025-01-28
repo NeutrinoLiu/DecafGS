@@ -63,21 +63,14 @@ class GlobalWriter:
 
 class LogDirMgr:
     def __init__(self, root):
+        soft_link = f"{root}_latest"
+        if os.path.exists(soft_link):
+            os.remove(soft_link)
         if os.path.exists(root):
-            # overwrite = input(f"Log directory {root} already exists. Press <y> to overwrite: ")
-            # workaround = overwrite.lower() != "y"
-            if True:
-                soft_link = f"{root}_latest"
-                if os.path.exists(soft_link):
-                    os.remove(soft_link)
-                root = f"{root}_{cur_time()}"
-                os.makedirs(root)
-                # using shell
-                abs_root = os.path.abspath(root)
-                os.system(f"ln -s {abs_root} {soft_link}")
-            else:
-                shutil.rmtree(root)
+            root = f"{root}_{cur_time()}"
         os.makedirs(root, exist_ok=True)
+        abs_root = os.path.abspath(root)
+        os.system(f"ln -s {abs_root} {soft_link}")
         print(f"Log directory: {root}")
 
         self.root = root
@@ -111,6 +104,7 @@ def save_video(img_list, save_path, fps=30):
         save_path (str): Path to save the video
         fps (int): Frames per second
     """
+
     dir = os.path.dirname(save_path)
     if not os.path.exists(dir):
         os.makedirs(dir)
@@ -227,7 +221,7 @@ def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
                 ret_opts[attr_name], 
                 lr_lambda_builder(ratio, lr_start, lr_stop)
             )
-            print(f"lr for {attr_name} initialized with exp decay: ({lr_init}->{lr_end})")
+            # print(f"lr for {attr_name} initialized with exp decay: ({lr_init}->{lr_end})")
         else:
             ret_opts[attr_name] = torch.optim.Adam(
                 [{
@@ -238,8 +232,7 @@ def get_adam_and_lr_sched(to_be_optimized, opt_cali, max_step):
                 eps=1e-15 / math.sqrt(opt_cali),
                 betas=(1 - opt_cali * (1 - 0.9), 1 - opt_cali * (1 - 0.999))
             )
-            print(f"lr for {attr_name} initialized with constant: {attr_lr}")
-    print()
+            # print(f"lr for {attr_name} initialized with constant: {attr_lr}")
     return ret_opts, ret_lr_sched
 
 
@@ -284,32 +277,20 @@ def timeit(func):
 # -------------------- per batch analysis helper functions ------------------- #
 
 def opacity_analysis(batch_state, K, dead_thres, per_frame=False):
+    # retain frame info
+    # opacity is camera invariant
+    anchor_spawn = {}
+    anchor_opacity = {}
+    ops = batch_state["ops"]
+    for (op, f) in zip(ops, batch_state["frames"]):
+        ops_per_anchor = op.detach().reshape(-1, K)
+        spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
+        opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
+        anchor_spawn[f] = spawn_per_anchor
+        anchor_opacity[f] = opacity_per_anchor
     if not per_frame:
-        # pc_batched is a list of pc, each pc is a Gaussians instance
-        # we need to analyse the batched pc to get the average spawn and opacity
-        anchor_spawn = []
-        anchor_opacity = []
-        ops = batch_state["ops"]
-        for op in ops:
-            ops_per_anchor = op.detach().reshape(-1, K)
-            spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
-            opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
-            anchor_spawn.append(spawn_per_anchor)
-            anchor_opacity.append(opacity_per_anchor)
-        anchor_spawn = sum(anchor_spawn) / len(ops)
-        anchor_opacity = sum(anchor_opacity) / len(ops)
-    else:
-        # retain frame info
-        # opacity is camera invariant
-        anchor_spawn = {}
-        anchor_opacity = {}
-        ops = batch_state["ops"]
-        for (op, f) in zip(ops, batch_state["frames"]):
-            ops_per_anchor = op.detach().reshape(-1, K)
-            spawn_per_anchor = torch.sum(ops_per_anchor > dead_thres, dim=-1)
-            opacity_per_anchor = torch.mean(ops_per_anchor, dim=-1)
-            anchor_spawn[f] = spawn_per_anchor
-            anchor_opacity[f] = opacity_per_anchor
+        anchor_spawn = sum(anchor_spawn.values()) / len(anchor_spawn)
+        anchor_opacity = sum(anchor_opacity.values()) / len(anchor_opacity)
 
     return anchor_spawn, anchor_opacity
 
@@ -390,7 +371,7 @@ def calculate_blames(
         ssim_error_tiled = tile_average(ssim_error, tile_size)
         ssim_error_tiled = ssim_error_tiled.flatten()
         topk_ssim, topk_idx = torch.topk(ssim_error_tiled, topk)
-        # remove idx by ssim larger than dssim_min
+        # remove those tiles with low dssim
         topk_idx = topk_idx[topk_ssim > dssim_min]
         topk_ssim = topk_ssim[topk_ssim > dssim_min]
         
@@ -507,7 +488,7 @@ def ewma_update(d, new_kv, alpha=0.9):
         else:
             d[k] = v
 
-def update_state(d, new_history):
+def update_state(d, new_history, special_aggr={}):
     ret = {}
     if d.get("history", None) is None:
         d["history"] = {}
@@ -517,7 +498,10 @@ def update_state(d, new_history):
         d["history"][k] = d["history"].get(k, {})
         d["history"][k].update(hist)
         full_hist = d["history"][k]
-        d[k] = sum(full_hist.values()) / len(full_hist)
+        if k not in special_aggr:
+            d[k] = sum(full_hist.values()) / len(full_hist)
+        else:
+            d[k] = special_aggr[k](full_hist)
         ret[k] = d[k].clone()
     return ret
     
@@ -572,3 +556,68 @@ def calculate_ratio(left, right, valid):
     overlaps = torch.clamp(overlaps, 1, V)
 
     return overlaps / V
+
+@torch.no_grad()
+def calculate_perturb(
+    pc,
+    intensity: float = 0.0,
+):
+    # add noise to indexed anchors
+    if intensity == 0: return torch.zeros_like(pc.means)
+
+    def op_sigmoid(x, k=100, x0=0.995):
+        """higher opacity, less noise"""
+        return 1 / (1 + torch.exp(-k * (x - x0)))
+    
+    ops = pc.opacities
+    means = pc.means
+    scales = pc.scales
+    rotations = pc.quats
+
+    # learn from mcmc
+    L = build_cov(scales, rotations)
+    cov = L @ L.transpose(1, 2)
+
+    noise_resistance = op_sigmoid(1 - ops).unsqueeze(1)
+    noise = torch.randn_like(means) * noise_resistance * intensity
+    noise = torch.bmm(cov, noise.unsqueeze(-1)).squeeze(-1)
+    # print(f"shape of noise: {noise.shape}")
+    # print(f"norm of noise: {noise.norm(dim=-1).mean()}")
+    # print(f"std of noise: {noise.norm(dim=-1).std()}")
+
+    return noise
+
+def build_rotation(r):
+    # r is [N, 4]
+    norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
+
+    q = r / norm[:, None]
+
+    R = torch.zeros((q.shape[0], 3, 3), device=r.device)
+
+    r = q[:, 0]
+    x = q[:, 1]
+    y = q[:, 2]
+    z = q[:, 3]
+
+    R[:, 0, 0] = 1 - 2 * (y*y + z*z)
+    R[:, 0, 1] = 2 * (x*y - r*z)
+    R[:, 0, 2] = 2 * (x*z + r*y)
+    R[:, 1, 0] = 2 * (x*y + r*z)
+    R[:, 1, 1] = 1 - 2 * (x*x + z*z)
+    R[:, 1, 2] = 2 * (y*z - r*x)
+    R[:, 2, 0] = 2 * (x*z - r*y)
+    R[:, 2, 1] = 2 * (y*z + r*x)
+    R[:, 2, 2] = 1 - 2 * (x*x + y*y)
+    return R
+
+def build_cov(s, r):
+    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device=s.device)
+    R = build_rotation(r)
+
+    L[:,0,0] = s[:,0]
+    L[:,1,1] = s[:,1]
+    L[:,2,2] = s[:,2]
+
+    L = R @ L
+    return L

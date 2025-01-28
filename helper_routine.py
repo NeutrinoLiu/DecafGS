@@ -1,12 +1,14 @@
 import math
 
 class RoutineMgrNull:
-    def __init__(self):
+    def __init__(self, chkpt=None):
         pass
     def checkin(self, step):
         pass
     def means_opt_only(self):
         return False
+    def dump_chkpt(self):
+        return {}
 
 class RoutineMgrDensify:
     """
@@ -18,7 +20,8 @@ class RoutineMgrDensify:
                  first_frame_iters,
                  stage_1_iters,
                  stage_2_iters,
-                 runner):
+                 runner,
+                 chkpt=None):
         self.first_frame_iters = first_frame_iters
         self.stage_total_iters = stage_1_iters + stage_2_iters
         self.stage_1_iters = stage_1_iters
@@ -28,6 +31,21 @@ class RoutineMgrDensify:
         self.step = None
         self.unlocked = None
         self.full_frames = False
+        self.parse_chkpt(chkpt)
+
+    def parse_chkpt(self, chkpt):
+        if chkpt is not None:
+            self.step = chkpt["step"]
+            self.unlocked = chkpt["unlocked"]
+            self.full_frames = chkpt["full_frames"]
+            print(f"RoutineMgr: loaded from checkpoint. step: {self.step}, unlocked: {self.unlocked}, full_frames: {self.full_frames}")
+
+    def dump_chkpt(self):
+        return {
+            "step": self.step,
+            "unlocked": self.unlocked,
+            "full_frames": self.full_frames
+        }
 
     def checkin(self, step):
         if self.full_frames:
@@ -79,7 +97,8 @@ class RoutineMgrIncremental:
                  first_frame_iters,
                  stage_1_iters,
                  stage_2_iters,
-                 runner):
+                 runner,
+                 chkpt=None):
         self.first_frame_iters = first_frame_iters
         self.stage_total_iters = stage_1_iters + stage_2_iters
         self.stage_1_iters = stage_1_iters
@@ -89,6 +108,21 @@ class RoutineMgrIncremental:
         self.step = None
         self.unlocked = None
         self.full_frames = False
+        self.parse_chkpt(chkpt)
+    
+    def parse_chkpt(self, chkpt):
+        if chkpt is not None:
+            self.step = chkpt["step"]
+            self.unlocked = chkpt["unlocked"]
+            self.full_frames = chkpt["full_frames"]
+            print(f"RoutineMgr: loaded from checkpoint. step: {self.step}, unlocked: {self.unlocked}, full_frames: {self.full_frames}")
+    
+    def dump_chkpt(self):
+        return {
+            "step": self.step,
+            "unlocked": self.unlocked,
+            "full_frames": self.full_frames
+        }
 
     def checkin(self, step):
         if self.full_frames:
@@ -139,7 +173,8 @@ class RoutineMgrFence:
                  stage_2_iters,
                  runner,
                  init_frames,
-                 std_grow=False):
+                 std_grow=False,
+                 chkpt=None):
         self.first_frame_iters = first_frame_iters
         self.stage_total_iters = stage_1_iters + stage_2_iters
         self.stage_1_iters = stage_1_iters
@@ -151,6 +186,26 @@ class RoutineMgrFence:
         self.full_frames = False
         self.initiated = False
         self.init_frames = init_frames
+        self.parse_chkpt(chkpt)
+    
+    def parse_chkpt(self, chkpt):
+        if chkpt is not None:
+            self.step = chkpt["step"]
+            self.full_frames = chkpt["full_frames"]
+            self.initiated = chkpt["initiated"]
+            self.init_frames = chkpt["init_frames"]
+            # recover the unlocked frames
+            self.runner.setup_loader(chkpt["unlocked_frames"])
+    
+    def dump_chkpt(self):
+        return {
+            "step": self.step,
+            "full_frames": self.full_frames,
+            "initiated": self.initiated,
+            "init_frames": self.init_frames,
+            # save the unlocked frames
+            "unlocked_frames": self.current_frames()
+        }
     
     def current_frames(self):
         return self.runner.train_loader_gen.frames

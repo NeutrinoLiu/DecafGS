@@ -11,6 +11,9 @@ class ViewerMgr:
         self.runner = runner
         self.vis_modes = ["RGB", "density", "childs", "relocate", "ops", "avg-spawn", "avg-ops", "avg-grad", "avg-blame"]
 
+        self.min_frame = min_frame
+        self.max_frame = max_frame
+
         self.server = viser.ViserServer(port=8080, verbose=False)
         self.viewer = nerfview.Viewer(
             server=self.server,
@@ -49,6 +52,8 @@ class ViewerMgr:
         mode="RGB",
         init_scale=0.02
     ):
+        frame = min(frame, self.max_frame-1)
+        frame = max(frame, self.min_frame)
         W, H = img_wh
         c2w = camera_state.c2w
         K = camera_state.get_K(img_wh)

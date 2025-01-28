@@ -58,9 +58,9 @@ class DecafMCMCStrategy:
         self.growing_rate: float = train_cfg.grow_rate
         self.cap_max: int = max_cap
 
-        self.noise_all: bool = train_cfg.perturb_all
-        self.noise_intensity: float = train_cfg.perturb_intensity
-        self.noise_start_iter: int = train_cfg.perturb_start_iter
+        # self.noise_all: bool = train_cfg.perturb_all
+        # self.noise_intensity: float = train_cfg.perturb_intensity
+        # self.noise_start_iter: int = train_cfg.perturb_start_iter
 
         self.min_opacity: float = train_cfg.reloc_dead_thres
         self.verbose: bool = verbose
@@ -77,7 +77,6 @@ class DecafMCMCStrategy:
         aks_params: Dict[str, torch.nn.Parameter],
         aks_opts: Dict[str, torch.optim.Optimizer],
         step: int,
-        anchor_xyz_lr: float,
         dead_func,
         impact_func,
     ):
@@ -90,8 +89,8 @@ class DecafMCMCStrategy:
 
         # ---------------------------------- relocate gs -------------------------------- #
         if (step < self.reloc_stop_iter
-            and step >= self.reloc_start_iter
-            and step % self.reloc_every == 0):
+            and step > self.reloc_start_iter
+            and (step - self.reloc_start_iter) % self.reloc_every == 0):
             n_reloacted_aks, dead_idx, target_idx = self._reloate_anchor(
                 state=state,
                 aks_params=aks_params,
@@ -107,8 +106,8 @@ class DecafMCMCStrategy:
             report["relocated"] = n_reloacted_aks if n_reloacted_aks > 0 else None
 
         # ---------------------------------- grow gs --------------------------------- #
-        if (step >= self.densify_start_iter
-            and step % self.densify_every == 0):
+        if (step > self.densify_start_iter
+            and (step - self.densify_start_iter) % self.densify_every == 0):
             n_new_aks, appended_idx, growed_idx = self._grow_anchor(
                 state=state,
                 aks_params=aks_params,
@@ -127,30 +126,30 @@ class DecafMCMCStrategy:
 
         # --------------------------------- add noise -------------------------------- #
 
-        if self.noise_all:
-            apply_noise_idx = torch.arange(aks_params["anchor_offsets"].shape[0], device=aks_params["anchor_offsets"].device)
-        if dead_idx is not None and appended_idx is None:
-            apply_noise_idx = dead_idx
-        elif dead_idx is None and appended_idx is not None:
-            apply_noise_idx = appended_idx
-        elif dead_idx is not None and appended_idx is not None:
-            apply_noise_idx = torch.cat([dead_idx, appended_idx])
-        else:
-            apply_noise_idx = None
+        # if self.noise_all:
+        #     apply_noise_idx = torch.arange(aks_params["anchor_offsets"].shape[0], device=aks_params["anchor_offsets"].device)
+        # if dead_idx is not None and appended_idx is None:
+        #     apply_noise_idx = dead_idx
+        # elif dead_idx is None and appended_idx is not None:
+        #     apply_noise_idx = appended_idx
+        # elif dead_idx is not None and appended_idx is not None:
+        #     apply_noise_idx = torch.cat([dead_idx, appended_idx])
+        # else:
+        #     apply_noise_idx = None
 
 
-        if self.noise_intensity > 0 \
-            and step >= self.noise_start_iter \
-            and apply_noise_idx is not None:
-            post_opacity = state["anchor_opacity"][idx_mapping]
-            idx_ops = post_opacity[apply_noise_idx]
-            self._inject_noise_to_position(
-                state=state,
-                aks_params=aks_params,
-                intensity=self.noise_intensity * anchor_xyz_lr,
-                idx=apply_noise_idx,
-                idx_ops=idx_ops, # always use opacity for noise adding
-            )
+        # if self.noise_intensity > 0 \
+        #     and step >= self.noise_start_iter \
+        #     and apply_noise_idx is not None:
+        #     post_opacity = state["anchor_opacity"][idx_mapping]
+        #     idx_ops = post_opacity[apply_noise_idx]
+        #     self._inject_noise_to_position(
+        #         state=state,
+        #         aks_params=aks_params,
+        #         intensity=self.noise_intensity * anchor_xyz_lr,
+        #         idx=apply_noise_idx,
+        #         idx_ops=idx_ops, # always use opacity for noise adding
+        #     )
 
         # reset state after any relocate or grow
         if len(report) > 0:
