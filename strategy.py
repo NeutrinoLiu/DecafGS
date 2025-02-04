@@ -4,27 +4,7 @@ from typing import Any, Dict, Union, List
 import torch
 
 from gsplat.strategy.ops import _update_param_with_optimizer
-
-def compute_decay_after_split(
-        decays: torch.Tensor, counts: torch.Tensor,
-        naive=False) -> torch.Tensor:
-    """Compute the new decay after relocating the anchor.
-
-    decay_new = decay_old + log(C)
-    so that after exp:
-    decay_new = decay_old * C
-    
-    since opacity = 1 - exp(-precursor/decay)
-    
-    so that:
-    1 - opacity_new = exp(-precursor/decay_new)
-                    = exp(-precursor/decay_old * C)
-                    = exp(-precursor/decay_old) ^ C
-                    = (1 - opacity_old) ^ C
-    """
-    if naive:
-        return decays + math.log(0.8)
-    return decays + torch.log(counts.float())
+from helper import update_decay_after_split
 
 class DecafMCMCStrategy:
     """Strategy that follows the paper:
@@ -46,8 +26,10 @@ class DecafMCMCStrategy:
         verbose (bool): Whether to print verbose information. Default to False.
     """
 
-    def __init__(self, train_cfg, max_cap, verbose = True):
+    def __init__(self, train_cfg, max_cap, verbose = True, naive_decay=False):
         self.scale_decay: float = train_cfg.reloc_scale_decay
+        self.ops_decay: float = train_cfg.reloc_ops_decay
+        self.naive_decay: bool = naive_decay
         
         self.reloc_start_iter: int = train_cfg.reloc_start_iter
         self.reloc_stop_iter: int = train_cfg.reloc_stop_iter
@@ -104,6 +86,7 @@ class DecafMCMCStrategy:
                     print(f"Step {step}: Relocated {n_reloacted_aks} Anchors.")
 
             report["relocated"] = n_reloacted_aks if n_reloacted_aks > 0 else None
+            report["relocated_idx"] = dead_idx if n_reloacted_aks > 0 else None
 
         # ---------------------------------- grow gs --------------------------------- #
         if (step > self.densify_start_iter
@@ -123,33 +106,7 @@ class DecafMCMCStrategy:
                     )
 
             report["grew"] = n_new_aks if n_new_aks > 0 else None
-
-        # --------------------------------- add noise -------------------------------- #
-
-        # if self.noise_all:
-        #     apply_noise_idx = torch.arange(aks_params["anchor_offsets"].shape[0], device=aks_params["anchor_offsets"].device)
-        # if dead_idx is not None and appended_idx is None:
-        #     apply_noise_idx = dead_idx
-        # elif dead_idx is None and appended_idx is not None:
-        #     apply_noise_idx = appended_idx
-        # elif dead_idx is not None and appended_idx is not None:
-        #     apply_noise_idx = torch.cat([dead_idx, appended_idx])
-        # else:
-        #     apply_noise_idx = None
-
-
-        # if self.noise_intensity > 0 \
-        #     and step >= self.noise_start_iter \
-        #     and apply_noise_idx is not None:
-        #     post_opacity = state["anchor_opacity"][idx_mapping]
-        #     idx_ops = post_opacity[apply_noise_idx]
-        #     self._inject_noise_to_position(
-        #         state=state,
-        #         aks_params=aks_params,
-        #         intensity=self.noise_intensity * anchor_xyz_lr,
-        #         idx=apply_noise_idx,
-        #         idx_ops=idx_ops, # always use opacity for noise adding
-        #     )
+            report["grew_idx"] = appended_idx if n_new_aks > 0 else None
 
         # reset state after any relocate or grow
         if len(report) > 0:
@@ -189,15 +146,13 @@ class DecafMCMCStrategy:
 
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         sampled_idx = alive_idx[sampled_idx]
-
-        decays = aks_params["anchor_opacity_decay"][sampled_idx]
-        counts = torch.bincount(sampled_idx)[sampled_idx] + 1
-        # counts = torch.ones_like(decays) * 2
-        new_opacity_decay = compute_decay_after_split(
-            decays = decays,
-            counts = counts,
+        new_opacity_decay = update_decay_after_split(
+            decays = aks_params["anchor_opacity_decay"][sampled_idx],
+            counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
+            naive=self.naive_decay,
+            reloc_ops_decay=self.ops_decay
         )
-        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
+        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] + math.log(self.scale_decay)
         
         def param_update(name: str, p: torch.Tensor) -> torch.Tensor:
             if name == "anchor_opacity_decay":
@@ -233,17 +188,19 @@ class DecafMCMCStrategy:
             assert False, "NaN in probs"
 
         sampled_idx = torch.multinomial(probs, n, replacement=True)
-        new_opacity_decay = compute_decay_after_split(
+        new_opacity_decay = update_decay_after_split(
             decays = aks_params["anchor_opacity_decay"][sampled_idx],
             counts = torch.bincount(sampled_idx)[sampled_idx] + 1,
+            naive=self.naive_decay,
+            reloc_ops_decay=self.ops_decay
         )
-        new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
+        # new_anchor_scale_extend = aks_params["anchor_scale_extend"][sampled_idx] * self.scale_decay
         
         def param_update(name: str, p: torch.Tensor) -> torch.Tensor:
             if name == "anchor_opacity_decay":
                 p[sampled_idx] = new_opacity_decay
-            if name == "anchor_scale_extend":
-                p[sampled_idx] = new_anchor_scale_extend
+            # if name == "anchor_scale_extend":
+            #     p[sampled_idx] = new_anchor_scale_extend
             p = torch.cat([p, p[sampled_idx]])
             return torch.nn.Parameter(p)
         def opt_update(key: str, v: torch.Tensor) -> torch.Tensor:
@@ -254,28 +211,3 @@ class DecafMCMCStrategy:
         appended_idx = torch.arange(N, N_target, device=sampled_idx.device)
 
         return n, appended_idx, sampled_idx
-
-    @torch.no_grad()
-    def _inject_noise_to_position(
-        self,
-        state: Dict[str, Any],
-        aks_params: Dict[str, torch.nn.Parameter],
-        intensity,
-        idx,
-        idx_ops,
-    ):
-        # add noise to indexed anchors
-        if intensity == 0: return
-        def op_sigmoid(x, k=100, x0=0.995):
-            """higher opacity, less noise"""
-            return 1 / (1 + torch.exp(-k * (x - x0)))
-        
-        assert idx_ops.shape[0] == idx.shape[0], f"shape mismatch, {idx_ops.shape[0]} != {idx.shape[0]}"
-        noise_resistance = op_sigmoid(1 - idx_ops).unsqueeze(1)
-        noise = torch.randn_like(aks_params["anchor_xyz"][idx]) \
-                 * noise_resistance * intensity * aks_params["anchor_offset_extend"][idx]
-        
-        aks_params["anchor_xyz"][idx] += noise
-
-        noise_norm = noise.norm(dim=-1)
-        print(f"noise mean: {noise_norm.mean().item()}, std: {noise_norm.std().item()}\n noise max: {noise_norm.max().item()}, min: {noise_norm.min().item()}")

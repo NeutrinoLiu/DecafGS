@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import json
 import time
 
-from line_profiler import profile
+from memory_profiler import profile
 
 import os
 import math
@@ -33,20 +33,16 @@ from interface import Gaussians, Camera
 from helper import (LogDirMgr, 
                     save_tensor_images_threaded,
                     save_video,
-                    threaded,
                     calculate_grads,
                     calculate_blames,
-                    calculate_ratio,
                     calculate_perturb,
                     opacity_analysis,
-                    normalize,
                     standardize,
-                    ewma_update,
                     update_state,
-                    gaussian_blur,
+                    gaussian_blur_diff,
                     )
 from helper_viewer import ViewerMgr
-from helper_routine import RoutineMgrIncremental, RoutineMgrNull, RoutineMgrFence
+from helper_routine import RoutineMgrIncremental, RoutineMgrNull, RoutineMgrFence, RoutineMgrFenceSimple
 
 class Runner:
     def __init__(self, cfg, chkpt=None):
@@ -97,7 +93,6 @@ class Runner:
             policy = "max_parallex",
             num_workers=data_cfg.num_workers,
             use_torch_loader=use_torch_loader,
-            img_proc_fn=self.img_proc_callback,
             )
         self.test_loader_gen = DataManager(
             self.scene,                         # img reader
@@ -121,6 +116,10 @@ class Runner:
         frame_length = self.max_frame - self.min_frame
         init_pts_timestamp = ((self.scene.init_pts_frame - self.min_frame) / frame_length) \
             if self.scene.init_pts_frame is not None else (0.5 * np.ones(N))
+        # print(f"init_pts_frame: {np.unique(self.scene.init_pts_frame).tolist()}")
+        # print(f"min_frame: {self.min_frame}, max_frame: {self.max_frame}")
+        # print(f"frame_offset: {np.unique(self.scene.init_pts_frame - self.min_frame).tolist()}")
+        # print(f"init_pts_timestamp: {np.unique(init_pts_timestamp).tolist()}")
         
         if train_cfg.routine == "fence" and train_cfg.routine_fence_std_grow:
             # incremental setup for the opacity span std, init span size is 2 (std=1 frame)
@@ -154,7 +153,7 @@ class Runner:
 
         # ------------------------- other training schedulers ------------------------ #
 
-        if self.train_cfg.routine == "incremental" or self.train_cfg.routine == "fence":
+        if self.train_cfg.routine == "incremental" or self.train_cfg.routine == "fence" or self.train_cfg.routine == "fence_simple":
             assert self.model_cfg.deform_delta_decoupled, "train.deform_delta_decoupled must be True"
             if self.train_cfg.routine == "incremental":
                 self.routine_mgr = RoutineMgrIncremental(
@@ -166,6 +165,7 @@ class Runner:
                 )
             elif self.train_cfg.routine == "fence":
                 unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
+                unique_frames = [f for f in unique_frames if f >= self.min_frame and f < self.max_frame]
                 self.routine_mgr = RoutineMgrFence(
                     first_frame_iters=self.train_cfg.routine_first_frame_iters,
                     stage_1_iters=self.train_cfg.routine_stage_1_iters,
@@ -175,13 +175,23 @@ class Runner:
                     std_grow=self.train_cfg.routine_fence_std_grow,
                     chkpt=chkpt["routine"] if chkpt is not None else None
                 )
+            elif self.train_cfg.routine == "fence_simple":
+                unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
+                unique_frames = [f for f in unique_frames if f >= self.min_frame and f < self.max_frame]
+                self.routine_mgr = RoutineMgrFenceSimple(
+                    first_frame_iters=self.train_cfg.routine_first_frame_iters,
+                    init_frames=unique_frames,
+                    runner=self,
+                    chkpt=chkpt["routine"] if chkpt is not None else None
+                )
         else:
             self.routine_mgr = RoutineMgrNull()
             
         # ------------------------------- other plugin ------------------------------- #
         self.strategy = DecafMCMCStrategy(
             train_cfg=train_cfg,
-            max_cap=model_cfg.anchor_num)
+            max_cap=model_cfg.anchor_num,
+            naive_decay=model_cfg.naive_decay,)
         
         self.state = {}         # running state, not only for strategy
         self.state.update(
@@ -201,15 +211,17 @@ class Runner:
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
     def img_proc_callback(self, img):
-        if self.train_cfg.blur_gradual_opt:
-            init_r = 5
+        if self.train_cfg.blur_for_motion_learning and self.routine_mgr.means_opt_only():
+            # only blur for motion learning
+            init_r = self.train_cfg.blur_radius
             final_r = 1
-            final_step = self.train_cfg.blur_gradual_opt_steps
-            if self.step > final_step:
+            final_step = self.train_cfg.blur_steps
+            cur_step = self.routine_mgr.means_opt_only_lasts()
+            if cur_step > final_step:
                 return img
             # expotentially decay 
-            r = init_r * (final_r / init_r) ** (self.step / final_step)
-            return gaussian_blur(img, r)
+            r = init_r * (final_r / init_r) ** (cur_step / final_step)
+            return gaussian_blur_diff(img, r)
         else:
             return img
 
@@ -274,7 +286,7 @@ class Runner:
         self.train_loader = iter([])
         self.test_loader = iter([])
 
-    @profile
+    # @profile(stream=open('memory_profiler.log','w+'))
     def train(self):
         init_step = self.init_step
         max_step = self.train_cfg.max_step
@@ -329,6 +341,7 @@ class Runner:
             K = self.model.deform.anchor_params['anchor_offsets'].shape[1]
             N = self.model.deform.anchor_params['anchor_offsets'].shape[0]
 
+            # check whether data loader is batched
             cams = [self.scene.get_cam(cam).to(self.device, non_blocking=True) \
                     for cam in data[0]]
             if isinstance(data[1], list):
@@ -345,20 +358,27 @@ class Runner:
                 gs_tempo_mask = aks_tempo_mask.unsqueeze(1).expand(-1, K).reshape(-1)
                 gs_tempo_mask_idx = torch.nonzero(gs_tempo_mask).flatten()
 
-                if self.routine_mgr.means_opt_only():
-                    pc = pc.means_opt_only()
-                
 
                 xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_offsets', None)
                 xyz_lr = xyz_lr.get_last_lr()[0] \
                     if xyz_lr is not None else self.train_cfg.lr_anchor_offsets
+                perturb_intensity = self.train_cfg.perturb_intensity * xyz_lr
+
+                if step < self.train_cfg.means_freeze_period:
+                    pc = pc.means_freeze_only()
+                    perturb_intensity = 0
+                elif self.routine_mgr.means_opt_only():
+                    pc = pc.means_opt_only()
                 
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
-                    perturb_intensity=self.train_cfg.perturb_intensity * xyz_lr,
+                    perturb_intensity=perturb_intensity,
                     prior_filter_idx=gs_tempo_mask_idx if self.model_cfg.filter_by_tempo else None
                 ) # img and info are batched actually, but batch size = 1
+
+                img = self.img_proc_callback(img)
+                gt = self.img_proc_callback(gt)
 
                 metrics["l1loss"] += F.l1_loss(img[None], gt[None])
                 metrics["ssimloss"] += 1 - fused_ssim(img[None], gt[None], padding="valid")
@@ -437,6 +457,15 @@ class Runner:
                     res = torch.maximum(res, t, out=res)
                 return res
             
+            def avg_none_zero_only(tensor_list):
+                """
+                tensorlist: [tensor, tensor, ...], tensor of shape [N,]
+                return: tensor of shape [N,], average of non-zero elements
+                """
+                non_zero_count = reduce(lambda x, y: x + (y > 0).float(), tensor_list, torch.zeros_like(tensor_list[0]))
+                sumup = reduce(lambda x, y: x + y, tensor_list, torch.zeros_like(tensor_list[0]))
+                return sumup / (non_zero_count + 1e-6)
+
             if step >= min(self.train_cfg.grow_start_iter, self.train_cfg.reloc_start_iter):
                 snapshot = update_state(
                     self.state, 
@@ -449,6 +478,7 @@ class Runner:
                     }, 
                     special_aggr = {
                         "anchor_opacity": lambda d: ele_wise_max(list(d.values())),
+                        "anchor_blame": lambda d: avg_none_zero_only(list(d.values())),
                     })
 
                 # compensation by frame contribution
@@ -504,12 +534,38 @@ class Runner:
                 aks_opts=self.model.deform.anchor_opts,
                 step=step,
                 dead_func= self.densify_dead_func,
-                impact_func= self.densify_prefer_func,
-            ) if not self.routine_mgr.means_opt_only() else {}
+                impact_func= self.densify_prefer_func
+            ) if self.state.get("history_length", 0) > 100 else {}
+            # ) if not self.routine_mgr.means_opt_only() else {}
             
             self.model.optimize()
             self.model.zero_grad()
             self.model.update_lr(step)
+
+            if self.train_cfg.perturb_anchor_post_densify > 0 and report.get("relocated_idx", None) is not None:
+                assert self.model_cfg.naive_decay, "naive_decay is required to perturb anchor after densify"
+                perturb_idx = report["relocated_idx"]
+                added_idx = report["grew_idx"]
+                if added_idx is not None:
+                    perturb_idx = torch.cat([perturb_idx, added_idx], dim=0)
+                
+                with torch.no_grad():
+                    anchor_xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_xyz', None)
+                    anchor_xyz_lr = anchor_xyz_lr.get_last_lr()[0] \
+                        if anchor_xyz_lr is not None else self.train_cfg.lr_anchor_xyz
+                    perturb_intensity = self.train_cfg.perturb_anchor_post_densify * anchor_xyz_lr
+                    anchors_as_pc = {
+                        "means": self.model.deform.anchor_params["anchor_xyz"][perturb_idx],
+                        "scales": torch.exp(self.model.deform.anchor_params["anchor_scale_extend"][perturb_idx]),
+                        "quats": self.model.deform.anchor_params["anchor_quat"][perturb_idx],
+                        "opacities": torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_decay"][perturb_idx]),
+                        "sh0": None,
+                        "shN": None,
+                    }
+                    perturb = calculate_perturb(Gaussians(anchors_as_pc), perturb_intensity)
+                    self.model.deform.anchor_params["anchor_xyz"][perturb_idx] += \
+                        torch.randn_like(self.model.deform.anchor_params["anchor_xyz"][perturb_idx]) * perturb
+                    print(f"avg perturb intensity: {perturb.norm(dim=-1).mean()}, std: {perturb.norm(dim=-1).std()}")
 
             # tensorboard >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> #
             with torch.no_grad():
@@ -531,7 +587,7 @@ class Runner:
                 self.writer.add_scalar("runtime/active_gs", torch.sum(snapshot["anchor_childs"]), step)
                 self.writer.add_scalar("runtime/average_child", torch.mean(snapshot["anchor_childs"]), step)
 
-                if len(self.train_loader_gen.frames) > 1:
+                if len(self.train_loader_gen.frames) > 1 and self.model_cfg.frame_embed_dim > 0:
                     frame_embeds = self.model.deform.deform_params["frame_embed"] # [F, N]
                     frame_embeds = torch.stack([frame_embeds[i] for i in range(len(self.train_loader_gen.frames))])
                     frame_embeds_std = torch.std(frame_embeds, dim=0)
@@ -574,8 +630,9 @@ class Runner:
                     "config": OmegaConf.to_container(self.cfg)
                 }, target)
         
-        with open(self.log.summary, 'a') as f:
-            f.write(json.dumps(self.model.count_params(), indent=4))
+            if step % 1000 == 0:
+                with open(self.log.summary, 'w+') as f:
+                    f.write(json.dumps(self.model.count_params(), indent=4))
         print("training finished, viewer lingering...")
         time.sleep(10)
 

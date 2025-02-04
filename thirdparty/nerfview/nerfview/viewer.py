@@ -144,6 +144,22 @@ class Viewer(object):
                 "Frame", min=self._frame_start, max=self._frame_end, step=1, initial_value=self._frame_start
             )
             self._render_frame_slider.on_update(self.rerender)
+            
+            def add_frame(_):
+                self._render_frame_slider.value += 1
+                if self._render_frame_slider.value > self._frame_end:
+                    self._render_frame_slider.value = self._frame_start
+                self.rerender(None)
+            def reduce_frame(_):
+                self._render_frame_slider.value -= 1
+                if self._render_frame_slider.value < self._frame_start:
+                    self._render_frame_slider.value = self._frame_end
+                self.rerender(None)
+
+            self._add_frame_button = self.server.gui.add_button("Next Frame")
+            self._add_frame_button.on_click(add_frame)
+            self._reduce_frame_button = self.server.gui.add_button("Previous Frame")
+            self._reduce_frame_button.on_click(reduce_frame)
 
         with self.server.gui.add_folder("Visualize Mode") as self._camera_folder:
             self._visualize_mode = self.server.gui.add_dropdown(

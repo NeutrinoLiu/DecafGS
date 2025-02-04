@@ -65,7 +65,9 @@ class Anchors:
     """
     Higher layer wrapper of anchor dict
     """
-    required = ["feature", "xyz", "offsets", "offset_extend", "scale_extend", "opacity_decay", "opacity_tempo_decay"]
+    required = ["feature", "xyz", "offsets", "offset_extend", 
+                "scale_extend", "anchor_quat",
+                "opacity_decay", "opacity_tempo_decay"]
     def __init__(self, params):
         assert all([k in params for k in self.required]), f"missing key in Anchors: {self.required}"
         self._params = params
@@ -103,6 +105,10 @@ class Anchors:
     def scale_extend(self):
         # [N, 3]
         return torch.exp(self._params["scale_extend"])
+    @property
+    def anchor_quat(self):
+        # [N, 4]
+        return torch.nn.functional.normalize(self._params["anchor_quat"], p=2, dim=-1)
     @property
     def opacity_decay(self):
         # [N,]
@@ -183,4 +189,14 @@ class Gaussians:
             "opacities": self.opacities.detach(),
             "sh0": self.sh0.detach(),
             "shN": self.shN.detach()
+        })
+    
+    def means_freeze_only(self):
+        return Gaussians({
+            "means": self.means.detach(),
+            "scales": self.scales,
+            "quats": self.quats,
+            "opacities": self.opacities,
+            "sh0": self.sh0,
+            "shN": self.shN
         })

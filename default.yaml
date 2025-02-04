@@ -32,7 +32,8 @@ model:
   frame_embed_entangle_range: 0 # per frame embed is weighted avg of nearby frames 
   # decoupled delta embedding
   deform_delta_decoupled: True
-  deform_delta_skip: False
+  deform_mixing_pypass: True       # appearance feature is always concated with raw anchor embeds to predict features
+                                    # this field can bypass raw delta embedding to delta prediction
   anchor_delta_embed_dim: 64     # dxyz use different embedding with feature
   frame_delta_embed_dim: 200
   # accumulative embedding
@@ -43,7 +44,8 @@ model:
   deform_skip: 4
   deform_anchor_xyz: True
   deform_child_offsets: True # deform child offsets as well
-  deform_child_scales: False
+  deform_child_scales: True
+  deform_child_quats: True
   anchor_per_frame_dxyz: False
   # neural GS MLP
   spawn_hidden_dim: 64
@@ -53,6 +55,7 @@ model:
   filter_by_tempo: False # no need to filter by temporal opacity, already filterd by ops
   view_dependent: False
   six_dof_rotate: False
+  naive_decay: False
 
 train:
   # logging
@@ -86,6 +89,7 @@ train:
     - 34000
   lr_anchor_offset_extend: 7e-3
   lr_anchor_scale_extend: 7e-3
+  lr_anchor_quat: 1e-3
   lr_anchor_opacity_decay: 1e-2
   lr_anchor_opacity_mean: 1e-3
   lr_anchor_opacity_std: 1e-3
@@ -107,26 +111,30 @@ train:
   reg_volume: 1e-1
   reg_offset: 1e-2
   # routine
+  means_freeze_period: 0
   routine: "fence"
   routine_first_frame_iters: 4000     # CONST-CC
   routine_stage_1_iters: 500
-  routine_stage_2_iters: 1000
+  routine_stage_2_iters: 500
   routine_fence_std_grow: False
-  perturb_intensity: 0
-  blur_gradual_opt: False
-  blur_gradual_opt_steps: 5000
+  perturb_intensity: 1e4
+  perturb_anchor_post_densify: 0
+  blur_for_motion_learning: False
+  blur_radius: 5
+  blur_steps: 400
   # grow and relocate
   grow_rate: 0.05
-  grow_start_iter: 20000                # CONST-AA
+  grow_start_iter: 2000                # CONST-AA
   grow_every: 200                     # CONST-BB
-  reloc_start_iter: 20000               # CONST-AA
+  reloc_start_iter: 2000               # CONST-AA
   reloc_stop_iter: 100000
   reloc_every: 200                    # CONST-BB
   reloc_dead_thres: 0.01
-  reloc_scale_decay: 0.9 # an approximate of MCMC rescale after relocation
+  reloc_scale_decay: 0.8 # an approximate of MCMC rescale after relocation
+  reloc_ops_decay: 0.8 # an approximate of MCMC opacity decay after relocation
   grad2d_alpha: .0
   blame_alpha: .9
-  blame_start_iter: 20000               # CONST-AA
+  blame_start_iter: 2000               # CONST-AA
   blame_max_gs_per_tile: 500
   # evaluation
   tb_histogram: False
@@ -137,4 +145,4 @@ train:
   test_dataset_split: 25
   test_steps_every: 500
   test_steps: []
-  chkpt_steps: [4000, 8000, 12000, 16000, 20000, 24000, 28000, 32000, 36000]
+  chkpt_steps: [1000, 2000, 4000, 8000, 12000, 16000, 20000, 24000, 28000, 32000, 36000]

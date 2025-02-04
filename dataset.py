@@ -89,8 +89,8 @@ def read_ply(ply_path, skip_frame_parse=False):
     if skip_frame_parse:
         return points, colors, None, None
     try:
-        frame = np.asarray(plydata.elements[0]["frame"])
-        span = np.asarray(plydata.elements[0]["span"])
+        frame = np.asarray(plydata.elements[0]["frame"]).astype(np.int32)
+        span = np.asarray(plydata.elements[0]["span"]).astype(np.int32)
     except:
         print(f"frame not found in {ply_path}")
         frame = None

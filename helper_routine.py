@@ -7,6 +7,8 @@ class RoutineMgrNull:
         pass
     def means_opt_only(self):
         return False
+    def means_opt_only_lasts(self):
+        return None
     def dump_chkpt(self):
         return {}
 
@@ -86,6 +88,8 @@ class RoutineMgrDensify:
 
     def means_opt_only(self):
         return False
+    def means_opt_only_lasts(self):
+        return None
 
 class RoutineMgrIncremental:
     """
@@ -159,6 +163,50 @@ class RoutineMgrIncremental:
         elif (self.step - self.first_frame_iters) % self.stage_total_iters <= self.stage_1_iters:
             return True
         return False
+    def means_opt_only_lasts(self):
+        if self.step < self.first_frame_iters:
+            return None
+        if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
+            return None
+        return (self.step - self.first_frame_iters) % self.stage_total_iters
+
+class RoutineMgrFenceSimple:
+    """
+    train the init frames first the ndirectly unlock all frames
+    """
+    def __init__(self,
+                 first_frame_iters,
+                 runner,
+                 init_frames,
+                 chkpt=None):
+        self.first_frame_iters = first_frame_iters
+        self.init_frames = init_frames 
+        self.runner = runner
+        # runtime
+        self.initiated = False
+        self.full_frames = False
+        self.step = None
+
+    def checkin(self, step):
+        self.step = step
+        if not self.initiated:
+            self.initiated = True
+            self.runner.setup_loader(self.init_frames.copy())
+            print(f"RoutineMgr: initiated. current frames: {sorted(self.init_frames)}")
+            return
+        if self.step > self.first_frame_iters and not self.full_frames:
+            self.full_frames = True
+            self.runner.setup_loader(self.runner.all_frames)
+            print(f"RoutineMgr: all frames unlocked. current frames: {sorted(self.runner.all_frames)}")
+            return
+        return
+        
+    def means_opt_only(self):
+        return False
+    def means_opt_only_lasts(self):
+        return None
+    def dump_chkpt(self):
+        return {}
 
 class RoutineMgrFence:
     """
@@ -219,6 +267,10 @@ class RoutineMgrFence:
             after_extended.append(unlocked+1)
         after_extended = set(after_extended) & set(self.total_frames())
         new_frames = after_extended - set(self.current_frames())
+        # print(f"current frames: {sorted(self.current_frames())}")
+        # print(f"after extended: {sorted(list(after_extended))}")
+        # print(f"new frames: {sorted(list(new_frames))}")
+        # print(f"total frames: {sorted(self.total_frames())}")
         return after_extended, new_frames
     def copy_embeds(self, befores, news):
         for f in news:
@@ -226,7 +278,7 @@ class RoutineMgrFence:
             if template not in befores:
                 template = f + 1
             assert template in befores, f"RoutineMgr: template frame {template} for new frame {f} not inited"
-            self.runner.model.deform.copy_frame_embed(template, f)
+            self.runner.model.deform.copy_frame_embed(template, f, offseted=False)
 
     def checkin(self, step):
         self.step = step
@@ -245,6 +297,7 @@ class RoutineMgrFence:
                 return
             after_extended, new_frames = self.try_to_extend()
             print(f"RoutineMgr: unlocked #{sorted(list(new_frames))}, init frame embeds")
+            # TODO screen the copy_embeds
             self.copy_embeds(
                 after_extended - new_frames, new_frames)
             if self.std_grow:
@@ -259,3 +312,10 @@ class RoutineMgrFence:
         elif (self.step - self.first_frame_iters) % self.stage_total_iters <= self.stage_1_iters:
             return True
         return False
+    
+    def means_opt_only_lasts(self):
+        if self.step < self.first_frame_iters:
+            return None
+        if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
+            return None
+        return (self.step - self.first_frame_iters) % self.stage_total_iters

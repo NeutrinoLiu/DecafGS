@@ -71,7 +71,7 @@ class TempoMixture(nn.Module):
                     skip,
                     depth,
                     delta_embed_dim=0,
-                    delta_deform_skip=False,
+                    deform_mixing_pypass=False,
                     T_max=None,
                     ):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
@@ -83,8 +83,9 @@ class TempoMixture(nn.Module):
         self.resfield = True if T_max is not None else False
         self.skip = skip
         self.decoupled_delta_embed = delta_embed_dim > 0
+        self.deform_mixing_bypass = deform_mixing_pypass
 
-        self.embed_mixing_mlp = SkippableMLP(in_dim, hidden_dim, feature_dim, skip, depth, T_max)
+        self.embed_feature_mlp = SkippableMLP(in_dim, hidden_dim, feature_dim, skip, depth, T_max)
 
         # two step delta deform:
         # - first mixing to get delta feature
@@ -92,12 +93,12 @@ class TempoMixture(nn.Module):
 
         # single step delta deform:
         # - directly get attribute delta, embed_deform_mlp is identity
-        self.embed_deform_mlp = SkippableMLP(delta_embed_dim, hidden_dim, feature_dim, skip, depth, T_max) if delta_embed_dim else None
-        if delta_deform_skip:
-            self.embed_deform_mlp = TempoIdentity()
+        self.embed_delta_mlp = SkippableMLP(delta_embed_dim, hidden_dim, feature_dim, skip, depth, T_max) if delta_embed_dim else None
+        
+        raw_embed_dim = delta_embed_dim if self.decoupled_delta_embed else in_dim
         self.delta_mlps = nn.ModuleList(
             [ MLP_builder(
-                in_dim      =delta_embed_dim if delta_deform_skip else feature_dim,
+                in_dim      =feature_dim + (raw_embed_dim if deform_mixing_pypass else 0),
                 hidden_dim  =hidden_dim,
                 out_dim     =delta_dims,
                 out_act     =nn.Identity(),
@@ -111,9 +112,34 @@ class TempoMixture(nn.Module):
         assert self.decoupled_delta_embed == (delta_embed is not None), \
             "delta_embed should be provided if and only if decoupled_delta_embed is True"
         
-        feature = self.embed_mixing_mlp(temporal_aks_embed, t)
+        feature = self.embed_feature_mlp(temporal_aks_embed, t)
 
-        delta_input = self.embed_deform_mlp(delta_embed, t) if self.decoupled_delta_embed else feature
+        if self.decoupled_delta_embed:
+            delta_feature = self.embed_delta_mlp(delta_embed, t)
+            if self.deform_mixing_bypass:
+                delta_input = torch.cat([delta_feature, delta_embed], dim=-1)
+            else:
+                delta_input = delta_feature
+        else:
+            if self.deform_mixing_bypass:
+                delta_input = torch.cat([feature, temporal_aks_embed], dim=-1)
+            else:
+                delta_input = feature
+
+        # if self.deform_mixing_pypass:
+        #     # [mixed_feature, raw_embed]
+        #     if self.decoupled_delta_embed:
+        #         delta_mixing = self.embed_deform_mlp(delta_embed, t)
+        #         delta_input = torch.cat([delta_mixing, delta_embed], dim=-1)
+        #     else:
+        #         delta_input = torch.cat([feature, temporal_aks_embed], dim=-1)
+        # else:
+        #     if self.decoupled_delta_embed:
+        #         delta_mixing = self.embed_deform_mlp(delta_embed, t)
+        #         delta_input = delta_mixing
+        #     else:
+        #         delta_input = feature
+
         delta_outputs = []
         for mlp in self.delta_mlps:
             delta_outputs.append(

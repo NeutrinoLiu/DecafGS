@@ -8,17 +8,12 @@ from torch import nn
 import math
 
 from examples.utils import rgb_to_sh
-from helper import get_adam_and_lr_sched, count_opt_params, calc_tempo_decay
+from helper import get_adam_and_lr_sched, count_opt_params, calc_tempo_decay, inverse_sigmoid, mul_quat, decay
 from interface import Camera, Gaussians, Anchors
 from helper_layers import MLP_builder, TempoMixture
 
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
-
-def inverse_sigmoid(x, eps=1e-6):
-    """Safe inverse sigmoid with numerical stability."""
-    x = x.clamp(eps, 1-eps)
-    return torch.log(x / (1 - x))
 
 class DummyPipeline(nn.Module):
     """
@@ -49,7 +44,6 @@ class Deformable(nn.Module):
                  device,
                  T_max=None):
         super(Deformable, self).__init__()
-
         self.cfg = model_cfg
         self.resfield = True if T_max is not None else False
         self.delta_decoupled = True if model_cfg.deform_delta_decoupled > 0 else False
@@ -71,8 +65,12 @@ class Deformable(nn.Module):
             torch.zeros(N, 3, dtype=torch.float32, device=device))
         para_anchor_scale_extend = nn.Parameter(
             torch.zeros(N, 3, dtype=torch.float32, device=device))
+        para_anchor_anchor_quat = nn.Parameter(
+            torch.zeros(N, 4, dtype=torch.float32, device=device))
+        para_anchor_anchor_quat.data[:, 0] = 1.0
+        ops_decay_init = 4 if model_cfg.naive_decay else 0
         para_anchor_opacity_decay = nn.Parameter(
-            torch.zeros(N, dtype=torch.float32, device=device))
+            torch.ones(N, dtype=torch.float32, device=device) * ops_decay_init)
         para_anchor_embed = nn.Parameter(
             torch.zeros(N, model_cfg.anchor_embed_dim, dtype=torch.float32, device=device))
         anchor_params = [
@@ -81,13 +79,10 @@ class Deformable(nn.Module):
             ("anchor_offsets", para_anchor_offsets, train_cfg.lr_anchor_offsets),
             ("anchor_offset_extend", para_anchor_offset_extend, train_cfg.lr_anchor_offset_extend),
             ("anchor_scale_extend", para_anchor_scale_extend, train_cfg.lr_anchor_scale_extend),
+            ("anchor_quat", para_anchor_anchor_quat, train_cfg.lr_anchor_quat),
             ("anchor_opacity_decay", para_anchor_opacity_decay, train_cfg.lr_anchor_opacity_decay)
         ]
         if model_cfg.temporal_opacity:
-            # para_anchor_opacity_mean = nn.Parameter(
-            #     torch.zeros(N, dtype=torch.float32, device=device)) 
-            # para_anchor_opacity_std = nn.Parameter(
-            #     torch.zeros(N, dtype=torch.float32, device=device))
             para_anchor_opacity_mean = nn.Parameter(
                 init_pts_time.to(device)
                 )
@@ -134,8 +129,8 @@ class Deformable(nn.Module):
         ]) if self.delta_decoupled else None
 
         if model_cfg.deform_depth > 0:
-            delta_dims = [3, 3 * K, 3, 3]
-                # d_xyz, d_offsets, d_offset_extend, d_scale_extend
+            delta_dims = [3, 3 * K, 3, 3, 4]
+                # d_xyz, d_offsets, d_offset_extend, d_scale_extend, d_quat
             delta_embed_dim = model_cfg.anchor_delta_embed_dim + model_cfg.frame_delta_embed_dim \
                 if self.delta_decoupled else 0
             
@@ -147,7 +142,7 @@ class Deformable(nn.Module):
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,
                 delta_embed_dim   = delta_embed_dim,
-                delta_deform_skip = model_cfg.deform_delta_skip,
+                deform_mixing_pypass = model_cfg.deform_mixing_pypass,
                 T_max       =   T_max
             ).to(device)
             deform_params = [
@@ -171,11 +166,14 @@ class Deformable(nn.Module):
             self.deform_opts = {}
             self.deform_lr_sched = {}
 
-    def copy_frame_embed(self, src_frame, dst_frame):
+    def copy_frame_embed(self, src_frame, dst_frame, offseted=True):
         """
         copy frame embed from src to dst
         """
         with torch.no_grad():
+            if not offseted:
+                src_frame -= self.cfg.frame_start
+                dst_frame -= self.cfg.frame_start
             self.deform_params["frame_embed"][dst_frame].data\
                 .copy_(self.deform_params["frame_embed"][src_frame].data)
             if self.delta_decoupled:
@@ -243,7 +241,8 @@ class Deformable(nn.Module):
          d_xyz, 
          d_offsets, 
          d_offset_extend, 
-         d_scale_extend) = self.deform_mlp(embeds, delta_embed, t)
+         d_scale_extend,
+         d_quat) = self.deform_mlp(embeds, delta_embed, t)
         
         if self.cfg.anchor_per_frame_dxyz:
             d_xyz = self.anchor_params["anchor_frame_dxyz"][:, frame] # [N, 3]
@@ -264,6 +263,13 @@ class Deformable(nn.Module):
             (d_offset_extend if self.cfg.deform_child_offsets else 0)
         scale_extend = self.anchor_params["anchor_scale_extend"] + \
             (d_scale_extend if self.cfg.deform_child_scales else 0)
+        anchor_quat = self.anchor_params["anchor_quat"] + \
+            (d_quat if self.cfg.deform_child_quats else 0)
+        if self.cfg.deform_child_quats:
+            anchor_quat = d_quat
+        else:
+            anchor_quat = torch.zeros(N, 4, dtype=torch.float32, device=xyz.device)
+            anchor_quat[:, 0] = 1.0
         if self.cfg.temporal_opacity:
             tt  = frame / self.frame_length
             opacity_tempo_decay = calc_tempo_decay(
@@ -282,24 +288,11 @@ class Deformable(nn.Module):
             "offsets"       : offsets,
             "offset_extend" : offset_extend, 
             "scale_extend"  : scale_extend,
-            "opacity_decay" : torch.exp(self.anchor_params["anchor_opacity_decay"]),
+            "anchor_quat"   : anchor_quat,
+            "opacity_decay" : self.anchor_params["anchor_opacity_decay"],
             "opacity_tempo_decay": opacity_tempo_decay,
         }
         return Anchors(aks_dict)
-
-def decay(precursor, exp_decay, skip=False):
-    """
-    decay opacities
-    to facilitize opacity split during densification
-    check: 
-    https://arxiv.org/abs/2404.06109
-    https://arxiv.org/abs/2404.09591
-    """
-    if skip:
-        return torch.clamp(precursor, 0., 1.)
-    eps = 1e-6
-    header = precursor / (exp_decay + eps)
-    return 1 - torch.exp(-header)
 
 class Scaffold(nn.Module):
     """
@@ -363,6 +356,8 @@ class Scaffold(nn.Module):
         K = means.shape[1]
         anchor_xyz = aks.anchor_xyz                             # [N, 3]
         scales_extend = aks.scale_extend                        # [N, 3]
+        anchor_quat = aks.anchor_quat                           # [N, 4]
+        child_quat_multiplier = anchor_quat.unsqueeze(1).expand(-1, K, -1).reshape(-1, 4)   # [N * K, 4]
         opacity_decay = aks.opacity_decay.unsqueeze(1).expand(-1, K).flatten()
         opacity_tempo_decay = aks.opacity_tempo_decay.unsqueeze(1).expand(-1, K).flatten()
 
@@ -377,23 +372,25 @@ class Scaffold(nn.Module):
 
         # attrs
         means = means.reshape(-1, 3)                            # [N * K, 3]
-        
+
         if self.resfield:
             scales = self.mlp["scales"](fea_ob, t).reshape(N, -1, 3)
             scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
             scales = scales.reshape(-1, 3)                          # [N * K, 3]
             quats = self.mlp["quats"](fea_ob, t).reshape(-1, 4)        # [N * K, 4]
+            quats = mul_quat(quats, child_quat_multiplier)
             opacities = self.mlp["opacities"](fea_ob, t).reshape(-1)   # [N * K]
-            opacities = decay(opacities, opacity_decay) * opacity_tempo_decay
             colors = self.mlp["colors"](fea_ob, t).reshape(-1, 3)      # [N * K, 3]
         else:
             scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
             scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
             scales = scales.reshape(-1, 3)                          # [N * K, 3]
             quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
+            quats = mul_quat(quats, child_quat_multiplier)
             opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
-            opacities = decay(opacities,  opacity_decay) * opacity_tempo_decay
             colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
+        # decay the opacity
+        opacities = decay(opacities,  opacity_decay, naive=self.cfg.naive_decay) * opacity_tempo_decay
 
         # since gs_dict is simply an interface
         # dont have to wrap it with torch.nn.ParameterDict
@@ -455,6 +452,7 @@ class DecafPipeline(nn.Module):
             self.parse_chkpt(chkpt)
     
     def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
+        # frame index will be remapping to [0, T_max]
         frame_idx = cam.frame - self.cfg.frame_start
         aks: Anchors = self.deform(frame_idx)
         gs: Gaussians = self.scaffold(aks, cam, frame_idx) \

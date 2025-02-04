@@ -475,7 +475,9 @@ def calculate_grads(
 
         return grad2d_aks, count_aks
 
-def normalize(v, eps=1e-6):
+def normalize(v, eps=1e-6, simple=False):
+    if simple:
+        return v / (v.max()+eps)
     return (v - v.min()) / (v.max() - v.min() + eps)
 def standardize(v, eps=1e-6):
     ret = ((v - v.mean()) / (v.std() + eps) + 1) /2
@@ -498,6 +500,7 @@ def update_state(d, new_history, special_aggr={}):
         d["history"][k] = d["history"].get(k, {})
         d["history"][k].update(hist)
         full_hist = d["history"][k]
+        d["history_length"] = len(full_hist)
         if k not in special_aggr:
             d[k] = sum(full_hist.values()) / len(full_hist)
         else:
@@ -512,6 +515,52 @@ def gaussian_blur(img, radius):
     blurred_pil = img_pil.filter(ImageFilter.GaussianBlur(radius))
     blurred_tensor = T.ToTensor()(blurred_pil)
     return blurred_tensor.to(img.device)
+
+def gaussian_blur_diff(img: torch.Tensor, r: float) -> torch.Tensor:
+    """
+    Apply a differentiable Gaussian blur to an image.
+    
+    Parameters:
+        img (torch.Tensor): Input image tensor of shape (3, H, W).
+        r (float): Blur radius (sigma) for the Gaussian.
+        
+    Returns:
+        torch.Tensor: Blurred image tensor of shape (3, H, W).
+    """
+    # If r is zero or negative, return the image unchanged.
+    if r <= 0:
+        return img
+
+    # Determine kernel size: cover roughly ±3σ.
+    radius = math.ceil(3 * r)
+    kernel_size = 2 * radius + 1
+
+    # Create a 1D coordinate tensor centered at zero.
+    x = torch.arange(kernel_size, dtype=img.dtype, device=img.device) - radius
+
+    # Compute the Gaussian kernel (without the 1/(sqrt(2pi)*sigma) factor, as we'll normalize later).
+    gauss_kernel = torch.exp(-(x ** 2) / (2 * r ** 2))
+    gauss_kernel = gauss_kernel / gauss_kernel.sum()  # Normalize the kernel
+
+    # Reshape for separable convolution
+    gauss_kernel_h = gauss_kernel.view(1, 1, 1, kernel_size)  # horizontal kernel
+    gauss_kernel_v = gauss_kernel.view(1, 1, kernel_size, 1)  # vertical kernel
+
+    # Add a batch dimension (now shape is [1, 3, H, W])
+    img = img.unsqueeze(0)
+
+    # Apply horizontal convolution
+    img = F.pad(img, pad=(radius, radius, 0, 0), mode='reflect')
+    kernel_h = gauss_kernel_h.repeat(img.shape[1], 1, 1, 1)  # one kernel per channel
+    img = F.conv2d(img, weight=kernel_h, groups=img.shape[1])
+
+    # Apply vertical convolution
+    img = F.pad(img, pad=(0, 0, radius, radius), mode='reflect')
+    kernel_v = gauss_kernel_v.repeat(img.shape[1], 1, 1, 1)
+    img = F.conv2d(img, weight=kernel_v, groups=img.shape[1])
+
+    # Remove the batch dimension
+    return img.squeeze(0)
     
 def calc_tempo_decay(x, mean, std, steepness, wider=1.):
     # no activation for mean
@@ -521,7 +570,8 @@ def calc_tempo_decay(x, mean, std, steepness, wider=1.):
         ( (x - mean) / (std_wider + 1e-6)
         ) ** 2
         ) ** beta
-    decay  = torch.exp(exponent)
+    # print(f"at {x}: {mean.data}, {std_wider.data}")
+    decay  = torch.exp(exponent).clamp(0.01, 1)
     # print(f"at {x}: {mean.data}, {std_wider.data}")
     # print(f"decay is {decay.data}")
     return decay
@@ -621,3 +671,67 @@ def build_cov(s, r):
 
     L = R @ L
     return L
+
+def mul_quat(q1, q2):
+    """
+    q1: [N, 4]
+    q2: [N, 4]
+    """
+    a1, b1, c1, d1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    a2, b2, c2, d2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    a = a1 * a2 - b1 * b2 - c1 * c2 - d1 * d2
+    b = a1 * b2 + b1 * a2 + c1 * d2 - d1 * c2
+    c = a1 * c2 - b1 * d2 + c1 * a2 + d1 * b2
+    d = a1 * d2 + b1 * c2 - c1 * b2 + d1 * a2
+    return torch.stack([a, b, c, d], dim=-1)
+
+def inverse_sigmoid(x, eps=1e-6):
+    """Safe inverse sigmoid with numerical stability."""
+    x = x.clamp(eps, 1-eps)
+    return torch.log(x / (1 - x))
+
+
+def decay(precursor, decay, naive=False):
+    """
+    decay opacities
+    to facilitize opacity split during densification
+    check: 
+    https://arxiv.org/abs/2404.06109
+    https://arxiv.org/abs/2404.09591
+    """
+    if naive:
+        return torch.sigmoid(decay) * precursor
+    exp_decay = torch.exp(decay)
+    eps = 1e-6
+    header = precursor / (exp_decay + eps)
+    return 1 - torch.exp(-header)
+
+def update_decay_after_split(
+        decays: torch.Tensor,
+        counts: torch.Tensor,
+        naive=False,
+        reloc_ops_decay=0.8) -> torch.Tensor:
+    """Compute the new decay after relocating the anchor.
+
+    # ----------------------------- none naive setup ----------------------------- #
+    decay_new = decay_old + log(C)
+    so that after exp:
+    decay_new = decay_old * C
+    
+    since opacity = 1 - exp(-precursor/decay)
+    
+    so that:
+    1 - opacity_new = exp(-precursor/decay_new)
+                    = exp(-precursor/decay_old / C)
+                    = exp(-precursor/decay_old) ^ (1/C)
+                    = (1 - opacity_old) ^ (1/C)
+    (1 - opacity_new) ^ C = 1 - opacity_old
+
+    # ----------------------------- naive setup ----------------------------- #
+    decay_new = decay_old - log(0.8), simply enlarge the decay
+    """
+    if naive:
+        before = torch.sigmoid(decays)
+        after = before * reloc_ops_decay
+        return inverse_sigmoid(after)
+    return decays + torch.log(counts.float())

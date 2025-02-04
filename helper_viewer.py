@@ -9,7 +9,7 @@ from helper import normalize
 class ViewerMgr:
     def __init__(self, runner, min_frame=0, max_frame=1):
         self.runner = runner
-        self.vis_modes = ["RGB", "density", "childs", "relocate", "ops", "avg-spawn", "avg-ops", "avg-grad", "avg-blame"]
+        self.vis_modes = ["RGB", "density", "childs", "relocate", "ops", "life-span", "avg-spawn", "avg-ops", "avg-grad", "avg-blame"]
 
         self.min_frame = min_frame
         self.max_frame = max_frame
@@ -113,7 +113,12 @@ class ViewerMgr:
             num_childs = aks.childs_xyz.shape[1]
             mask = None
             if mode == "ops":
-                vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1)
+                min_vis = 0.1
+                vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1) + min_vis
+            elif mode == "life-span":
+                with torch.no_grad():
+                    span = torch.sigmoid(self.runner.model.deform.anchor_params["anchor_opacity_std"])
+                vis_ops = span
             elif mode == "avg-spawn":
                 vis_ops = self.runner.state.get("anchor_childs", None)
                 if vis_ops is None:
@@ -142,7 +147,7 @@ class ViewerMgr:
                     vis_ops = None
             if vis_ops is None:
                 return self.last_time_img.cpu().numpy()
-            vis_ops = normalize(vis_ops)
+            vis_ops = normalize(vis_ops, simple=True)
             quats = torch.zeros(aks.anchor_xyz.shape[0], 4, device=self.runner.device)
             quats[:, 0] = 1.0
             scales = torch.ones(aks.anchor_xyz.shape[0], 3, device=self.runner.device) * init_scale
@@ -194,6 +199,7 @@ class ViewerMgr:
             cam=cam,
             permute=False,      # no need to permute, viewer need (H, W, 3)
             )
-
+        if mode == "RGB":
+            img = self.runner.img_proc_callback(img.permute(2, 0, 1)).permute(1, 2, 0)
         self.last_time_img = img
         return img.cpu().numpy()
