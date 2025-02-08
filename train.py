@@ -42,7 +42,11 @@ from helper import (LogDirMgr,
                     gaussian_blur_diff,
                     )
 from helper_viewer import ViewerMgr
-from helper_routine import RoutineMgrIncremental, RoutineMgrNull, RoutineMgrFence, RoutineMgrFenceSimple
+from helper_routine import (RoutineMgrIncremental,
+                            RoutineMgrNull,
+                            RoutineMgrFence,
+                            RoutineMgrFenceSimple,
+                            RoutineMgrFenceFeatGeomDecoupled)
 
 class Runner:
     def __init__(self, cfg, chkpt=None):
@@ -153,7 +157,9 @@ class Runner:
 
         # ------------------------- other training schedulers ------------------------ #
 
-        if self.train_cfg.routine == "incremental" or self.train_cfg.routine == "fence" or self.train_cfg.routine == "fence_simple":
+        decouple_required_routines = ["incremental", "fence", "fence_simple_decoupled"]
+        other_routines = ["fence_simple"]
+        if self.train_cfg.routine in decouple_required_routines:
             assert self.model_cfg.deform_delta_decoupled, "train.deform_delta_decoupled must be True"
             if self.train_cfg.routine == "incremental":
                 self.routine_mgr = RoutineMgrIncremental(
@@ -175,7 +181,19 @@ class Runner:
                     std_grow=self.train_cfg.routine_fence_std_grow,
                     chkpt=chkpt["routine"] if chkpt is not None else None
                 )
-            elif self.train_cfg.routine == "fence_simple":
+            elif self.train_cfg.routine == "fence_simple_decoupled":
+                unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
+                unique_frames = [f for f in unique_frames if f >= self.min_frame and f < self.max_frame]
+                self.routine_mgr = RoutineMgrFenceFeatGeomDecoupled(
+                    first_frame_iters=self.train_cfg.routine_first_frame_iters,
+                    stage_1_iters=self.train_cfg.routine_stage_1_iters,
+                    stage_2_iters=self.train_cfg.routine_stage_2_iters,
+                    init_frames=unique_frames,
+                    runner=self,
+                    chkpt=chkpt["routine"] if chkpt is not None else None
+                )
+        elif self.train_cfg.routine in other_routines:
+            if self.train_cfg.routine == "fence_simple":
                 unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
                 unique_frames = [f for f in unique_frames if f >= self.min_frame and f < self.max_frame]
                 self.routine_mgr = RoutineMgrFenceSimple(
@@ -185,6 +203,7 @@ class Runner:
                     chkpt=chkpt["routine"] if chkpt is not None else None
                 )
         else:
+            print(f"routine {self.train_cfg.routine} not supported, fallback to null routine")
             self.routine_mgr = RoutineMgrNull()
             
         # ------------------------------- other plugin ------------------------------- #
@@ -211,12 +230,12 @@ class Runner:
         self.writer = SummaryWriter(log_dir=self.log.tb)
 
     def img_proc_callback(self, img):
-        if self.train_cfg.blur_for_motion_learning and self.routine_mgr.means_opt_only():
+        if self.train_cfg.blur_for_motion_learning and self.routine_mgr.in_first_stage():
             # only blur for motion learning
             init_r = self.train_cfg.blur_radius
             final_r = 1
             final_step = self.train_cfg.blur_steps
-            cur_step = self.routine_mgr.means_opt_only_lasts()
+            cur_step = self.routine_mgr.first_stage_lasts()
             if cur_step > final_step:
                 return img
             # expotentially decay 
@@ -353,23 +372,34 @@ class Runner:
 
             for cam, gt in zip(cams, gts):
 
-                pc, aks = self.model.produce(cam)
+                aks = self.model.gen_aks(cam)
+                if self.train_cfg.routine == "fence_simple_decoupled" and \
+                    not self.routine_mgr.is_warming_up():
+                    if self.routine_mgr.in_first_stage():
+                        aks = aks.feat_freeze_only()
+                    else:
+                        aks = aks.feat_opt_only()
+
+                pc = self.model.gen_gs(aks, cam)
+                if step < self.train_cfg.means_freeze_period:
+                    pc = pc.means_freeze_only()
+                if self.train_cfg.routine in ["incremental", "fence"] and \
+                   self.routine_mgr.in_first_stage() and \
+                   step >= self.train_cfg.means_freeze_period:
+                    pc = pc.means_opt_only()
+
+                # mask by tempo opacity
                 aks_tempo_mask = aks.opacity_tempo_decay > 0.1
                 gs_tempo_mask = aks_tempo_mask.unsqueeze(1).expand(-1, K).reshape(-1)
                 gs_tempo_mask_idx = torch.nonzero(gs_tempo_mask).flatten()
 
-
+                # calculate perturb intensity
                 xyz_lr = self.model.deform.anchor_lr_sched.get('anchor_offsets', None)
                 xyz_lr = xyz_lr.get_last_lr()[0] \
                     if xyz_lr is not None else self.train_cfg.lr_anchor_offsets
                 perturb_intensity = self.train_cfg.perturb_intensity * xyz_lr
-
-                if step < self.train_cfg.means_freeze_period:
-                    pc = pc.means_freeze_only()
-                    perturb_intensity = 0
-                elif self.routine_mgr.means_opt_only():
-                    pc = pc.means_opt_only()
                 
+                # render
                 img, _, info = self.single_render(
                     pc=pc,
                     cam=cam,
@@ -377,6 +407,7 @@ class Runner:
                     prior_filter_idx=gs_tempo_mask_idx if self.model_cfg.filter_by_tempo else None
                 ) # img and info are batched actually, but batch size = 1
 
+                # post process, if any
                 img = self.img_proc_callback(img)
                 gt = self.img_proc_callback(gt)
 
@@ -480,20 +511,6 @@ class Runner:
                         "anchor_opacity": lambda d: ele_wise_max(list(d.values())),
                         "anchor_blame": lambda d: avg_none_zero_only(list(d.values())),
                     })
-
-                # compensation by frame contribution
-                # if self.model_cfg.temporal_opacity:
-                #     total_frames = self.max_frame - self.min_frame
-                #     active_frames_bin = [1 if (f+self.min_frame) in self.train_loader_gen.frames else 0 for f in range(total_frames)]
-                #     active_frames_bin = torch.Tensor(active_frames_bin).to(self.device)
-                #     opacity_means = self.model.deform.anchor_params["anchor_opacity_mean"]
-                #     opacity_stds = torch.sigmoid(self.model.deform.anchor_params["anchor_opacity_std"])
-                #     opacity_span_left = ((opacity_means - opacity_stds).clamp(0, 1) * total_frames).round()
-                #     opacity_span_right = ((opacity_means + opacity_stds).clamp(0, 1) * total_frames).round()
-                #     contribute_ratio = calculate_ratio(
-                #         opacity_span_left, opacity_span_right, active_frames_bin)
-                #     assert contribute_ratio.shape[0] == N
-                #     self.state["anchor_opacity"] /= contribute_ratio
             else:
                 snapshot = update_state({}, {
                     "anchor_blame": anchor_blame,
@@ -536,7 +553,6 @@ class Runner:
                 dead_func= self.densify_dead_func,
                 impact_func= self.densify_prefer_func
             ) if self.state.get("history_length", 0) > 100 else {}
-            # ) if not self.routine_mgr.means_opt_only() else {}
             
             self.model.optimize()
             self.model.zero_grad()

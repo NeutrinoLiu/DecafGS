@@ -113,8 +113,7 @@ class ViewerMgr:
             num_childs = aks.childs_xyz.shape[1]
             mask = None
             if mode == "ops":
-                min_vis = 0.1
-                vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1) + min_vis
+                vis_ops = gs.opacities.reshape(-1, num_childs).mean(dim=1)
             elif mode == "life-span":
                 with torch.no_grad():
                     span = torch.sigmoid(self.runner.model.deform.anchor_params["anchor_opacity_std"])

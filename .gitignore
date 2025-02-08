@@ -7,7 +7,8 @@ output*
 *.png
 experiments
 *.txt
-
+*.log
+override.yaml
 **/*.egg-info
 **/*.egg
 **/*.pyc

@@ -126,20 +126,6 @@ class TempoMixture(nn.Module):
             else:
                 delta_input = feature
 
-        # if self.deform_mixing_pypass:
-        #     # [mixed_feature, raw_embed]
-        #     if self.decoupled_delta_embed:
-        #         delta_mixing = self.embed_deform_mlp(delta_embed, t)
-        #         delta_input = torch.cat([delta_mixing, delta_embed], dim=-1)
-        #     else:
-        #         delta_input = torch.cat([feature, temporal_aks_embed], dim=-1)
-        # else:
-        #     if self.decoupled_delta_embed:
-        #         delta_mixing = self.embed_deform_mlp(delta_embed, t)
-        #         delta_input = delta_mixing
-        #     else:
-        #         delta_input = feature
-
         delta_outputs = []
         for mlp in self.delta_mlps:
             delta_outputs.append(

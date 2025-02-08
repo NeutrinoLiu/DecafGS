@@ -55,7 +55,7 @@ model:
   filter_by_tempo: False # no need to filter by temporal opacity, already filterd by ops
   view_dependent: False
   six_dof_rotate: False
-  naive_decay: False
+  naive_decay: True
 
 train:
   # logging

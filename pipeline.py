@@ -26,6 +26,14 @@ class DummyPipeline(nn.Module):
     def produce(self, cam: Camera) -> Gaussians:
         return self.content
 
+def set_requires_grad(paralist, target):
+    if isinstance(paralist, nn.Parameter):
+        paralist.requires_grad = target
+    else:
+        # as a list or iterable
+        for p in paralist:
+            p.requires_grad = target
+
 class Deformable(nn.Module):
     """
     A temporal deformation module
@@ -35,6 +43,32 @@ class Deformable(nn.Module):
         :output [aks]
         :params frame_embed, anchor_embed, anchor_attrs, deform_mlp
     """
+    def unfreeze(self):
+        """
+        unfreeze all params
+        """
+        for p in self.parameters():
+            p.requires_grad = True
+    def freeze_only(self, params: list[str]):
+        """
+        freeze params
+        """
+        # first unfreeze all
+        self.unfreeze()
+        for p in params:
+            if p in self.anchor_params:
+                set_requires_grad(self.anchor_params[p], False)
+            elif p in self.deform_params:
+                set_requires_grad(self.deform_params[p], False)
+            # for mlp_deform sub modules specificlly
+            elif p == "mlp_deform_feature":
+                set_requires_grad(self.deform_mlp.embed_feature_mlp.parameters(), False)
+            elif p == "mlp_deform_delta":
+                set_requires_grad(self.deform_mlp.embed_delta_mlp.parameters(), False)
+                set_requires_grad(self.deform_mlp.delta_mlps.parameters(), False)
+            else: 
+                assert False, f"param {p} not found in Deformable Module, no freezing"
+
     def __init__(self, 
                  train_cfg,
                  model_cfg,
@@ -301,6 +335,25 @@ class Scaffold(nn.Module):
         :output [gs]
         :params mlp of scales, quats, opacities, colors
     """
+    def unfreeze(self):
+        """
+        unfreeze all params
+        """
+        for para in self.parameters():
+            para.requires_grad = True
+    def freeze_only(self, params: list[str]):
+        """
+        freeze params
+        """
+        # first unfreeze all
+        self.unfreeze()
+        for p in params:
+            mlp_name = p.replace("mlp_", "")
+            if mlp_name in self.mlp:
+                set_requires_grad(self.mlp[mlp_name].parameters(), False)
+            else:
+                assert False, f"param {p} not found in Scaffold Module, no freezing"
+
     def __init__(self, 
                  train_cfg, 
                  model_cfg,
@@ -374,23 +427,28 @@ class Scaffold(nn.Module):
         means = means.reshape(-1, 3)                            # [N * K, 3]
 
         if self.resfield:
-            scales = self.mlp["scales"](fea_ob, t).reshape(N, -1, 3)
-            scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
-            scales = scales.reshape(-1, 3)                          # [N * K, 3]
-            quats = self.mlp["quats"](fea_ob, t).reshape(-1, 4)        # [N * K, 4]
-            quats = mul_quat(quats, child_quat_multiplier)
-            opacities = self.mlp["opacities"](fea_ob, t).reshape(-1)   # [N * K]
-            colors = self.mlp["colors"](fea_ob, t).reshape(-1, 3)      # [N * K, 3]
+            mlp_scales = self.mlp["scales"](fea_ob, t).reshape(N, -1, 3)
+            mlp_quats = self.mlp["quats"](fea_ob, t).reshape(-1, 4)        # [N * K, 4]
+            mlp_opacities = self.mlp["opacities"](fea_ob, t).reshape(-1)   # [N * K]
+            mlp_colors = self.mlp["colors"](fea_ob, t).reshape(-1, 3)      # [N * K, 3]
         else:
-            scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
-            scales = scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
-            scales = scales.reshape(-1, 3)                          # [N * K, 3]
-            quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
-            quats = mul_quat(quats, child_quat_multiplier)
-            opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
-            colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
-        # decay the opacity
-        opacities = decay(opacities,  opacity_decay, naive=self.cfg.naive_decay) * opacity_tempo_decay
+            mlp_scales = self.mlp["scales"](fea_ob).reshape(N, -1, 3)
+            mlp_quats = self.mlp["quats"](fea_ob).reshape(-1, 4)        # [N * K, 4]
+            mlp_opacities = self.mlp["opacities"](fea_ob).reshape(-1)   # [N * K]
+            mlp_colors = self.mlp["colors"](fea_ob).reshape(-1, 3)      # [N * K, 3]
+
+        if aks.feature_freezed:
+            # when anchor feature is freezed, we also freeze the attributs mlp
+            mlp_scales = mlp_scales.detach()
+            mlp_quats = mlp_quats.detach()
+            mlp_opacities = mlp_opacities.detach()
+            mlp_colors = mlp_colors.detach()
+
+        # post process
+        scales = mlp_scales * scales_extend.unsqueeze(1).expand(-1, K, -1)    # [N, K, 3]
+        scales = scales.reshape(-1, 3)                          # [N * K, 3]
+        quats = mul_quat(mlp_quats, child_quat_multiplier)
+        opacities = decay(mlp_opacities,  opacity_decay, naive=self.cfg.naive_decay) * opacity_tempo_decay
 
         # since gs_dict is simply an interface
         # dont have to wrap it with torch.nn.ParameterDict
@@ -399,33 +457,30 @@ class Scaffold(nn.Module):
             "scales": scales,
             "quats": quats,
             "opacities": opacities,
-            "sh0": rgb_to_sh(colors).unsqueeze(1),
+            "sh0": rgb_to_sh(mlp_colors).unsqueeze(1),
             "shN": torch.zeros(means.shape[0], 
                                0, 3,
                                device=means.device)
         }
         return Gaussians(gs_dict)
 
-    def freeze(self):
-        """
-        freeze all params
-        """
-        for mlp in self.mlp.values():
-            for p in mlp.parameters():
-                p.requires_grad = False
-    def unfreeze(self):
-        """
-        unfreeze all params
-        """
-        for mlp in self.mlp.values():
-            for p in mlp.parameters():
-                p.requires_grad = True
-
 class DecafPipeline(nn.Module):
     """
     a wrapper of system pipeline
     parameterless nn module
     """
+    def unfreeze(self):
+        """
+        unfreeze all params
+        """
+        self.deform.unfreeze()
+        self.scaffold.unfreeze()
+    def freeze_only(self, deformable_paras: list[str], scaffold_paras: list[str]):
+        """
+        freeze params
+        """
+        self.deform.freeze_only(deformable_paras)
+        self.scaffold.freeze_only(scaffold_paras)
     def __init__(self, train_cfg, model_cfg,
                  init_pts,
                  init_pts_time,
@@ -451,12 +506,22 @@ class DecafPipeline(nn.Module):
         if chkpt is not None:
             self.parse_chkpt(chkpt)
     
-    def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
-        # frame index will be remapping to [0, T_max]
+    def gen_aks(self, cam: Camera):
+        # frame index will be remapped to [0, T_max]
         frame_idx = cam.frame - self.cfg.frame_start
         aks: Anchors = self.deform(frame_idx)
+        return aks
+    
+    def gen_gs(self, aks: Anchors, cam: Camera):
+        # frame index will be remapped to [0, T_max]
+        frame_idx = cam.frame - self.cfg.frame_start
         gs: Gaussians = self.scaffold(aks, cam, frame_idx) \
-            if self.resfield else self.scaffold(aks, cam)
+            if self.resfield else self.scaffold
+        return gs
+
+    def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
+        aks = self.gen_aks(cam)
+        gs = self.gen_gs(aks, cam)
         return gs, aks
     
     def optimize(self):

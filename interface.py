@@ -118,6 +118,35 @@ class Anchors:
         # [N,]
         return self._params["opacity_tempo_decay"]
 
+    @property
+    def feature_freezed(self):
+        return self._params.get("feature_freezed", False)
+
+    def feat_opt_only(self):
+        return Anchors({
+            "feature": self.feature,
+            "xyz": self.anchor_xyz.detach(),
+            "offsets": self.offsets.detach(),
+            "offset_extend": self.offset_extend.detach(),
+            "scale_extend": self.scale_extend.detach(),
+            "anchor_quat": self.anchor_quat.detach(),
+            "opacity_decay": self.opacity_decay.detach(),
+            "opacity_tempo_decay": self.opacity_tempo_decay.detach()
+        })
+
+    def feat_freeze_only(self):
+        return Anchors({
+            "feature": self.feature.detach(),
+            "feature_freezed": True,
+            "xyz": self.anchor_xyz,
+            "offsets": self.offsets,
+            "offset_extend": self.offset_extend,
+            "scale_extend": self.scale_extend,
+            "anchor_quat": self.anchor_quat,
+            "opacity_decay": self.opacity_decay,
+            "opacity_tempo_decay": self.opacity_tempo_decay
+        })
+
 
 class Gaussians:
     """

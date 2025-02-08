@@ -2,17 +2,18 @@ import math
 
 class RoutineMgrNull:
     def __init__(self, chkpt=None):
+        # subclass no need to super__init__ since it's a null class
         pass
     def checkin(self, step):
         pass
-    def means_opt_only(self):
+    def in_first_stage(self):
         return False
-    def means_opt_only_lasts(self):
+    def first_stage_lasts(self):
         return None
     def dump_chkpt(self):
         return {}
 
-class RoutineMgrDensify:
+class RoutineMgrFavorNewFrame(RoutineMgrNull):
     """
     first stage train new frame only
     second stage train all frames
@@ -86,12 +87,8 @@ class RoutineMgrDensify:
                 self.runner.train_loader = iter([])
                 self.runner.test_loader = iter([])
 
-    def means_opt_only(self):
-        return False
-    def means_opt_only_lasts(self):
-        return None
 
-class RoutineMgrIncremental:
+class RoutineMgrIncremental(RoutineMgrNull):
     """
     first stage train position only
     second stage train all attributes
@@ -155,7 +152,7 @@ class RoutineMgrIncremental:
                 print(f"RoutineMgr: copy frame embed from {last_frame} to {new_frame}")
                 self.runner.model.deform.copy_frame_embed(last_frame, new_frame)
     
-    def means_opt_only(self):
+    def in_first_stage(self):
         if self.full_frames:
             return False
         if self.unlocked == 0:
@@ -163,14 +160,14 @@ class RoutineMgrIncremental:
         elif (self.step - self.first_frame_iters) % self.stage_total_iters <= self.stage_1_iters:
             return True
         return False
-    def means_opt_only_lasts(self):
+    def first_stage_lasts(self):
         if self.step < self.first_frame_iters:
             return None
         if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
             return None
         return (self.step - self.first_frame_iters) % self.stage_total_iters
 
-class RoutineMgrFenceSimple:
+class RoutineMgrFenceSimple(RoutineMgrNull):
     """
     train the init frames first the ndirectly unlock all frames
     """
@@ -201,16 +198,50 @@ class RoutineMgrFenceSimple:
             return
         return
         
-    def means_opt_only(self):
-        return False
-    def means_opt_only_lasts(self):
-        return None
     def dump_chkpt(self):
         return {}
 
-class RoutineMgrFence:
+class RoutineMgrFenceFeatGeomDecoupled(RoutineMgrFenceSimple):
     """
-    first stage train position only
+    dataset train as fence,
+    yet feature and geometry are decoupled during different iterations
+    """
+    def __init__(self,
+                 first_frame_iters,
+                 stage_1_iters,
+                 stage_2_iters,
+                 runner,
+                 init_frames,
+                 chkpt=None):
+        super().__init__(first_frame_iters, runner, init_frames, chkpt)
+        self.stage_total_iters = stage_1_iters + stage_2_iters
+        self.stage_1_iters = stage_1_iters
+        self.stage_2_iters = stage_2_iters
+
+    def is_warming_up(self):
+        return self.step < self.first_frame_iters
+
+    def is_first_stage(self):
+        if self.step < self.first_frame_iters:
+            return False
+        if (self.step - self.first_frame_iters) % self.stage_total_iters <= self.stage_1_iters:
+            return True
+        return False
+    
+    def first_stage_lasts(self):
+        if self.step < self.first_frame_iters:
+            return None
+        if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
+            return None
+        return (self.step - self.first_frame_iters) % self.stage_total_iters
+
+    def checkin(self, step):
+        super().checkin(step)
+
+
+class RoutineMgrFence(RoutineMgrNull):
+    """
+    first stage train position(i.e means) only
     second stage train all attributes
     both trains on current full unlocked frames
     yet expand frames as a fence
@@ -306,14 +337,14 @@ class RoutineMgrFence:
             print(f"RoutineMgr: flush data loaders. current training frames: {sorted(list(after_extended))}")
             self.runner.setup_loader(list(after_extended))
             
-    def means_opt_only(self):
+    def in_first_stage(self):
         if self.full_frames or self.step < self.first_frame_iters:
             return False
         elif (self.step - self.first_frame_iters) % self.stage_total_iters <= self.stage_1_iters:
             return True
         return False
     
-    def means_opt_only_lasts(self):
+    def first_stage_lasts(self):
         if self.step < self.first_frame_iters:
             return None
         if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
