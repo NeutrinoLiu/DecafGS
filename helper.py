@@ -563,6 +563,11 @@ def gaussian_blur_diff(img: torch.Tensor, r: float) -> torch.Tensor:
     return img.squeeze(0)
     
 def calc_tempo_decay(x, mean, std, steepness, wider=1.):
+    # print(f"""devices:
+    #       x: {x.device}
+    #       mean: {mean.device}
+    #       std: {std.device}
+    #       steepness: {steepness.device}""")
     # no activation for mean
     std_wider = torch.sigmoid(std) * wider  # 0-1 to slightly wider range
     beta = torch.sigmoid(steepness) * 10 + 1 # 1-infinity

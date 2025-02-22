@@ -71,7 +71,7 @@ class TempoMixture(nn.Module):
                     skip,
                     depth,
                     delta_embed_dim=0,
-                    deform_mixing_pypass=False,
+                    deform_mixing_bypass=False,
                     T_max=None,
                     ):       # insert skip connection at the input of skip-th layer
                                         # skip = 0 means no skip connection
@@ -83,7 +83,7 @@ class TempoMixture(nn.Module):
         self.resfield = True if T_max is not None else False
         self.skip = skip
         self.decoupled_delta_embed = delta_embed_dim > 0
-        self.deform_mixing_bypass = deform_mixing_pypass
+        self.deform_mixing_bypass = deform_mixing_bypass
 
         self.embed_feature_mlp = SkippableMLP(in_dim, hidden_dim, feature_dim, skip, depth, T_max)
 
@@ -98,13 +98,26 @@ class TempoMixture(nn.Module):
         raw_embed_dim = delta_embed_dim if self.decoupled_delta_embed else in_dim
         self.delta_mlps = nn.ModuleList(
             [ MLP_builder(
-                in_dim      =feature_dim + (raw_embed_dim if deform_mixing_pypass else 0),
+                in_dim      =feature_dim + (raw_embed_dim if deform_mixing_bypass else 0),
                 hidden_dim  =hidden_dim,
                 out_dim     =delta_dims,
                 out_act     =nn.Identity(),
                 T_max       =T_max
                 ) for delta_dims in further_dims ]
         )
+    def get_delta_mlp(self, name):
+        if name == "xyz":
+            return self.delta_mlps[0]
+        elif name == "offsets":
+            return self.delta_mlps[1]
+        elif name == "offset_extend":
+            return self.delta_mlps[2]
+        elif name == "scale_extend":
+            return self.delta_mlps[3]
+        elif name == "quat":
+            return self.delta_mlps[4]
+        else:
+            raise ValueError("unknown delta attribute")
 
     def forward(self, temporal_aks_embed, delta_embed=None, t=None):
         assert self.resfield == (t is not None), \
@@ -194,10 +207,22 @@ class ResMLP(nn.Module):
 #         return torch.matmul(x, weight) + self.bias
 
 class ResLinear(ResMLP):
+    _registered = []
+    @classmethod
+    def enable_resfield(cls):
+        for layer in cls._registered:
+            layer.ignore_residuals = False
+    @classmethod
+    def disable_resfield(cls):
+        for layer in cls._registered:
+            layer.ignore_residuals = True
+
     def __init__(self, in_dim, out_dim, T_max, rank=16):
         super(ResLinear, self).__init__()
         self.layer = Linear(in_dim, out_dim, rank=rank, capacity=T_max)
         self.span = T_max-1
+        ResLinear._registered.append(self.layer)
+        
     def forward(self, x, t):
         assert t <= self.span, "t should be less than T_max"
         unified_time = 2 * t / self.span - 1 

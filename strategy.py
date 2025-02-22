@@ -143,13 +143,6 @@ class DecafMCMCStrategy:
             print(state["anchor_blame"])
             print(f"number of nan in blame: {state['anchor_blame'].isnan().sum().item()}")
             assert False, "NaN in probs"
-        else:
-            print(f"""stats of probs:
-    max: {probs.max().item()}
-    min: {probs.min().item()}
-    mean: {probs.mean().item()}
-    std: {probs.std().item()}
-    median: {probs.median().item()}""")
 
         sampled_idx = torch.multinomial(probs, n, replacement=True)
         sampled_idx = alive_idx[sampled_idx]

@@ -1,4 +1,40 @@
 import math
+class RoutineConsts:
+    WARMUP_FREEZE = {
+        "deform": [],
+        "scaffold": []
+    }
+    APPEARANCE_FREEZE = {
+        "deform": [
+            "anchor_embed",
+            "frame_embed",
+            "mlp_deform_feature"
+            "anchor_opacity_decay",
+            "anchor_opacity_mean",
+            "anchor_opacity_std",
+            "anchor_opacity_steepness",
+            ],
+        "scaffold": [
+            "mlp_scales",
+            "mlp_quats",
+            "mlp_opacities",
+            "mlp_colors"
+            ]
+    }
+    DEFORM_FREEZE = {
+        "deform": [
+            "anchor_xyz",
+            "anchor_offsets",
+            "anchor_offset_extend",
+            "anchor_scale_extend",
+            "anchor_quat",
+            "anchor_delta_embed",
+            "frame_delta_embed",
+            "mlp_deform_delta"
+            ],
+        "scaffold": []
+    }
+
 
 class RoutineMgrNull:
     def __init__(self, chkpt=None):
@@ -6,12 +42,16 @@ class RoutineMgrNull:
         pass
     def checkin(self, step):
         pass
+    def is_warming_up(self):
+        return False
     def in_first_stage(self):
         return False
     def first_stage_lasts(self):
         return None
     def dump_chkpt(self):
         return {}
+    def model_reconfig(self):
+        pass
 
 class RoutineMgrFavorNewFrame(RoutineMgrNull):
     """
@@ -86,7 +126,9 @@ class RoutineMgrFavorNewFrame(RoutineMgrNull):
                 self.runner.test_loader_gen.frames = unlocked_frames
                 self.runner.train_loader = iter([])
                 self.runner.test_loader = iter([])
-
+    
+    def is_warming_up(self):
+        return self.step < self.first_frame_iters
 
 class RoutineMgrIncremental(RoutineMgrNull):
     """
@@ -166,6 +208,25 @@ class RoutineMgrIncremental(RoutineMgrNull):
         if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
             return None
         return (self.step - self.first_frame_iters) % self.stage_total_iters
+    def is_warming_up(self):
+        return self.step < self.first_frame_iters
+
+    def model_reconfig(self):
+        model = self.runner.model
+        if self.is_warming_up():
+            model.freeze_only(
+                deformable_paras = RoutineConsts.WARMUP_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.WARMUP_FREEZE["scaffold"]
+            )
+        elif self.in_first_stage():
+            # optimize deform in the first stage
+            model.freeze_only(
+                deformable_paras = RoutineConsts.APPEARANCE_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.APPEARANCE_FREEZE["scaffold"]
+            )
+            # optimize all in the second stage
+        else:
+            model.unfreeze()
 
 class RoutineMgrFenceSimple(RoutineMgrNull):
     """
@@ -200,8 +261,21 @@ class RoutineMgrFenceSimple(RoutineMgrNull):
         
     def dump_chkpt(self):
         return {}
+    
+    def is_warming_up(self):
+        return self.step < self.first_frame_iters
+    
+    def model_reconfig(self):
+        model = self.runner.model
+        if self.is_warming_up():
+            model.freeze_only(
+                deformable_paras = RoutineConsts.WARMUP_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.WARMUP_FREEZE["scaffold"]
+            )
+        else:
+            model.unfreeze()
 
-class RoutineMgrFenceFeatGeomDecoupled(RoutineMgrFenceSimple):
+class RoutineMgrFenceSimpleDecoupled(RoutineMgrFenceSimple):
     """
     dataset train as fence,
     yet feature and geometry are decoupled during different iterations
@@ -217,9 +291,6 @@ class RoutineMgrFenceFeatGeomDecoupled(RoutineMgrFenceSimple):
         self.stage_total_iters = stage_1_iters + stage_2_iters
         self.stage_1_iters = stage_1_iters
         self.stage_2_iters = stage_2_iters
-
-    def is_warming_up(self):
-        return self.step < self.first_frame_iters
 
     def is_first_stage(self):
         if self.step < self.first_frame_iters:
@@ -238,6 +309,21 @@ class RoutineMgrFenceFeatGeomDecoupled(RoutineMgrFenceSimple):
     def checkin(self, step):
         super().checkin(step)
 
+    def model_reconfig(self):
+        model = self.runner.model
+        if self.is_warming_up():
+            model.freeze_only(
+                deformable_paras = RoutineConsts.WARMUP_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.WARMUP_FREEZE["scaffold"]
+            )
+        elif self.in_first_stage():
+            # optimize deform in the first tage
+            model.freeze_only(
+                deformable_paras = RoutineConsts.APPEARANCE_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.APPEARANCE_FREEZE["scaffold"]
+            )
+        else:
+            model.unfreeze()
 
 class RoutineMgrFence(RoutineMgrNull):
     """
@@ -350,3 +436,23 @@ class RoutineMgrFence(RoutineMgrNull):
         if (self.step - self.first_frame_iters) % self.stage_total_iters > self.stage_1_iters:
             return None
         return (self.step - self.first_frame_iters) % self.stage_total_iters
+
+    def is_warming_up(self):
+        return self.step < self.first_frame_iters
+
+    def model_reconfig(self):
+        model = self.runner.model
+        if self.is_warming_up():
+            model.freeze_only(
+                deformable_paras = RoutineConsts.WARMUP_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.WARMUP_FREEZE["scaffold"]
+            )
+        elif self.in_first_stage():
+            # optimize deform in the first stage
+            model.freeze_only(
+                deformable_paras = RoutineConsts.APPEARANCE_FREEZE["deform"],
+                scaffold_paras = RoutineConsts.APPEARANCE_FREEZE["scaffold"]
+            )
+            # optimize all in the second stage
+        else:
+            model.unfreeze()

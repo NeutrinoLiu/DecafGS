@@ -38,6 +38,7 @@ from helper import (LogDirMgr,
                     calculate_perturb,
                     opacity_analysis,
                     standardize,
+                    normalize,
                     update_state,
                     gaussian_blur_diff,
                     )
@@ -46,7 +47,8 @@ from helper_routine import (RoutineMgrIncremental,
                             RoutineMgrNull,
                             RoutineMgrFence,
                             RoutineMgrFenceSimple,
-                            RoutineMgrFenceFeatGeomDecoupled)
+                            RoutineMgrFenceSimpleDecoupled)
+from helper_layers import ResLinear
 
 class Runner:
     def __init__(self, cfg, chkpt=None):
@@ -94,7 +96,8 @@ class Runner:
             train_cam_idx,                      # train cam only
             self.all_frames,                        # full frame
             batch_size = train_cfg.batch_size,
-            policy = "max_parallex",
+            # policy = "max_parallex",
+            policy = "random",
             num_workers=data_cfg.num_workers,
             use_torch_loader=use_torch_loader,
             )
@@ -184,7 +187,7 @@ class Runner:
             elif self.train_cfg.routine == "fence_simple_decoupled":
                 unique_frames = np.unique(self.scene.init_pts_frame).astype(int).tolist()
                 unique_frames = [f for f in unique_frames if f >= self.min_frame and f < self.max_frame]
-                self.routine_mgr = RoutineMgrFenceFeatGeomDecoupled(
+                self.routine_mgr = RoutineMgrFenceSimpleDecoupled(
                     first_frame_iters=self.train_cfg.routine_first_frame_iters,
                     stage_1_iters=self.train_cfg.routine_stage_1_iters,
                     stage_2_iters=self.train_cfg.routine_stage_2_iters,
@@ -370,23 +373,28 @@ class Runner:
             else:
                 raise ValueError(f"unexpected data[1] type {type(data[1])}")
 
+            # -------------------------- model partial freezing -------------------------- #
+            if step < self.train_cfg.means_freeze_period:
+                # warm up training, keep means (anchor_xyz) fixed
+                self.model.freeze_only(
+                    deformable_paras=["anchor_xyz",             # freeze canonical anchor xyz
+                                      "anchor_delta_embed",
+                                      "frame_delta_embed",      # freeze deform embeddings
+                                      "mlp_deform_delta_xyz"], # freeze deform mlp
+                    scaffold_paras=[]
+                )
+            else:
+                self.model.unfreeze()
+                self.routine_mgr.model_reconfig()
+
+
             for cam, gt in zip(cams, gts):
 
-                aks = self.model.gen_aks(cam)
-                if self.train_cfg.routine == "fence_simple_decoupled" and \
-                    not self.routine_mgr.is_warming_up():
-                    if self.routine_mgr.in_first_stage():
-                        aks = aks.feat_freeze_only()
-                    else:
-                        aks = aks.feat_opt_only()
-
-                pc = self.model.gen_gs(aks, cam)
-                if step < self.train_cfg.means_freeze_period:
-                    pc = pc.means_freeze_only()
-                if self.train_cfg.routine in ["incremental", "fence"] and \
-                   self.routine_mgr.in_first_stage() and \
-                   step >= self.train_cfg.means_freeze_period:
-                    pc = pc.means_opt_only()
+                if self.routine_mgr.is_warming_up():
+                    ResLinear.disable_resfield()
+                else:
+                    ResLinear.enable_resfield()
+                pc, aks = self.model.produce(cam)
 
                 # mask by tempo opacity
                 aks_tempo_mask = aks.opacity_tempo_decay > 0.1
@@ -521,7 +529,7 @@ class Runner:
                 })
             # ------------------------ relocate and densification ------------------------ #
 
-            rescale = standardize
+            rescale = normalize
             opacity_thres_fn = lambda x: x["anchor_opacity"] < self.train_cfg.reloc_dead_thres
             opacity_count_thres_fn = lambda x: x["anchor_count"] < 0.05
             blame_thres_fn = lambda x: rescale(x["anchor_blame"]) < 0.1

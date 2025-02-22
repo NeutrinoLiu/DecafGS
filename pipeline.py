@@ -10,10 +10,15 @@ import math
 from examples.utils import rgb_to_sh
 from helper import get_adam_and_lr_sched, count_opt_params, calc_tempo_decay, inverse_sigmoid, mul_quat, decay
 from interface import Camera, Gaussians, Anchors
-from helper_layers import MLP_builder, TempoMixture
+from helper_layers import MLP_builder, TempoMixture, ExpLayer
 
 def random_init(N, dim, scale=1.):
     return (torch.randn(N, dim) * 2. - 1.) * scale
+
+def unit_quat(means):
+    N = means.shape[0]
+    return torch.tensor([[1., 0., 0., 0.]] * N, dtype=torch.float32, device=means.device)
+    
 
 class DummyPipeline(nn.Module):
     """
@@ -49,7 +54,7 @@ class Deformable(nn.Module):
         """
         for p in self.parameters():
             p.requires_grad = True
-    def freeze_only(self, params: list[str]):
+    def freeze_only(self, params: list):
         """
         freeze params
         """
@@ -66,6 +71,9 @@ class Deformable(nn.Module):
             elif p == "mlp_deform_delta":
                 set_requires_grad(self.deform_mlp.embed_delta_mlp.parameters(), False)
                 set_requires_grad(self.deform_mlp.delta_mlps.parameters(), False)
+            elif "mlp_deform_delta_" in p:
+                p = p.replace("mlp_deform_delta_", "")
+                set_requires_grad(self.deform_mlp.get_delta_mlp(p).parameters(), False)
             else: 
                 assert False, f"param {p} not found in Deformable Module, no freezing"
 
@@ -176,7 +184,7 @@ class Deformable(nn.Module):
                 skip        =   model_cfg.deform_skip,
                 depth       =   model_cfg.deform_depth,
                 delta_embed_dim   = delta_embed_dim,
-                deform_mixing_pypass = model_cfg.deform_mixing_pypass,
+                deform_mixing_bypass = model_cfg.deform_mixing_bypass,
                 T_max       =   T_max
             ).to(device)
             deform_params = [
@@ -280,12 +288,6 @@ class Deformable(nn.Module):
         
         if self.cfg.anchor_per_frame_dxyz:
             d_xyz = self.anchor_params["anchor_frame_dxyz"][:, frame] # [N, 3]
-        
-        # print(f"frame {frame} embed: {frame_embed}")
-        # print(f"shape of embeds: {embeds.shape}")
-        # print(f"first anchor embed: {self.anchor_params['anchor_embed'][0]}")
-        # print(f"first mlp layer: {self.deform_mlp.layers[0][0].weight}")
-        # print(f"first mlp layer shpae: {self.deform_mlp.layers[0][0].weight.shape}")
 
         # ----------------------------- anchor attributes ---------------------------- #
         K = self.anchor_params["anchor_offsets"].shape[1]
@@ -305,7 +307,7 @@ class Deformable(nn.Module):
             anchor_quat = torch.zeros(N, 4, dtype=torch.float32, device=xyz.device)
             anchor_quat[:, 0] = 1.0
         if self.cfg.temporal_opacity:
-            tt  = frame / self.frame_length
+            tt  = (frame / self.frame_length)
             opacity_tempo_decay = calc_tempo_decay(
                 tt, 
                 self.anchor_params["anchor_opacity_mean"],
@@ -341,7 +343,7 @@ class Scaffold(nn.Module):
         """
         for para in self.parameters():
             para.requires_grad = True
-    def freeze_only(self, params: list[str]):
+    def freeze_only(self, params: list):
         """
         freeze params
         """
@@ -371,7 +373,7 @@ class Scaffold(nn.Module):
         hidden_dim = model_cfg.spawn_hidden_dim
         k = model_cfg.anchor_child_num
         self.mlp = nn.ModuleDict({
-            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, nn.Sigmoid(),
+            "scales":    MLP_builder(in_dim, hidden_dim, 3 * k, ExpLayer(),
                                      model_cfg.view_dependent,
                                      T_max,
                                      model_cfg.spawn_mlp_deeper).to(device), # scale of offset
@@ -475,7 +477,7 @@ class DecafPipeline(nn.Module):
         """
         self.deform.unfreeze()
         self.scaffold.unfreeze()
-    def freeze_only(self, deformable_paras: list[str], scaffold_paras: list[str]):
+    def freeze_only(self, deformable_paras: list=[], scaffold_paras: list=[]):
         """
         freeze params
         """
@@ -505,23 +507,11 @@ class DecafPipeline(nn.Module):
         self.resfield = True if T_max is not None else False
         if chkpt is not None:
             self.parse_chkpt(chkpt)
-    
-    def gen_aks(self, cam: Camera):
-        # frame index will be remapped to [0, T_max]
-        frame_idx = cam.frame - self.cfg.frame_start
-        aks: Anchors = self.deform(frame_idx)
-        return aks
-    
-    def gen_gs(self, aks: Anchors, cam: Camera):
-        # frame index will be remapped to [0, T_max]
-        frame_idx = cam.frame - self.cfg.frame_start
-        gs: Gaussians = self.scaffold(aks, cam, frame_idx) \
-            if self.resfield else self.scaffold
-        return gs
 
     def forward(self, cam: Camera) -> Tuple[Gaussians, Anchors]:
-        aks = self.gen_aks(cam)
-        gs = self.gen_gs(aks, cam)
+        frame_idx = cam.frame - self.cfg.frame_start
+        aks: Anchors = self.deform(frame_idx)
+        gs: Gaussians = self.scaffold(aks, cam, frame_idx)
         return gs, aks
     
     def optimize(self):
